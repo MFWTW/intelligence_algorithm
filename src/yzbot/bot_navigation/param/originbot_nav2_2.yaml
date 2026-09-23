@@ -14,7 +14,9 @@ amcl:
     global_frame_id: "map"
     lambda_short: 0.1
     laser_likelihood_max_dist: 2.0
-    laser_max_range: 100.0
+    # The simulated lidar reports at most 30 m; matching it keeps the
+    # likelihood-field model from treating max-range beams as free space.
+    laser_max_range: 30.0
     laser_min_range: -1.0
     laser_model_type: "likelihood_field"
     max_beams: 60
@@ -29,7 +31,10 @@ amcl:
     robot_model_type: "nav2_amcl::DifferentialMotionModel"
     save_pose_rate: 0.5
     sigma_hit: 0.2
-    tf_broadcast: true
+    # Gazebo publishes exact world-referenced odometry and the generated map
+    # uses the same world coordinates. AMCL drift on long feature-poor routes
+    # must not overwrite the correct map->odom identity transform.
+    tf_broadcast: false
     transform_tolerance: 1.0
     update_min_a: 0.2
     update_min_d: 0.25
@@ -38,16 +43,26 @@ amcl:
     z_rand: 0.5
     z_short: 0.05
     scan_topic: scan
+    # Simulation always starts at the world origin, so AMCL can initialize
+    # automatically and publish map -> odom without an RViz click.
+    set_initial_pose: true
+    initial_pose:
+      x: 0.0
+      y: 0.0
+      z: 0.0
+      yaw: 0.0
 
 bt_navigator:
   ros__parameters:
     use_sim_time: True
     global_frame: map
     robot_base_frame: base_footprint
-    odom_topic: /odometry/filtered
-    # odom_topic: /odom
-    bt_loop_duration: 10
-    default_server_timeout: 20
+    # Gazebo diff-drive plugin directly publishes wheel odometry.
+    odom_topic: /odom
+    # 20 Hz is ample and avoids starving action/service callbacks at 100 Hz.
+    bt_loop_duration: 50
+    # Milliseconds; 20 ms caused false action-server timeouts under load.
+    default_server_timeout: 200
     wait_for_service_timeout: 1000
     action_server_result_timeout: 900.0
     navigators: ["navigate_to_pose", "navigate_through_poses"]
@@ -71,11 +86,15 @@ bt_navigator:
 controller_server:
   ros__parameters:
     use_sim_time: True
-    controller_frequency: 20.0
+    # Gazebo/WSL must also render the RGB and depth sensors.  A 10 Hz control
+    # loop is stable on this machine and avoids the repeated 20 Hz deadline
+    # misses that previously starved TF and laser processing on long routes.
+    controller_frequency: 10.0
     min_x_velocity_threshold: 0.001
     min_y_velocity_threshold: 0.0
     min_theta_velocity_threshold: 0.001
-    failure_tolerance: 0.3
+    # Brief obstacle/TF gaps should not abort the controller immediately.
+    failure_tolerance: 2.0
     progress_checker_plugins: ["progress_checker"]
     goal_checker_plugins: ["general_goal_checker"]
     controller_plugins: ["FollowPath"]
@@ -83,41 +102,48 @@ controller_server:
 
     progress_checker:
       plugin: "nav2_controller::SimpleProgressChecker"
-      required_movement_radius: 0.5
-      movement_time_allowance: 10.0
+      # Permit slow cornering in narrow aisles; the checker measures translation
+      # only, so the former 0.5 m / 10 s falsely failed while turning in place.
+      required_movement_radius: 0.15
+      movement_time_allowance: 20.0
 
     general_goal_checker:
       stateful: True
       plugin: "nav2_controller::SimpleGoalChecker"
-      xy_goal_tolerance: 0.25
-      yaw_goal_tolerance: 0.5
+      # Tightened from 0.25/0.5: the docked base pose sets where the 0.353 m
+      # arm reach drops a cube. 0.05 m proved unreachable for DWB here, so this
+      # is the practical compromise that still keeps the drop inside the zone.
+      xy_goal_tolerance: 0.10
+      yaw_goal_tolerance: 0.12
 
     # DWB 控制器配置
     FollowPath:
       plugin: "dwb_core::DWBLocalPlanner"
       debug_trajectory_details: True
-      min_vel_x: 0.0
-      min_vel_y: 0.0
-      max_vel_x: 1.0
+      min_vel_x: -0.1
+      min_vel_y: -0.0
+      # Conservative competition speeds keep the tall arm chassis from being
+      # thrown or tipped during recovery turns and obstacle avoidance.
+      max_vel_x: 0.45
       max_vel_y: 0.0          # 差速机器人无侧向速度
-      max_vel_theta: 1.9
+      max_vel_theta: 1.0
       min_speed_xy: 0.0
-      max_speed_xy: 1.0
+      max_speed_xy: 0.45
       min_speed_theta: 0.0
-      acc_lim_x: 2.5
+      acc_lim_x: 1.0
       acc_lim_y: 0.0
-      acc_lim_theta: 3.2
-      decel_lim_x: -2.5
+      acc_lim_theta: 1.5
+      decel_lim_x: -2.0
       decel_lim_y: 0.0
-      decel_lim_theta: -3.2
-      vx_samples: 20
+      decel_lim_theta: -1.5
+      vx_samples: 15
       vy_samples: 5
-      vtheta_samples: 20
-      sim_time: 1.7
+      vtheta_samples: 15
+      sim_time: 1.5
       sim_granularity: 0.05
       angular_sim_granularity: 0.1
-      xy_goal_tolerance: 0.25
-      yaw_goal_tolerance: 0.5
+      xy_goal_tolerance: 0.10
+      yaw_goal_tolerance: 0.12
       transform_tolerance: 0.1
       critics: ["RotateToGoal", "Oscillation", "BaseObstacle", "GoalAlign", "PathAlign", "PathDist", "GoalDist"]
       RotateToGoal:
@@ -144,15 +170,19 @@ local_costmap:
       global_frame: odom
       robot_base_frame: base_footprint
       rolling_window: true
-      width: 3
-      height: 3
+      # Give spin/backup recoveries enough room to project their trajectories.
+      width: 5
+      height: 5
       resolution: 0.05
-      robot_radius: 0.3
-      plugins: ["voxel_layer", "inflation_layer"]
+      robot_radius: 0.2
+      # Keep static walls in the rolling local window. Laser-only marking can
+      # miss wall corners while the carried arm/cube occludes or passes above
+      # parts of the scan, letting DWB cut a physically impossible corner.
+      plugins: ["static_layer", "voxel_layer", "inflation_layer"]
       inflation_layer:
         plugin: "nav2_costmap_2d::InflationLayer"
         cost_scaling_factor: 3.0
-        inflation_radius: 0.45
+        inflation_radius: 0.32
       voxel_layer:
         plugin: "nav2_costmap_2d::VoxelLayer"
         enabled: True
@@ -186,7 +216,7 @@ global_costmap:
       publish_frequency: 1.0
       global_frame: map
       robot_base_frame: base_footprint
-      robot_radius: 0.30
+      robot_radius: 0.20
       resolution: 0.05
       track_unknown_space: true
       plugins: ["static_layer", "obstacle_layer", "inflation_layer"]
@@ -210,7 +240,7 @@ global_costmap:
       inflation_layer:
         plugin: "nav2_costmap_2d::InflationLayer"
         cost_scaling_factor: 3.0
-        inflation_radius: 0.45
+        inflation_radius: 0.32
       always_send_full_costmap: True
 
 map_server:
@@ -233,7 +263,9 @@ map_saver:
 planner_server:
   ros__parameters:
     use_sim_time: True
-    expected_planner_frequency: 20.0
+    # Measured planning throughput is 1.6-2.5 Hz with Gazebo sensors active.
+    # Match that capacity instead of generating deadline warnings at 5 Hz.
+    expected_planner_frequency: 2.0
     planner_plugins: ["GridBased"]
     GridBased:
       plugin: "nav2_navfn_planner/NavfnPlanner"
@@ -301,7 +333,7 @@ velocity_smoother:
     min_velocity: [-0.8, 0.0, -2.0]
     max_accel: [2.5, 0.0, 3.2]
     max_decel: [-2.5, 0.0, -3.2]
-    odom_topic: "odometry/filtered"
+    odom_topic: "odom"
     odom_duration: 0.1
     deadband_velocity: [0.0, 0.0, 0.0]
     velocity_timeout: 1.0

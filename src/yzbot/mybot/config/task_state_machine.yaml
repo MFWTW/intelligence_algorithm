@@ -1,0 +1,10 @@
+task_state_machine:
+  ros__parameters:
+    # The worker already retries each Nav2 goal. Keep supervisor retries low so
+    # failure budgets do not multiply into an unbounded competition run.
+    max_object_retries: 1
+    skip_failed_object: false
+    object_timeout_sec: 240.0
+    task_timeout_sec: 290.0
+    health_loss_grace_sec: 3.0
+    autostart: true

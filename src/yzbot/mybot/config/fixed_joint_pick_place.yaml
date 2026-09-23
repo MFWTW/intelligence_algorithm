@@ -1,0 +1,167 @@
+fixed_joint_pick_place:
+  ros__parameters:
+    # Delivery request. The launch file can override cube_name and warehouse.
+    cube_name: red_cube_1
+    warehouse: A
+
+    # Map-frame coarse pickup poses [x, y, yaw]. Approach from the east so the
+    # requested low-number cube is not hidden by its same-colour row. Most goals
+    # park 0.58 m east; red_cube_2 needs extra clearance from its inflated laser
+    # obstacle, and the visual servo closes the additional distance. yaw=pi
+    # points the arm west.
+    navigation_frame: map
+    pickup_red_cube_1_pose: [-9.420, -6.464152, 3.141593]
+    pickup_red_cube_2_pose: [15.350, -2.0, 3.141593]
+    pickup_red_cube_3_pose: [-11.420, -13.0, 3.141593]
+    pickup_red_cube_4_pose: [13.580, -9.0, 3.141593]
+    pickup_red_cube_5_pose: [-0.420, -6.0, 3.141593]
+    pickup_blue_cube_1_pose: [-7.420, -3.0, 3.141593]
+    pickup_blue_cube_2_pose: [-8.420, 3.0, 3.141593]
+    pickup_blue_cube_3_pose: [8.580, -6.0, 3.141593]
+    pickup_blue_cube_4_pose: [10.580, 4.0, 3.141593]
+    pickup_blue_cube_5_pose: [-4.420, -12.0, 3.141593]
+    use_backup_pickup_pose: true
+    pickup_backup_offset_m: 0.15
+    # While Nav2 is moving, cancel its action on the first entry into this
+    # base-centre distance and hand exclusive velocity control to vision. This
+    # works even when the global path passes the cube before its final goal.
+    enable_visual_handoff: true
+    visual_handoff_distance_m: 1.5
+
+    # The plates are centred at x=5 and y=-11/-12/-13. With the tighter Nav2
+    # goal checker the old shortfall compensation over-corrected the dock. A
+    # headless closed-loop run measured the released cube 0.358 m in front and
+    # 0.016 m left of the base goal, so compensate that physical arm offset.
+    warehouse_a_pose: [4.642, -11.016, 0.0]
+    warehouse_b_pose: [4.642, -12.016, 0.0]
+    warehouse_c_pose: [4.642, -13.016, 0.0]
+    # Loaded blue_cube_1 gets trapped following the single long path beside
+    # Wall_57. Cross its open north end with generous mapped clearance first.
+    blue_cube_1_warehouse_b_via_1: [-4.2, 0.0, 0.0]
+    blue_cube_1_warehouse_b_via_2: [-2.3, 0.0, 0.0]
+
+    # Target Gazebo model/link names.
+    robot_model_name: six_arm
+    robot_base_link: base_footprint
+    # The folded arm reaches about 0.32 m even before attachment. The previous
+    # 0.20 m radius let the blue_cube_1 route pass only 0.28 m from Wall_57,
+    # physically wedging the arm although Nav2 considered the centre path legal.
+    empty_robot_radius_m: 0.32
+    empty_inflation_radius_m: 0.42
+    # At 0.35 m the blue-to-B route reached Wall_57 at exactly 0.35 m
+    # clearance; BaseObstacle then rejected all 255 trajectories. Keep a 5 cm
+    # loaded safety margin and inflate far enough for the planner to prefer it.
+    loaded_robot_radius_m: 0.40
+    loaded_inflation_radius_m: 0.60
+    robot_attach_link: link6
+    cube_link: link
+
+    # Keep true when using competition_bringup.launch.py.
+    require_system_ready: true
+    ready_timeout_sec: 180.0
+    action_timeout_sec: 30.0
+    # Cross-map delivery can make slow but valid progress through narrow aisles.
+    navigation_timeout_sec: 150.0
+    navigation_retry_count: 2
+    service_timeout_sec: 10.0
+
+    # Fine alignment writes to the Nav2 smoother's input topic so the smoother
+    # stays the only publisher of /cmd_vel, then resumes normal navigation.
+    enable_visual_alignment: true
+    camera_topic: /camera/image_raw
+    fine_cmd_vel_topic: /cmd_vel_nav
+    # From the 1.5 m base handoff the camera must cover about 1.1 m before the
+    # final creep, so allow enough time at the deliberately low 0.06 m/s limit.
+    visual_timeout_sec: 75.0
+    visual_detection_stale_sec: 0.5
+    # A 30 mm cube is only about 17 x 14 px at the handoff distance. The
+    # lower-half and aspect filters still reject most non-floor red regions.
+    visual_min_contour_area: 100.0
+    # Extreme pure-red threshold for Gazebo/Red cubes. Brick-red walls are much
+    # darker and have substantially more green/blue, so they fail both tests.
+    visual_red_min_saturation: 200
+    visual_red_min_value: 100
+    visual_red_dominance_ratio: 2.5
+    # Gazebo calibration for this robot: the 0.093 m high, level camera maps a
+    # floor point to row = 360 + 66.0 / (standoff - 0.015). Row 680 keeps the
+    # stop well clear of the 720 px frame edge, and the 10 px band survives
+    # bottom-row jitter without letting the creep overshoot into the cube.
+    visual_approach_row: 680.0
+    visual_row_tolerance: 10.0
+    # The creep to the 0.173 m grasp standoff is computed from the measured
+    # bottom row (k and offset from the same calibration), so any stop inside
+    # the band lands link6 on the cube. visual_final_creep_m is a manual trim.
+    visual_row_distance_k: 66.0
+    visual_row_distance_offset_m: 0.015
+    # During visual control, reject red/brown furniture if its bottom row is
+    # inconsistent with the target cube's live range. The camera is mounted
+    # about 0.18 m ahead of base_footprint.
+    camera_forward_offset_m: 0.18
+    visual_expected_row_tolerance: 80.0
+    # 0.187 m keeps link6 ~14 mm short of the cube centre, so the pre-grasp
+    # swing (link6 reaches 0.397 m) passes above the cube instead of striking it.
+    visual_target_standoff_m: 0.187
+    visual_final_creep_m: 0.0
+    visual_creep_speed: 0.025
+    visual_center_tolerance: 0.04
+    visual_linear_gain: 0.25
+    visual_angular_gain: 0.8
+    visual_max_linear_speed: 0.06
+    visual_max_angular_speed: 0.25
+    visual_stable_frames: 3
+    # Rotate in place to find the cube when coarse parking left it out of view.
+    visual_search_rate: 0.35
+    visual_search_timeout_sec: 18.0
+
+    # Prevent the Gazebo plugin from attaching a distant cube.
+    require_proximity_check: true
+    proximity_timeout_sec: 5.0
+    # Calibrated in Gazebo: at the aligned standoff link6 sits 0.063 m from the
+    # cube centre (the fingers reach down to the cube), so 0.09 m accepts the
+    # calibrated grasp while still rejecting a remote attachment.
+    max_attach_distance_m: 0.09
+    max_attached_distance_m: 0.12
+
+    # Confirm the released cube rests inside the 1.0 x 0.5 m target zone.
+    verify_placement: true
+    zone_a_centre: [5.0, -11.0]
+    zone_b_centre: [5.0, -12.0]
+    zone_c_centre: [5.0, -13.0]
+    zone_half_length_m: 0.5
+    zone_half_width_m: 0.25
+    # 0.015 keeps the whole 0.03 m cube inside the 1.0 x 0.5 m plate edges.
+    placement_tolerance_m: 0.015
+    placement_settle_sec: 1.5
+    # Gazebo keeps a small residual velocity in a released cube; without this
+    # the cube creeps out of the zone after the run reports success.
+    stabilize_release: true
+
+    arm_motion_sec: 3.0
+    gripper_motion_sec: 1.0
+    settle_sec: 0.4
+
+    # Joint angles calibrated in Gazebo against link6: the grasp/place posture
+    # puts the gripper fingers at the cube centre (link6 origin 0.063 m above),
+    # and these values are kept as verified rather than re-solved.
+    home_joints: [0.0, 0.6102, 1.2593, 0.0, -1.4931, 0.0]
+    pre_grasp_joints: [0.0, 0.9, 1.17, 0.0, -0.3, 0.0]
+    grasp_joints: [0.0, 1.2, 1.17, 0.0, -0.3, 0.0]
+    lift_joints: [0.0, 0.9, 1.17, 0.0, -0.3, 0.0]
+
+    # The cube remains attached while the arm is in this folded posture and
+    # Nav2 carries the robot to the selected warehouse.
+    transport_joints: [0.0, 0.6102, 1.2593, 0.0, -1.4931, 0.0]
+
+    # Warehouse docking yaw is zero, so placement is forward (+x). The place
+    # posture is raised (q2/q3) so the released cube lands *on* the 0.02 m thick
+    # zone plate: the lower grasp posture released it 5 mm inside the plate and
+    # ODE slowly ejected it out of the zone.
+    pre_place_joints: [0.0, 0.9, 1.17, 0.0, -0.3, 0.0]
+    place_joints: [0.0, 1.035, 1.295, 0.0, -0.3, 0.0]
+
+    # The fixed Gazebo joint, not finger contact, carries the cube. Keep the
+    # 75 mm finger gap open after attachment: even the former 35 mm gap left
+    # only 2.5 mm clearance per side, and contact jitter fought the fixed joint
+    # hard enough to launch the complete robot outside the map at >100 m/s.
+    gripper_open: 0.0
+    gripper_closed: 0.0

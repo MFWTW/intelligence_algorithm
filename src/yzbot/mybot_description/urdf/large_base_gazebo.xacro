@@ -18,8 +18,11 @@
 
         <gazebo reference="${prefix}_wheel_link">
             <material>Gazebo/Gray</material>
-            <mu1>100000.0</mu1>
-            <mu2>100000.0</mu2>
+            <!-- Keep ODE contact constraints well-conditioned. Extremely large
+                 friction values can inject explosive impulses when a wheel or
+                 caster catches an obstacle, launching the whole robot. -->
+            <mu1>2.0</mu1>
+            <mu2>2.0</mu2>
         </gazebo>
     </xacro:macro>
 
@@ -45,7 +48,11 @@
             <update_rate>30</update_rate>
             <left_joint>left_wheel_joint</left_joint>
             <right_joint>right_wheel_joint</right_joint>
-            <wheel_separation>${wheel_joint_y*2}</wheel_separation>
+            <!-- Wheel joint origins are at y=+/-(base_width+wheel_length)/2,
+                 so the physical centre-to-centre track is 0.370 m.  The old
+                 wheel_joint_y*2 value was 0.760 m and made commanded turns
+                 roughly twice as aggressive as the real chassis geometry. -->
+            <wheel_separation>${base_width+wheel_length}</wheel_separation>
             <wheel_diameter>${2*wheel_radius}</wheel_diameter>
             <max_wheel_torque>10</max_wheel_torque>
             <max_wheel_acceleration>1.0</max_wheel_acceleration>

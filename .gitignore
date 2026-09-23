@@ -22,3 +22,19 @@ Thumbs.db
 
 # Preserved metadata from the vendored upstream repository
 .git.upstream/
+
+# Runtime diagnostics and ROS recordings
+run_logs/
+rosbag2_*/
+*.bag
+*.db3
+
+# Python virtual environments
+venv/
+.venv/
+env/
+
+# Local-only duplicate notes and crash artifacts
+/Readme.txt
+core
+core.*

@@ -33,7 +33,9 @@
 
         <gazebo reference="${prefix}_link">
             <sensor type="camera" name="camera_node">
-                <update_rate>30.0</update_rate>
+                <!-- 15 Hz is sufficient for the visual servo and avoids
+                     overloading Ogre/D3D12 under Gazebo Classic on WSL. -->
+                <update_rate>15.0</update_rate>
                 <camera name="head">
                     <horizontal_fov>1.3962634</horizontal_fov>
                     <image>

@@ -13,8 +13,10 @@
                 </geometry>
             </visual>
             <collision>
+                <!-- Match the physical housing. The former 0.30 m-wide box
+                     could contact the floor/object while the arm was folded. -->
                 <geometry>
-                    <box size="0.07 0.3 0.09" />
+                    <box size="0.15 0.04 0.04" />
                 </geometry>
             </collision>
         </link>
@@ -29,8 +31,10 @@
 
         <gazebo reference="${prefix}_link">
             <sensor type="depth" name="${prefix}">
-                <always_on>true</always_on>
-                <update_rate>15.0</update_rate>
+                <!-- This depth stream is not used by fixed pick/place. Keep it
+                     demand-driven and light to prevent WSL D3D12 device loss. -->
+                <always_on>false</always_on>
+                <update_rate>5.0</update_rate>
                 <pose>0 0 0 0 0 0</pose>
                 <camera name="camera">
                     <horizontal_fov>${60.0*M_PI/180.0}</horizontal_fov>

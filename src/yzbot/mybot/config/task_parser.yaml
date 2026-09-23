@@ -1,0 +1,65 @@
+task_parser:
+  ros__parameters:
+    # ---- 出题程序 ----------------------------------------------------
+    # 题目生成器（x86_64 Linux ELF）。运行一次向 stdout 输出一行题目。
+    generator_path: /home/yaowei/dev_ws/TMSCQtest_x86_x64.bin
+    generator_timeout_sec: 10.0
+    # 调试用：非空时直接解析这段题目，不调用出题程序。
+    problem_override: ''
+
+    # ---- 云端大模型 --------------------------------------------------
+    # API Key 只从环境变量 DEEPSEEK_API_KEY 读取，绝不写入本文件。
+    api_key_env: DEEPSEEK_API_KEY
+    api_base_url: https://api.deepseek.com/chat/completions
+    model: deepseek-chat
+    temperature: 0.0
+    max_tokens: 400
+    request_timeout_sec: 40.0
+    max_retries: 4
+    retry_backoff_sec: 1.5
+    # 备用模型：主模型连续失败后切换（留空则不切换）。
+    fallback_model: deepseek-reasoner
+
+    # ---- 题目解析规则 ------------------------------------------------
+    # 大模型只负责“解题”：统计两种物品总需求、按容器容量向上取整得到 x、y。
+    # 颜色与区域都不交给模型判断，由下面两组规则在本地确定性计算。
+    mapping_rules: |
+      1. 题面中“每个<容器>有N个<物品>”表示一个容器可装 N 件物品，填入 capacity。
+      2. 你只做信息抽取：把题面里每个人需要的数量逐行列出，不要自己做求和、
+         不要自己做除法、不要输出总数。
+      3. first 表示题面中先出现的物品类别，second 表示后出现的物品类别。
+         例：T恤、裤子 -> first=T恤，second=裤子。
+      4. “甲、乙都需要N个X”必须拆成两行（甲一行、乙一行），每行都是 N，
+         顿号里有几个人就写几行。
+      5. 不要做颜色或区域的判断。
+
+    system_prompt: |
+      你是机器人比赛的任务解析器。请严格按照下面的规则，把中文应用题解析成 JSON。
+      只输出 JSON 对象，不要输出任何其他内容。
+
+    output_schema: '{"capacity":<int>,"items":[{"who":"<人名>","first":<int>,"second":<int>}]}'
+
+    # ---- 颜色映射：计算结果 -> 方块颜色 ------------------------------
+    # 对应赛前规则“x代表红色，y代表蓝色”。
+    color_x: red
+    color_y: blue
+
+    # ---- 区域映射：数量 -> 区域 查表 ----------------------------------
+    # 出题程序保证 x、y 均 >= 1 且 x + y = 5，所以数量只可能是 1、2、3、4。
+    # 本表按数量 1、2、3、4 依次给出区域，可表达任意赛前规则（含 B 区）。
+    # 示例规则“数量大于等于3的去A区，其他颜色去C区”即：
+    #   1->C, 2->C, 3->A, 4->A
+    zone_by_count: ['C', 'C', 'A', 'A']
+    # 赛前给出的规则原文，仅用于日志和 /competition/task_rules 发布。
+    zone_rule_text: '数量大于等于3的去A区，其他颜色去C区'
+
+    # ---- 结果不变量（出题程序背景约束） ------------------------------
+    # 所有题目的 x、y 均 >= 1 且 x + y = 5。这是独立于题面算术的强校验，
+    # 即使遇到没见过的题型也能挡住模型数错。若出题程序改版请调整。
+    enforce_count_invariant: true
+    min_count_per_color: 1
+    expected_total_counts: 5
+
+    # ---- 校验 --------------------------------------------------------
+    # 场景中红/蓝方块各有 5 个，总任务数超过则判为非法。
+    max_cubes_per_color: 5
