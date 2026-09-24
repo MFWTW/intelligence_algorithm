@@ -6,9 +6,14 @@
 
 - Ubuntu 22.04
 - ROS 2 Humble
-- Gazebo
+- Gazebo Classic 11
 - Nav2
 - MoveIt 2
+
+**新机器请先看 [`DEPENDENCIES.md`](DEPENDENCIES.md)**：里面有实测版本基线、
+一键安装命令、每个依赖的用途，以及「哪些不用装」。对应的清单文件是
+[`requirements-ros.txt`](requirements-ros.txt)（apt / ROS 包）和
+[`requirements.txt`](requirements.txt)（pip 的 Python 库）。
 
 ## 源码结构
 
@@ -22,6 +27,11 @@
 
 ```bash
 cd ~/dev_ws
+# 依赖没装齐时先补（详见 DEPENDENCIES.md）
+#   grep -vE '^\s*(#|$)' requirements-ros.txt | xargs sudo apt install -y
+#   python3 -m pip install -r requirements.txt
+# 或者用 rosdep 自动推导：
+#   rosdep install --from-paths src --ignore-src -r -y
 colcon build --symlink-install
 source install/setup.bash
 ```

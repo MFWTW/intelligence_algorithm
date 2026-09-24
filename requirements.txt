@@ -1,0 +1,15 @@
+# Python 侧依赖（pip）
+#
+# 说明：这个工程 ROS 相关的一切（rclpy、cv_bridge、tf2、moveit、nav2）都必须用
+# apt 的 ros-humble-* 安装，**不要**用 pip 装，否则 ABI/环境会错乱。
+# 这里只列真正的第三方 Python 库。
+#
+# 安装：python3 -m pip install -r requirements.txt
+#
+# 需要 NumPy（fixed_joint_pick_place.py 的 HSV 掩码与轮廓运算）。
+# apt 的 python3-numpy（1.21.5）就够用；装了 pip 版会覆盖 apt 版，两者都可以。
+numpy>=1.21
+
+# OpenCV 默认来自 apt 的 python3-opencv（4.5.4，与 cv_bridge 配套）。
+# 只有在 apt 装不了、必须走 pip 时才启用下面这行，并且别和 apt 版同时 import：
+# opencv-python>=4.5
