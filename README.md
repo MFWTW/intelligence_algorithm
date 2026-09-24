@@ -192,4 +192,46 @@ ros2 launch mybot fixed_joint_pick_place.launch.py \
 距离过大时拒绝远距离吸附；放置后会校验落点是否在区域内。
 注意已放置的方块仍会被后续导航路径推挤，连续作业需为已放置方块预留绕行路径。
 
+## 故障排查：动作目标响应超时 / 节点互相发现不到
+
+典型日志：
+
+```
+[arm_controller]: Received new action goal
+[arm_controller]: Accepted new action goal
+[arm_controller.rclcpp_action]: Failed to send goal response ... (timeout): client will not receive response
+[fixed_joint_pick_place]: arm transport raised an exception: MOTION_STATE_UNKNOWN: goal response timed out
+[task_state_machine]: UNSAFE_OBJECT_STATE:PRE_GRASP:arm transport:FAILED:STATE_UNKNOWN
+```
+
+控制器**已经接受**了目标，但 Fast DDS 只给服务响应约 100 ms 的投递窗口；
+响应被丢掉后客户端等满 `action_timeout_sec`，只能判定状态未知并安全停机。
+同类症状还有：新起的节点看不到 `/navigate_to_pose`、代价地图服务等
+（`Timed out waiting for ...`），而服务端其实活着。
+
+根因是 WSL 上 Fast DDS 的残留状态：反复 Ctrl-C / `kill -9` 之后，
+`/dev/shm/fastrtps_*` 会留下上百个死进程的共享内存段，`ros2 daemon`
+也可能长期挂着旧 participant，新进程就会随机匹配不上端点。
+
+处理办法（**必须在没有 ROS/Gazebo 进程运行时**执行，然后重新拉起仿真）：
+
+```bash
+ros2 run mybot reset_dds_cache.sh
+```
+
+脚本会停掉 ros2 daemon 并清掉残留段。同一份代码实测对比：清理前连续三次启动
+执行器分别卡在 10 s / 55 s / 55 s 的三个**不同**端点上；清理后 0.7 s 通过全部
+10 项依赖检查，并完整跑完一次抓取配送。
+
+想彻底不走共享内存（用一点拷贝开销换稳定），可选用仓库里的纯 UDPv4 profile：
+
+```bash
+export FASTRTPS_DEFAULT_PROFILES_FILE=\
+  $(ros2 pkg prefix mybot)/share/mybot/config/fastdds_wsl_udp.xml
+```
+
+另外 `fixed_joint_pick_place.yaml` 里 `action_retry_count` 会对“目标响应丢失”
+做有限次重试（重发同一个目标，幂等安全），`dependency_timeout_sec` 控制启动时
+等待各 action/service 出现的时长。
+
 更详细的开发计划见 [`比赛后续开发任务清单.md`](比赛后续开发任务清单.md)。

@@ -39,10 +39,19 @@ class TaskStateMachine(Node):
         self.declare_parameter('executor_params_file', '')
         self.declare_parameter('max_object_retries', 1)
         self.declare_parameter('skip_failed_object', False)
-        self.declare_parameter('object_timeout_sec', 240.0)
-        self.declare_parameter('task_timeout_sec', 290.0)
+        self.declare_parameter('object_timeout_sec', 300.0)
+        # The generated problem guarantees x + y = 5, so every competition run
+        # carries five cubes and cannot fit in a fixed short budget: measured
+        # per-cube wall time is about 184 s. 0 means "derive the budget from the
+        # queue length"; a positive value is used verbatim as an override.
+        self.declare_parameter('task_timeout_sec', 0.0)
+        self.declare_parameter('task_timeout_per_object_sec', 360.0)
+        self.declare_parameter('task_startup_grace_sec', 180.0)
         self.declare_parameter('health_loss_grace_sec', 3.0)
         self.declare_parameter('autostart', True)
+        # A finished or failed run must be repeatable: the parser republishes the
+        # same JSON when the same problem is generated again.
+        self.declare_parameter('allow_task_replay', True)
 
         qos = QoSProfile(depth=1)
         qos.reliability = ReliabilityPolicy.RELIABLE
@@ -75,7 +84,7 @@ class TaskStateMachine(Node):
         self._attempt = 0
         self._process = None
         self._process_started = 0.0
-        self._task_started = 0.0
+        self._task_started = None
         self._terminal = False
         self._state = ''
         self._last_task_json = ''
@@ -114,6 +123,23 @@ class TaskStateMachine(Node):
         retry.data = self._attempt
         self._retry_pub.publish(retry)
 
+    def _task_budget(self) -> float:
+        """Wall-clock budget for the whole queue.
+
+        Measured subprocess time is ~184 s per cube and the generated problem
+        always carries five cubes, so a fixed 290 s task timeout killed the run
+        during the second cube. The budget is therefore derived from the queue
+        length unless the operator overrides it explicitly.
+        """
+        override = float(self.get_parameter('task_timeout_sec').value)
+        if override > 0.0:
+            return override
+        per_object = float(
+            self.get_parameter('task_timeout_per_object_sec').value
+        )
+        grace = float(self.get_parameter('task_startup_grace_sec').value)
+        return grace + per_object * max(1, self._total)
+
     def _fail(self, code: str, detail: str) -> None:
         self._stop_child()
         for _ in range(3):
@@ -144,8 +170,17 @@ class TaskStateMachine(Node):
 
     def _task_cb(self, msg: String) -> None:
         raw = msg.data.strip()
-        if not raw or raw == self._last_task_json:
+        if not raw:
             return
+        if raw == self._last_task_json:
+            # Re-running the same problem is only meaningful once the previous
+            # run has settled; while a run is active the duplicate is ignored.
+            if not (
+                bool(self.get_parameter('allow_task_replay').value)
+                and self._terminal
+            ):
+                return
+            self.get_logger().info('Replaying the previous task on request.')
         if self._process is not None:
             self.get_logger().warning('Ignoring a new task while execution is active.')
             return
@@ -190,11 +225,17 @@ class TaskStateMachine(Node):
         self._completed = 0
         self._index = 0
         self._attempt = 0
-        self._task_started = time.monotonic()
+        # The budget starts when the first executor actually launches, not when
+        # the JSON arrives: the parser runs at bringup time, so charging the
+        # task for the Gazebo/Nav2 startup would waste real execution time.
+        self._task_started = None
         self._terminal = False
         self._error_pub.publish(self._string(''))
         self._publish_progress()
-        self.get_logger().info(f'Accepted deterministic task queue: {queue}')
+        self.get_logger().info(
+            f'Accepted deterministic task queue ({len(queue)} objects, '
+            f'budget {self._task_budget():.0f}s): {queue}'
+        )
 
     def _executor_state_cb(self, msg: String) -> None:
         if self._process is not None and msg.data in VALID_STATES:
@@ -248,6 +289,8 @@ class TaskStateMachine(Node):
             self._fail('EXECUTOR_START', str(exc))
             return
         self._process_started = time.monotonic()
+        if self._task_started is None:
+            self._task_started = self._process_started
         self._unsafe_to_retry = False
         self._last_executor_error = ''
         self.get_logger().info(
@@ -307,8 +350,10 @@ class TaskStateMachine(Node):
         if self._terminal or not bool(self.get_parameter('autostart').value):
             return
         now = time.monotonic()
-        if self._queue and now - self._task_started > float(
-            self.get_parameter('task_timeout_sec').value
+        if (
+            self._queue
+            and self._task_started is not None
+            and now - self._task_started > self._task_budget()
         ):
             self._fail('TASK_TIMEOUT', 'competition task exceeded its time budget')
             return

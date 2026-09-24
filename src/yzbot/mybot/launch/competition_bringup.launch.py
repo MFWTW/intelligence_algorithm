@@ -6,6 +6,7 @@ from launch.actions import (
     DeclareLaunchArgument,
     IncludeLaunchDescription,
     RegisterEventHandler,
+    SetEnvironmentVariable,
 )
 from launch.conditions import IfCondition
 from launch.event_handlers import OnProcessExit
@@ -41,6 +42,7 @@ def generate_launch_description():
     nav_map = LaunchConfiguration('nav_map')
     start_task_system = LaunchConfiguration('start_task_system')
     start_task_parser = LaunchConfiguration('start_task_parser')
+    parser_linger_sec = LaunchConfiguration('parser_linger_sec')
 
     gazebo = IncludeLaunchDescription(
         PythonLaunchDescriptionSource(
@@ -125,10 +127,20 @@ def generate_launch_description():
         name='task_parser',
         output='screen',
         condition=IfCondition(start_task_parser),
-        parameters=[parser_params],
+        parameters=[
+            parser_params,
+            {'linger_sec': ParameterValue(parser_linger_sec, value_type=float)},
+        ],
     )
 
     return LaunchDescription([
+        # Same WSL/D3D12 story as gazebo_world2.launch.py: keep every GL
+        # process (Gazebo, MoveIt RViz, Nav2 RViz) on the discrete adapter so
+        # the renderer does not lose its device and drop parts of the scene.
+        SetEnvironmentVariable(
+            'MESA_D3D12_DEFAULT_ADAPTER_NAME',
+            os.environ.get('MESA_D3D12_DEFAULT_ADAPTER_NAME', 'NVIDIA'),
+        ),
         DeclareLaunchArgument(
             'gui', default_value='true', choices=['true', 'false'],
             description='Start the Gazebo graphical client.',
@@ -155,6 +167,12 @@ def generate_launch_description():
                         'from the Gazebo world so AMCL has matching features.',
         ),
         DeclareLaunchArgument(
+            'parser_linger_sec', default_value='45.0',
+            description='How long task_parser keeps /competition/task latched '
+                        'after a successful parse so a late supervisor still '
+                        'receives it. 0 exits immediately.',
+        ),
+        DeclareLaunchArgument(
             'health_timeout', default_value='180.0',
             description='Seconds before the health checker reports a startup timeout.',
         ),
@@ -163,8 +181,9 @@ def generate_launch_description():
             description='Start the competition task state machine.',
         ),
         DeclareLaunchArgument(
-            'start_task_parser', default_value='false', choices=['true', 'false'],
-            description='Run the one-shot cloud task parser automatically.',
+            'start_task_parser', default_value='true', choices=['true', 'false'],
+            description='Run the problem generator and the LLM task parser. '
+                        'Requires DEEPSEEK_API_KEY in the environment.',
         ),
         gazebo,
         # Start the heavy stacks only after sensors and all controllers are

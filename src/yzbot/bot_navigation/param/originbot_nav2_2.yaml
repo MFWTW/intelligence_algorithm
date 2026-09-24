@@ -116,50 +116,114 @@ controller_server:
       xy_goal_tolerance: 0.10
       yaw_goal_tolerance: 0.12
 
-    # DWB 控制器配置
+    # Switched from DWB to MPPI. DWB repeatedly produced a 3-point local plan
+    # with cmd=(0,0) while the global plan was valid and the base was free:
+    # reproduced at (11.2,-8.3) and again at (13.5,-12.2), and it survived
+    # removing the zero-velocity samples, restoring the official critic
+    # weights, disabling the Oscillation critic and lengthening sim_time to
+    # 3.0 s (that last one fixed the corner turn but made every leg 2-3x
+    # slower). MPPI samples 2000 rollouts and scores them with a soft-min, so
+    # it does not settle into the same degenerate optimum.
     FollowPath:
-      plugin: "dwb_core::DWBLocalPlanner"
-      debug_trajectory_details: True
-      min_vel_x: -0.1
-      min_vel_y: -0.0
-      # Conservative competition speeds keep the tall arm chassis from being
-      # thrown or tipped during recovery turns and obstacle avoidance.
-      max_vel_x: 0.45
-      max_vel_y: 0.0          # 差速机器人无侧向速度
-      max_vel_theta: 1.0
-      min_speed_xy: 0.0
-      max_speed_xy: 0.45
-      min_speed_theta: 0.0
-      acc_lim_x: 1.0
-      acc_lim_y: 0.0
-      acc_lim_theta: 1.5
-      decel_lim_x: -2.0
-      decel_lim_y: 0.0
-      decel_lim_theta: -1.5
-      vx_samples: 15
-      vy_samples: 5
-      vtheta_samples: 15
-      sim_time: 1.5
-      sim_granularity: 0.05
-      angular_sim_granularity: 0.1
-      xy_goal_tolerance: 0.10
-      yaw_goal_tolerance: 0.12
+      plugin: "nav2_mppi_controller::MPPIController"
+      time_steps: 56
+      # MPPI requires model_dt >= the control period (1/10 Hz = 0.1 s);
+      # with 0.05 it aborts configure with "Controller period more then
+      # model dt". 56 steps x 0.1 s keeps a 5.6 s horizon.
+      model_dt: 0.1
+      batch_size: 2000
+      ax_max: 3.0
+      ax_min: -3.0
+      ay_max: 3.0
+      az_max: 3.5
+      vx_std: 0.2
+      vy_std: 0.2
+      wz_std: 0.4
+      vx_max: 0.5
+      # No reversing. With vx_min: -0.35 MPPI regularly picked reverse arcs to
+      # line up with the path (recorded /cmd_vel_nav: vx = -0.021..-0.061 while
+      # |wz| ~ 1.0), which reads as the car driving backwards. Forward-only
+      # costs a little geometry freedom; the behavior server's BackUp recovery
+      # still exists for genuinely stuck situations.
+      vx_min: 0.0
+      vy_max: 0.5
+      wz_max: 1.9
+      iteration_count: 1
+      prune_distance: 1.7
       transform_tolerance: 0.1
-      critics: ["RotateToGoal", "Oscillation", "BaseObstacle", "GoalAlign", "PathAlign", "PathDist", "GoalDist"]
-      RotateToGoal:
+      temperature: 0.3
+      gamma: 0.015
+      motion_model: "DiffDrive"
+      visualize: true
+      regenerate_noises: true
+      TrajectoryVisualizer:
+        trajectory_step: 5
+        time_step: 3
+      AckermannConstraints:
+        min_turning_r: 0.2
+      critics: [
+        "ConstraintCritic", "CostCritic", "GoalCritic",
+        "GoalAngleCritic", "PathAlignCritic", "PathFollowCritic",
+        "PathAngleCritic", "PreferForwardCritic"]
+      ConstraintCritic:
         enabled: true
-      Oscillation:
+        cost_power: 1
+        cost_weight: 4.0
+      GoalCritic:
         enabled: true
-      BaseObstacle:
+        cost_power: 1
+        cost_weight: 5.0
+        threshold_to_consider: 1.4
+      GoalAngleCritic:
         enabled: true
-      GoalAlign:
+        cost_power: 1
+        cost_weight: 3.0
+        threshold_to_consider: 0.5
+      PreferForwardCritic:
         enabled: true
-      PathAlign:
+        cost_power: 1
+        cost_weight: 5.0
+        threshold_to_consider: 0.5
+      CostCritic:
         enabled: true
-      PathDist:
+        cost_power: 1
+        cost_weight: 3.81
+        critical_cost: 300.0
+        # The costmaps are configured with a dynamic robot_radius (the
+        # executor rewrites it per phase), so no explicit footprint
+        # polygon exists and MPPI aborts configure with "Considering
+        # footprint in collision checking but no robot footprint".
+        consider_footprint: false
+        collision_cost: 1000000.0
+        near_goal_distance: 1.0
+        trajectory_point_step: 2
+      PathAlignCritic:
         enabled: true
-      GoalDist:
+        cost_power: 1
+        cost_weight: 14.0
+        max_path_occupancy_ratio: 0.05
+        trajectory_point_step: 4
+        threshold_to_consider: 0.5
+        offset_from_furthest: 20
+        use_path_orientations: false
+      PathFollowCritic:
         enabled: true
+        cost_power: 1
+        cost_weight: 5.0
+        offset_from_furthest: 5
+        threshold_to_consider: 1.4
+      PathAngleCritic:
+        enabled: true
+        cost_power: 1
+        cost_weight: 2.0
+        offset_from_furthest: 4
+        threshold_to_consider: 0.5
+        max_angle_to_furthest: 1.0
+        mode: 0
+      # TwirlingCritic:
+      #   enabled: true
+      #   twirling_cost_power: 1
+      #   twirling_cost_weight: 10.0
 
 local_costmap:
   local_costmap:

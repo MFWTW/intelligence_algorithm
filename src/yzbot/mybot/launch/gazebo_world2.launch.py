@@ -1,7 +1,12 @@
 import os
 import re
 from launch import LaunchDescription
-from launch.actions import DeclareLaunchArgument, IncludeLaunchDescription, RegisterEventHandler
+from launch.actions import (
+    DeclareLaunchArgument,
+    IncludeLaunchDescription,
+    RegisterEventHandler,
+    SetEnvironmentVariable,
+)
 from launch.conditions import IfCondition
 from launch.event_handlers import OnProcessExit
 from launch.launch_description_sources import PythonLaunchDescriptionSource
@@ -132,7 +137,18 @@ def generate_launch_description():
     # Gazebo 差速驱动插件已经发布 /odom 和 odom -> base_footprint。
     # 这里不再重复启动 EKF，避免依赖不存在的 config/ekf.yaml，
     # 同时避免两个节点竞争发布同一条 TF。
+    # 这台机器上 gzserver/gzclient 默认走 Mesa 的 D3D12 渲染后端，
+    # 而它默认选中核显（AMD Radeon iGPU，共享内存）。实测核显路径会
+    # 报 "Vertex Buffer: Out of memory" -> "D3D12: Removing Device" 并让
+    # gzserver/gzclient 段错误退出，渲染残缺（例如看不到车体）。
+    # 指定 NVIDIA 独显（这里有 8 GB 独立显存）后同一场景稳定渲染；
+    # 没有 NVIDIA 显卡时 Mesa 会忽略该名字并回落到默认适配器。
+    # 如需强制别的适配器，运行前自行 export 同名环境变量即可。
     ld = LaunchDescription()
+    ld.add_action(SetEnvironmentVariable(
+        'MESA_D3D12_DEFAULT_ADAPTER_NAME',
+        os.environ.get('MESA_D3D12_DEFAULT_ADAPTER_NAME', 'NVIDIA'),
+    ))
     ld.add_action(DeclareLaunchArgument(
         'gui',
         default_value='true',

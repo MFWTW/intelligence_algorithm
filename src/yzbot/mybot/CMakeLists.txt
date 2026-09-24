@@ -17,6 +17,7 @@ install(FILES .setup_assistant DESTINATION share/${PROJECT_NAME})
 
 install(PROGRAMS
   scripts/fixed_joint_pick_place.py
+  scripts/reset_dds_cache.sh
   scripts/startup_gate.py
   scripts/system_health_check.py
   scripts/task_parser.py

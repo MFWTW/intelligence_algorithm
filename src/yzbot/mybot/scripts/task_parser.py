@@ -39,6 +39,11 @@ class TaskParser(Node):
         )
         self.declare_parameter('generator_timeout_sec', 10.0)
         self.declare_parameter('problem_override', '')
+        # The structured task is published transient-local, but a publisher that
+        # exits immediately takes its durability cache with it. Keeping the node
+        # alive briefly guarantees a late-starting supervisor still latches the
+        # task. 0 restores the historical "parse once and exit" behaviour.
+        self.declare_parameter('linger_sec', 0.0)
 
         self.declare_parameter('api_key_env', 'DEEPSEEK_API_KEY')
         self.declare_parameter(
@@ -535,6 +540,17 @@ def main(args=None) -> None:
     exit_code = 1
     try:
         exit_code = 0 if node.run_once() else 1
+        linger = float(node.get_parameter('linger_sec').value)
+        if exit_code == 0 and linger > 0.0:
+            # Keep the transient-local sample alive so a supervisor that starts
+            # after this node finished can still receive /competition/task.
+            node.get_logger().info(
+                f'Holding /competition/task for {linger:.0f}s so late '
+                'subscribers latch it.'
+            )
+            deadline = time.monotonic() + linger
+            while rclpy.ok() and time.monotonic() < deadline:
+                rclpy.spin_once(node, timeout_sec=0.2)
     except KeyboardInterrupt:
         pass
     except Exception as exc:

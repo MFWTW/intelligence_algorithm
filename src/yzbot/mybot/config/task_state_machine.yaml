@@ -4,7 +4,17 @@ task_state_machine:
     # failure budgets do not multiply into an unbounded competition run.
     max_object_retries: 1
     skip_failed_object: false
-    object_timeout_sec: 240.0
-    task_timeout_sec: 290.0
+    # Measured per-cube wall time is 154-199 s (six runs, mean 184 s). 300 s
+    # leaves room for one slow leg without masking a genuinely stuck cube.
+    object_timeout_sec: 360.0
+    # The problem generator guarantees x + y = 5, so every generated task has
+    # five cubes and cannot fit into a fixed short budget. 0 derives the budget
+    # from the queue length; set a positive value to override it outright.
+    task_timeout_sec: 0.0
+    task_timeout_per_object_sec: 420.0
+    task_startup_grace_sec: 180.0
     health_loss_grace_sec: 3.0
     autostart: true
+    # Let a finished/failed task be executed again when the same problem is
+    # regenerated (the parser republishes identical JSON).
+    allow_task_replay: true

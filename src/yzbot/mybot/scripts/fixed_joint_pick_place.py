@@ -24,7 +24,12 @@ from geometry_msgs.msg import PoseStamped, Twist
 from linkattacher_msgs.srv import AttachLink, DetachLink
 from nav2_msgs.action import NavigateToPose
 from nav2_msgs.srv import ClearEntireCostmap
-from rcl_interfaces.msg import Parameter, ParameterType, ParameterValue
+from rcl_interfaces.msg import (
+    Parameter,
+    ParameterDescriptor,
+    ParameterType,
+    ParameterValue,
+)
 from rcl_interfaces.srv import SetParameters
 from rclpy.action import ActionClient
 from rclpy.duration import Duration
@@ -90,6 +95,31 @@ class FixedJointPickPlace(Node):
         # blue_cube_1 -> B otherwise follows the long global path into a DWB
         # local minimum beside Wall_57. These two clearance poses force the
         # loaded robot around the open north end before cross-map transport.
+        # DWB settles into a zero-progress local minimum when a route demands a
+        # large heading correction right beside a concave corner (measured at
+        # Wall_57 and at the doorway next to Wall_115). Instead of tuning the
+        # controller per case, every cube may declare up to two clearance
+        # waypoints that shape its approach; empty means "go direct". The
+        # descriptor must allow dynamic typing: an empty list default is
+        # inferred as BYTE_ARRAY and then rejects the DOUBLE_ARRAY from YAML.
+        # blue_cube_1 sits behind Wall_57, whose only opening is its north end.
+        # red_cube_2 is north of Wall_115 and is only reachable through the
+        # 2.09 m doorway beside it (x ~ 9.7); going direct from warehouse C let
+        # the path drift east of the doorway and then demand a ~180 deg turn at
+        # the wall end, which DWB answered by twitching in place for minutes.
+        pickup_via_defaults = {
+            'blue_cube_1': [[-2.3, 0.0, math.pi], [-4.2, 0.0, math.pi]],
+            'red_cube_2': [[9.65, -7.70, math.pi / 2.0], []],
+        }
+        waypoint_descriptor = ParameterDescriptor(dynamic_typing=True)
+        for cube in pickup_defaults:
+            first, second = pickup_via_defaults.get(cube, [[], []])
+            self.declare_parameter(
+                f'{cube}_pickup_via_1', first, waypoint_descriptor
+            )
+            self.declare_parameter(
+                f'{cube}_pickup_via_2', second, waypoint_descriptor
+            )
         self.declare_parameter(
             'blue_cube_1_warehouse_b_via_1', [-4.2, 0.0, 0.0]
         )
@@ -115,7 +145,19 @@ class FixedJointPickPlace(Node):
         self.declare_parameter('action_timeout_sec', 30.0)
         self.declare_parameter('navigation_timeout_sec', 120.0)
         self.declare_parameter('navigation_retry_count', 2)
+        # Fast DDS gives an action goal *response* only ~100 ms to be delivered,
+        # so a transient transport stall makes the controller's answer vanish
+        # even though it accepted the goal ("Failed to send goal response
+        # (timeout)" appears in the controller's log). That used to abort the
+        # whole task with an unknown motion state. Every retry re-sends exactly
+        # the same target, so letting the possibly-running motion settle first
+        # makes the retry idempotent and safe.
+        self.declare_parameter('action_retry_count', 2)
         self.declare_parameter('service_timeout_sec', 10.0)
+        # Discovering every Nav2 service can take longer than a single service
+        # call budget right after startup, especially on loaded WSL hosts; the
+        # dependency gate gets its own, more generous timeout.
+        self.declare_parameter('dependency_timeout_sec', 60.0)
         self.declare_parameter('require_proximity_check', True)
         self.declare_parameter('verify_placement', True)
         # Map-frame centres of the 1.0 x 0.5 m warehouse plates.
@@ -142,6 +184,20 @@ class FixedJointPickPlace(Node):
         self.declare_parameter('visual_red_min_saturation', 200)
         self.declare_parameter('visual_red_min_value', 100)
         self.declare_parameter('visual_red_dominance_ratio', 2.5)
+        # Blue needs the same treatment. Measured on this Gazebo world: the
+        # blue cube renders as H=120, S=250, V=200 with B/G,B/R > 25, while the
+        # shadowed brick/wood walls that used to be picked up as "blue" sit at
+        # H=103..114, S=87..105, V=135..155 with B/G,B/R of only 1.2..1.6. The
+        # former bare hue window (95..135 with S>=80, V>=45) therefore matched
+        # whole wall patches that were larger than the cube itself, which is
+        # what made the base servo onto walls instead of the cube.
+        self.declare_parameter('visual_blue_hue_min', 110)
+        self.declare_parameter('visual_blue_hue_max', 130)
+        self.declare_parameter('visual_blue_min_saturation', 170)
+        # Shadowed blue faces only lose value (S stays ~250), so this floor is
+        # deliberately low; saturation and channel dominance do the rejecting.
+        self.declare_parameter('visual_blue_min_value', 70)
+        self.declare_parameter('visual_blue_dominance_ratio', 2.0)
         # Gazebo calibration: bottom row = 360 + 66.0 / (standoff - 0.015).
         # Row 680 stops well clear of the 720 px frame edge; the band is wide
         # enough to survive bottom-row jitter but tight enough that the creep
@@ -311,7 +367,34 @@ class FixedJointPickPlace(Node):
 
         hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
         if self._target_colour == 'blue':
-            mask = cv2.inRange(hsv, np.array([95, 80, 45]), np.array([135, 255, 255]))
+            min_saturation = int(
+                self.get_parameter('visual_blue_min_saturation').value
+            )
+            min_value = int(
+                self.get_parameter('visual_blue_min_value').value
+            )
+            hue_min = int(self.get_parameter('visual_blue_hue_min').value)
+            hue_max = int(self.get_parameter('visual_blue_hue_max').value)
+            mask = cv2.inRange(
+                hsv,
+                np.array([hue_min, min_saturation, min_value]),
+                np.array([hue_max, 255, 255]),
+            )
+            # Hue alone also matches the desaturated blue-grey of shadowed
+            # brick/wood walls, so require the blue channel to dominate both
+            # red and green exactly as the red gate does.
+            blue, green, red = cv2.split(image)
+            ratio = float(
+                self.get_parameter('visual_blue_dominance_ratio').value
+            )
+            blue_float = blue.astype(np.float32)
+            dominant = np.where(
+                (blue_float >= ratio * red.astype(np.float32))
+                & (blue_float >= ratio * green.astype(np.float32)),
+                255,
+                0,
+            ).astype(np.uint8)
+            mask = cv2.bitwise_and(mask, dominant)
             box_colour = (255, 0, 0)
         else:
             min_saturation = int(
@@ -461,7 +544,7 @@ class FixedJointPickPlace(Node):
             ):
                 return False
 
-        timeout = float(self.get_parameter('service_timeout_sec').value)
+        timeout = float(self.get_parameter('dependency_timeout_sec').value)
         dependencies = [
             (
                 lambda: self._arm_client.wait_for_server(timeout_sec=0.0),
@@ -503,6 +586,42 @@ class FixedJointPickPlace(Node):
                 return False
         return True
 
+    def _send_goal_tolerant(
+        self,
+        label: str,
+        client: ActionClient,
+        goal,
+        response_timeout: float,
+        settle_sec: float,
+    ):
+        """Send an action goal, retrying when the goal response is lost.
+
+        The controller can accept a goal and still fail to deliver the response
+        (Fast DDS allows roughly 100 ms for a service response). Because each
+        retry re-sends the identical target, waiting for the possibly-executing
+        motion to settle first keeps the retry idempotent. Returns ``None`` when
+        every attempt lost its response.
+        """
+        attempts = max(1, int(self.get_parameter('action_retry_count').value) + 1)
+        for attempt in range(1, attempts + 1):
+            future = client.send_goal_async(goal)
+            rclpy.spin_until_future_complete(
+                self, future, timeout_sec=response_timeout
+            )
+            if future.done():
+                return future.result()
+            self.get_logger().warning(
+                f'{label}: no goal response within {response_timeout:.1f}s '
+                f'(attempt {attempt}/{attempts}); the server may have accepted '
+                'the goal and be executing it, so waiting before re-sending the '
+                'same target.'
+            )
+            if attempt < attempts:
+                end = time.monotonic() + settle_sec
+                while rclpy.ok() and time.monotonic() < end:
+                    rclpy.spin_once(self, timeout_sec=0.1)
+        return None
+
     def _execute_trajectory(
         self,
         label: str,
@@ -523,13 +642,14 @@ class FixedJointPickPlace(Node):
 
         goal = FollowJointTrajectory.Goal()
         goal.trajectory = trajectory
-        send_future = client.send_goal_async(goal)
         timeout = float(self.get_parameter('action_timeout_sec').value)
-        rclpy.spin_until_future_complete(self, send_future, timeout_sec=timeout)
-        if not send_future.done():
+        settle_sec = float(self.get_parameter('settle_sec').value)
+        goal_handle = self._send_goal_tolerant(
+            label, client, goal, timeout, motion_sec + settle_sec
+        )
+        if goal_handle is None:
             raise RuntimeError('MOTION_STATE_UNKNOWN: goal response timed out')
 
-        goal_handle = send_future.result()
         if goal_handle is None or not goal_handle.accepted:
             self.get_logger().error(f'{label}: controller rejected the goal.')
             return False
@@ -733,18 +853,20 @@ class FixedJointPickPlace(Node):
         self.get_logger().info(
             f'Navigate to {label}: x={x:.3f}, y={y:.3f}, yaw={yaw:.3f}.'
         )
-        send_future = self._navigate_client.send_goal_async(goal)
         response_timeout = float(self.get_parameter('service_timeout_sec').value)
-        rclpy.spin_until_future_complete(self, send_future, timeout_sec=response_timeout)
-        if not send_future.done():
+        # Nav2 can lose a goal response the same way the arm controller does;
+        # re-sending the identical pose preempts the old goal and is harmless.
+        goal_handle = self._send_goal_tolerant(
+            label, self._navigate_client, goal, response_timeout, 5.0
+        )
+        if goal_handle is None:
             self.get_logger().error(
                 f'Nav2 did not acknowledge {label} within '
                 f'{response_timeout:.1f}s; refusing to wait indefinitely.'
             )
             self._stop_base()
             raise RuntimeError('NAV_STATE_UNKNOWN: goal response timed out')
-        goal_handle = send_future.result()
-        if goal_handle is None or not goal_handle.accepted:
+        if not goal_handle.accepted:
             self.get_logger().error(f'Nav2 rejected the {label} goal.')
             return False
 
@@ -891,6 +1013,21 @@ class FixedJointPickPlace(Node):
             )
             return False
         handoff_cube = cube if use_handoff else None
+        # Drive any declared clearance waypoints before the final approach so a
+        # concave corner never forces DWB into a large turn at zero clearance.
+        for index in (1, 2):
+            parameter = f'{cube}_pickup_via_{index}'
+            if not self.get_parameter(parameter).value:
+                continue
+            waypoint = self._double_list(parameter, 3)
+            if not self._navigate_to(
+                f'{cube} pickup clearance waypoint {index}',
+                waypoint,
+                completion_radius_m=0.35,
+            ):
+                return False
+            if not self._clear_costmaps():
+                return False
         label = f'{cube} visual handoff' if use_handoff else f'{cube} pre-grasp'
         if self._navigate_to(label, values, handoff_cube):
             return True

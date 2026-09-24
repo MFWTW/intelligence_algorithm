@@ -43,6 +43,7 @@ class SystemHealthCheck(Node):
         # Nav2 nodes can race its lifecycle managers and leave the stack split.
         self.declare_parameter('auto_recover_nav2', False)
         self.declare_parameter('recover_interval_sec', 5.0)
+        self.declare_parameter('controller_query_timeout_sec', 5.0)
 
         self._timeout_sec = float(self.get_parameter('timeout_sec').value)
         self._require_moveit = bool(self.get_parameter('require_moveit').value)
@@ -51,6 +52,7 @@ class SystemHealthCheck(Node):
         self._timed_out = False
         self._last_ready = None
         self._controller_future = None
+        self._controller_requested_at = 0.0
         self._active_controllers = set()
         self._auto_recover = bool(
             self.get_parameter('auto_recover_nav2').value
@@ -59,6 +61,9 @@ class SystemHealthCheck(Node):
             self.get_parameter('recover_interval_sec').value
         )
         self._last_recover = 0.0
+        self._controller_query_timeout = float(
+            self.get_parameter('controller_query_timeout_sec').value
+        )
         self._nav2_states = {}
         self._state_clients = {}
         self._activate_clients = {}
@@ -100,8 +105,21 @@ class SystemHealthCheck(Node):
             self._controller_future = self._controller_client.call_async(
                 ListControllers.Request()
             )
+            self._controller_requested_at = time.monotonic()
             return
         if not self._controller_future.done():
+            # A single lost response used to wedge this checker forever: the
+            # future stayed pending, _active_controllers stayed empty, and
+            # /competition/system_ready never became true even though every
+            # controller was active. Drop a stale request and ask again.
+            if (
+                time.monotonic() - self._controller_requested_at
+                > self._controller_query_timeout
+            ):
+                self.get_logger().warning(
+                    'Controller health query timed out; retrying.'
+                )
+                self._controller_future = None
             return
 
         try:

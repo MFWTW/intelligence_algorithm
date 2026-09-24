@@ -11,7 +11,13 @@ fixed_joint_pick_place:
     # points the arm west.
     navigation_frame: map
     pickup_red_cube_1_pose: [-9.420, -6.464152, 3.141593]
-    pickup_red_cube_2_pose: [15.350, -2.0, 3.141593]
+    # red_cube_2 sits at (14.5, -2.0), only 1.35 m west of the outer east wall
+    # (Wall_10, x = 15.85). The old east-side standoff (15.350, -2.0) left just
+    # 0.50 m of clearance against the 0.74 m the empty footprint needs, so the
+    # planner correctly refused that goal and the leg aborted. Approach from the
+    # south instead: 1.35 m clearance, 1.00 m from the cube (inside the 1.5 m
+    # visual handoff), camera still looking straight at it.
+    pickup_red_cube_2_pose: [14.500, -3.000, 1.570796]
     pickup_red_cube_3_pose: [-11.420, -13.0, 3.141593]
     pickup_red_cube_4_pose: [13.580, -9.0, 3.141593]
     pickup_red_cube_5_pose: [-0.420, -6.0, 3.141593]
@@ -35,8 +41,20 @@ fixed_joint_pick_place:
     warehouse_a_pose: [4.642, -11.016, 0.0]
     warehouse_b_pose: [4.642, -12.016, 0.0]
     warehouse_c_pose: [4.642, -13.016, 0.0]
-    # Loaded blue_cube_1 gets trapped following the single long path beside
-    # Wall_57. Cross its open north end with generous mapped clearance first.
+    # Wall_57 separates warehouse A from blue_cube_1. On a continuous
+    # red_cube_1 -> A then blue_cube_1 -> B run, the direct second pickup path
+    # approaches the south-east wall end and DWB repeatedly reports no progress.
+    # Cross the open north end from east to west before approaching the cube.
+    blue_cube_1_pickup_via_1: [-2.3, 0.0, 3.141593]
+    blue_cube_1_pickup_via_2: [-4.2, 0.0, 3.141593]
+    # red_cube_2 lies north of Wall_115 and can only be reached through the
+    # 2.09 m doorway beside it (x ~ 8.6..10.7). Going direct from warehouse C
+    # let the path drift east of the doorway and then demand a ~180 deg turn at
+    # the wall end, where DWB twitched in place instead of turning. Route
+    # through the doorway centre heading north, then turn to the cube.
+    red_cube_2_pickup_via_1: [9.65, -7.70, 1.570796]
+    # Loaded blue_cube_1 gets trapped following the single long path beside the
+    # same wall. Cross its open north end west-to-east before delivery to B.
     blue_cube_1_warehouse_b_via_1: [-4.2, 0.0, 0.0]
     blue_cube_1_warehouse_b_via_2: [-2.3, 0.0, 0.0]
 
@@ -47,10 +65,15 @@ fixed_joint_pick_place:
     # 0.20 m radius let the blue_cube_1 route pass only 0.28 m from Wall_57,
     # physically wedging the arm although Nav2 considered the centre path legal.
     empty_robot_radius_m: 0.32
+    # Nav2 marks every cell within robot_radius of an obstacle as inscribed, so
+    # a centre at exactly 0.32 m from a wall has all 250 rollouts rejected.
+    # 0.42 m keeps a 0.10 m legal band; raising it to 0.60 m fixed that wedge
+    # but made navigation slow enough to hit the leg timeouts.
     empty_inflation_radius_m: 0.42
     # At 0.35 m the blue-to-B route reached Wall_57 at exactly 0.35 m
-    # clearance; BaseObstacle then rejected all 255 trajectories. Keep a 5 cm
-    # loaded safety margin and inflate far enough for the planner to prefer it.
+    # clearance; BaseObstacle then rejected all 255 trajectories. 0.40 m radius
+    # plus 0.20 m of inflation keeps the planned path clear of the inscribed
+    # band while still fitting the 2.09 m doorway beside Wall_115.
     loaded_robot_radius_m: 0.40
     loaded_inflation_radius_m: 0.60
     robot_attach_link: link6
@@ -61,9 +84,19 @@ fixed_joint_pick_place:
     ready_timeout_sec: 180.0
     action_timeout_sec: 30.0
     # Cross-map delivery can make slow but valid progress through narrow aisles.
-    navigation_timeout_sec: 150.0
+    navigation_timeout_sec: 170.0
     navigation_retry_count: 2
+    # Fast DDS only gives an action goal response about 100 ms to be delivered.
+    # When a transport stall eats that response the controller logs
+    # "Failed to send goal response (timeout)" and the client sees a goal that
+    # was accepted but never answered. Re-sending the identical target is safe,
+    # so retry a lost response this many times before declaring the motion state
+    # unknown (each retry waits for the possible motion first).
+    action_retry_count: 2
     service_timeout_sec: 10.0
+    # Startup discovery of every Nav2 service can exceed a single service-call
+    # budget on a loaded WSL host; the dependency gate waits this long instead.
+    dependency_timeout_sec: 60.0
 
     # Fine alignment writes to the Nav2 smoother's input topic so the smoother
     # stays the only publisher of /cmd_vel, then resumes normal navigation.
@@ -82,6 +115,18 @@ fixed_joint_pick_place:
     visual_red_min_saturation: 200
     visual_red_min_value: 100
     visual_red_dominance_ratio: 2.5
+    # Same idea for Gazebo/Blue cubes (measured H=120, S=250, V=200 with
+    # B/R = B/G > 25). The previous bare hue window also matched shadowed
+    # brick/wood walls (H=103..114, S=87..105, V=135..155, B/R = B/G = 1.2..1.6)
+    # whose blobs were several times larger than the cube, so the base servo
+    # drove at walls. Keep S >= 170 and the 2.0 dominance ratio: together they
+    # removed every wall pixel in the recorded frames while leaving the cube
+    # (about 340 px at the 1.5 m visual handoff) fully detected.
+    visual_blue_hue_min: 110
+    visual_blue_hue_max: 130
+    visual_blue_min_saturation: 170
+    visual_blue_min_value: 70
+    visual_blue_dominance_ratio: 2.0
     # Gazebo calibration for this robot: the 0.093 m high, level camera maps a
     # floor point to row = 360 + 66.0 / (standoff - 0.015). Row 680 keeps the
     # stop well clear of the 720 px frame edge, and the 10 px band survives

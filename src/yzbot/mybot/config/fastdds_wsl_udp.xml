@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<profiles xmlns="http://www.eprosima.com/XMLSchemas/fastRTPS_Profiles">
+  <!-- WSL2（镜像网络模式）下 Fast DDS 的组播发现/共享内存传输经常抽风，
+       典型症状是 action 目标被控制器接收了、但响应送不回来：
+         [arm_controller.rclcpp_action] Failed to send goal response ... (timeout)
+       于是客户端 30 s 后报 MOTION_STATE_UNKNOWN: goal response timed out。
+
+       这个 profile 关掉内建传输，只保留 UDPv4（不再走 SHM），用一点拷贝开销
+       换稳定性。用法（所有需要互通的终端都要带上）：
+
+         export FASTRTPS_DEFAULT_PROFILES_FILE=\
+           $(ros2 pkg prefix mybot)/share/mybot/config/fastdds_wsl_udp.xml
+
+       注意：这是 opt-in。默认不启用，因为它会退掉共享内存零拷贝，
+       大图像话题（/camera/image_raw 1280x720@15Hz）会多几次内存拷贝。 -->
+  <transport_descriptors>
+    <transport_descriptor>
+      <transport_id>udp_transport</transport_id>
+      <type>UDPv4</type>
+    </transport_descriptor>
+  </transport_descriptors>
+  <participant profile_name="udp_only" is_default_profile="true">
+    <rtps>
+      <userTransports>
+        <transport_id>udp_transport</transport_id>
+      </userTransports>
+      <useBuiltinTransports>false</useBuiltinTransports>
+    </rtps>
+  </participant>
+</profiles>
