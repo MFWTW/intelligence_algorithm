@@ -74,6 +74,23 @@ bt_navigator:
     # nav2_bt_navigator/navigate_to_pose_w_replanning_and_recovery.xml
     # nav2_bt_navigator/navigate_through_poses_w_replanning_and_recovery.xml
     # They can be set here or via a RewrittenYaml remap from a parent launch file to Nav2.
+    # 2026-10-06: the stock recovery round (Spin 1.57 rad + Wait 5 + BackUp 0.30 m
+    # @ 0.05 m/s) costs ~12 simulated seconds per attempt, and one loaded
+    # delivery leg burned three progress-checker windows with it. The shipped
+    # tree keeps the same replanning pipeline and retry count but recovers in
+    # ~4 simulated seconds (clear costmaps -> back up 0.15 m -> spin 0.8 rad).
+    #
+    # 2026-10-08: this is an ABSOLUTE path and therefore machine specific - a fresh
+    # clone under a different $HOME will not find it and Nav2 silently falls back
+    # to the stock recovery tree, losing the tuned behaviour. A $HOME form was
+    # tried and reverted: ROS 2 launch does not expand environment variables inside
+    # a parameter file, so the literal "$HOME/..." string reached Nav2 and would
+    # have failed on this machine too. A relative/package form was not verified
+    # either, so the working absolute path stays and the portability fix is left as
+    # a documented follow-up: after cloning, either edit this line to your own
+    # install path or move nav_to_pose_short_recovery.xml into the Nav2 share tree
+    # and point at that.
+    default_nav_to_pose_bt_xml: /home/yaowei/dev_ws/install/mybot/share/mybot/config/nav_to_pose_short_recovery.xml
 
     # plugin_lib_names is used to add custom BT plugins to the executor (vector of strings).
     # Built-in plugins are added automatically
@@ -104,8 +121,11 @@ controller_server:
       plugin: "nav2_controller::SimpleProgressChecker"
       # Permit slow cornering in narrow aisles; the checker measures translation
       # only, so the former 0.5 m / 10 s falsely failed while turning in place.
-      required_movement_radius: 0.15
-      movement_time_allowance: 20.0
+      # 2026-10-06: a loaded leg burned three 20 s windows while standing still,
+      # so detect a real stop sooner (12 s) and with a smaller radius (0.10 m).
+      # Slow-but-valid motion still passes: 0.10 m in 12 s is 8 mm/s.
+      required_movement_radius: 0.10
+      movement_time_allowance: 12.0
 
     general_goal_checker:
       stateful: True
@@ -124,6 +144,10 @@ controller_server:
     # 3.0 s (that last one fixed the corner turn but made every leg 2-3x
     # slower). MPPI samples 2000 rollouts and scores them with a soft-min, so
     # it does not settle into the same degenerate optimum.
+    # 2026-10-07 A/B: MPPI 的 critic 结构把巡航锁在 0.32 m/s（实测与 vx_max、
+    # 膨胀半径、critic 权重都无关）。换回 DWB 检验"直道给满速"能否把巡航拉到 0.8+。
+    # 配置取自 80ab78f 现场验证版，目标容差同步当前 goal checker。
+    # 回滚：cp run_logs/tools/originbot_nav2_2.yaml.mppi <本文件>
     FollowPath:
       plugin: "nav2_mppi_controller::MPPIController"
       time_steps: 56
@@ -139,7 +163,12 @@ controller_server:
       vx_std: 0.2
       vy_std: 0.2
       wz_std: 0.4
-      vx_max: 0.5
+      vx_max: 0.8
+      # Raised from 0.5: the measured single-cube run spent 117 s of 198 s in
+      # the two navigation legs, running well below the cap in the aisles. The
+      # base reaches 0.5 m/s in about 1 s, so the cap - not the wheel
+      # acceleration limit - is what the legs see. Revert to 0.5 if the loaded
+      # (0.40 m radius / 0.60 m inflation) legs clip walls.
       # No reversing. With vx_min: -0.35 MPPI regularly picked reverse arcs to
       # line up with the path (recorded /cmd_vel_nav: vx = -0.021..-0.061 while
       # |wz| ~ 1.0), which reads as the car driving backwards. Forward-only
@@ -188,6 +217,13 @@ controller_server:
         enabled: true
         cost_power: 1
         cost_weight: 3.81
+        # 2026-10-07: 试过 300 -> 150，A/B 实测无效，已改回 300.0。
+        # 同一次会话、同一条 23 m 直道、同一辆车，只切换这一个参数
+        # （/tmp/ab_test.py，NavFn+MPPI 全量栈）：
+        #   critical_cost=300 -> vx 均值 0.331 最大 0.377  35 s 走 9.10 m
+        #   critical_cost=150 -> vx 均值 0.313 最大 0.411  35 s 走 8.53 m
+        # 两档巡航同为 ~0.26 m/s，都摸不到 vx_max=0.8，说明限制巡航的不是
+        # 这个 critic 对膨胀带的定价。继续动它只是白白牺牲离墙余量。
         critical_cost: 300.0
         # The costmaps are configured with a dynamic robot_radius (the
         # executor rewrites it per phase), so no explicit footprint
@@ -224,12 +260,13 @@ controller_server:
       #   enabled: true
       #   twirling_cost_power: 1
       #   twirling_cost_weight: 10.0
-
 local_costmap:
   local_costmap:
     ros__parameters:
       use_sim_time: True
-      update_frequency: 5.0
+      # 2026-10-07: 提速后 5 Hz 意味着 1 m/s 时两次更新间车走 20 cm，
+      # 提到 10 Hz（控制回路就是 10 Hz）把盲走压到 10 cm。
+      update_frequency: 10.0
       publish_frequency: 2.0
       global_frame: odom
       robot_base_frame: base_footprint
@@ -246,7 +283,7 @@ local_costmap:
       inflation_layer:
         plugin: "nav2_costmap_2d::InflationLayer"
         cost_scaling_factor: 3.0
-        inflation_radius: 0.32
+        inflation_radius: 0.36
       voxel_layer:
         plugin: "nav2_costmap_2d::VoxelLayer"
         enabled: True
@@ -304,7 +341,7 @@ global_costmap:
       inflation_layer:
         plugin: "nav2_costmap_2d::InflationLayer"
         cost_scaling_factor: 3.0
-        inflation_radius: 0.32
+        inflation_radius: 0.36
       always_send_full_costmap: True
 
 map_server:

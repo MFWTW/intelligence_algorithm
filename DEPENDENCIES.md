@@ -50,6 +50,7 @@ python3 -m pip install -r requirements.txt
 | 导航 | `navigation2`、`nav2-bringup`、`nav2-mppi-controller`、`nav2-amcl` | 取物/送仓导航、定位（地图 + AMCL） |
 | 机械臂 | `moveit`、`moveit-configs-utils`、`moveit-kinematics` | `move_group` + MoveIt RViz |
 | 视觉 | `python3-opencv`、`cv-bridge`、`image-transport` | HSV 找方块、`/camera/image_raw` 订阅（`numpy` 做掩码） |
+| 比赛可视化 | `foxglove-bridge` | 8765 端口的 WebSocket，Windows 上的 Foxglove 桌面版看状态面板，见 [`FOXGLOVE.md`](FOXGLOVE.md) |
 
 各类的完整逐条清单和注释都在 `requirements-ros.txt` 里。
 
@@ -91,10 +92,20 @@ ros2 launch mybot competition_bringup.launch.py
   ```bash
   ros2 launch mybot competition_bringup.launch.py gui:=false moveit_rviz:=false
   ```
-- 跑出题 + 云端解析需要环境变量（Key 不落盘）：
+- 跑出题 + 云端解析需要 API Key，**存一次即可**（运行时自动加载，Key 不进版本库）：
   ```bash
-  export DEEPSEEK_API_KEY=sk-xxxx
+  ros2 run mybot set_deepseek_key.sh          # 写 ~/.config/mybot/deepseek_api_key (600)
+  ros2 run mybot set_deepseek_key.sh --check  # 确认当前会加载哪个文件
+  # 也可以临时用环境变量：export DEEPSEEK_API_KEY=sk-xxxx
   ```
+  没配好时 `task_parser` 会在日志里说明缺 Key，并发布 `FAILED:CRASH`；
+  总控据此报 `TASK_PARSE:FAILED:CRASH`，不会默默停在 IDLE。
+- 比赛可视化（Foxglove，默认随 bringup 一起起，端口 8765）：
+  ```bash
+  ros2 launch mybot competition_bringup.launch.py foxglove:=true
+  # 没装 ros-humble-foxglove-bridge 时只是打一条警告，其余照常启动
+  ```
+  连接与面板绑定见 [`FOXGLOVE.md`](FOXGLOVE.md)。
 
 ## 6. 装完自检
 

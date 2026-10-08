@@ -36,6 +36,26 @@
 
     <gazebo reference="back_caster_link">
         <material>Gazebo/Black</material>
+        <!-- The caster is a *fixed* sphere, not a swivelling wheel, so it has no
+             steering degree of freedom: during an in-place rotation it must slide
+             sideways along the floor. With Gazebo's default friction (mu = 1.0)
+             it acted as a brake: the base reached only 64-73 % of every commanded
+             yaw rate while straight-line tracking stayed at 99 %. Measured
+             open-loop on a clean Gazebo instance (run_logs/tools/turn_test.py,
+             ground-truth twist):
+                 cmd wz 0.5 -> 0.319 rad/s (63.8 %)
+                 cmd wz 1.0 -> 0.693 rad/s (69.3 %)
+                 cmd wz 1.9 -> 1.383 rad/s (72.8 %)
+             Nav2 kept correcting a heading it never reached, which reads as
+             stuttering turns. 0.01 is the usual caster value; the drive wheels
+             keep mu 2.0, so traction is unaffected. Note this sphere has no
+             swivel joint at all, so low friction is the only way to let it slide
+             without dragging; if turns ever feel loose, raise mu1/mu2 to ~0.05
+             rather than reverting to the default. -->
+        <mu1>0.01</mu1>
+        <mu2>0.01</mu2>
+        <kp>1000000.0</kp>
+        <kd>100.0</kd>
     </gazebo>
 
     <xacro:wheel_transmission prefix="left" />
@@ -55,7 +75,7 @@
             <wheel_separation>${base_width+wheel_length}</wheel_separation>
             <wheel_diameter>${2*wheel_radius}</wheel_diameter>
             <max_wheel_torque>10</max_wheel_torque>
-            <max_wheel_acceleration>1.0</max_wheel_acceleration>
+            <max_wheel_acceleration>10.0</max_wheel_acceleration>
             <command_topic>cmd_vel</command_topic>
             <publish_odom>true</publish_odom>
             <publish_odom_tf>true</publish_odom_tf>

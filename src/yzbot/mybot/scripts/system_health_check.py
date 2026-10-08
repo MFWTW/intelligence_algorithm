@@ -39,10 +39,12 @@ class SystemHealthCheck(Node):
         self.declare_parameter('timeout_sec', 180.0)
         self.declare_parameter('require_moveit', True)
         self.declare_parameter('require_nav2', True)
-        # Observe lifecycle state by default. Directly activating individual
-        # Nav2 nodes can race its lifecycle managers and leave the stack split.
-        self.declare_parameter('auto_recover_nav2', False)
+        # Observe lifecycle state and repair a bringup that wedged. A healthy
+        # bringup finishes well inside recover_grace_sec, so the repair only
+        # ever fires on a stack that is genuinely stuck (see _recover_nav2).
+        self.declare_parameter('auto_recover_nav2', True)
         self.declare_parameter('recover_interval_sec', 5.0)
+        self.declare_parameter('recover_grace_sec', 45.0)
         self.declare_parameter('controller_query_timeout_sec', 5.0)
 
         self._timeout_sec = float(self.get_parameter('timeout_sec').value)
@@ -65,8 +67,10 @@ class SystemHealthCheck(Node):
             self.get_parameter('controller_query_timeout_sec').value
         )
         self._nav2_states = {}
+        self._inactive_since = {}
         self._state_clients = {}
         self._activate_clients = {}
+        self._state_client_created = {}
         if self._require_nav2:
             for name in NAV2_NODES:
                 self._state_clients[name] = self.create_client(
@@ -75,6 +79,7 @@ class SystemHealthCheck(Node):
                 self._activate_clients[name] = self.create_client(
                     ChangeState, f'/{name}/change_state'
                 )
+                self._state_client_created[name] = time.monotonic()
 
         ready_qos = QoSProfile(depth=1)
         ready_qos.reliability = ReliabilityPolicy.RELIABLE
@@ -136,9 +141,26 @@ class SystemHealthCheck(Node):
 
     def _poll_nav2_states(self):
         """Query each Nav2 node's lifecycle state without blocking the timer."""
-        for name, client in self._state_clients.items():
+        now = time.monotonic()
+        for name, client in list(self._state_clients.items()):
             if not client.service_is_ready():
+                # These clients are created before MoveIt/Nav2 exist (they start
+                # only after the startup gate). On WSL/Fast DDS such a client can
+                # stay unmatched *forever*, so the node is reported inactive even
+                # though `ros2 lifecycle get` says active - and the health check
+                # then blocks the task forever. Rebuild the client so discovery
+                # runs again against the now-existing server.
+                if now - self._state_client_created.get(name, now) > 20.0:
+                    self.destroy_client(client)
+                    self._state_clients[name] = self.create_client(
+                        GetState, f'/{name}/get_state'
+                    )
+                    self._state_client_created[name] = now
+                    self.get_logger().warning(
+                        f'{name}: lifecycle service never matched; client rebuilt.'
+                    )
                 continue
+            self._state_client_created[name] = now
             future = client.call_async(GetState.Request())
             future.add_done_callback(
                 lambda done, node_name=name: self._store_state(node_name, done)
@@ -154,23 +176,46 @@ class SystemHealthCheck(Node):
             self._nav2_states[name] = response.current_state.id
 
     def _recover_nav2(self, inactive):
-        """Activate Nav2 nodes the bringup left inactive (rate limited)."""
+        """Nudge Nav2 nodes the bringup left behind (rate limited).
+
+        The lifecycle managers own the normal bringup, but they can wedge
+        permanently. Measured 2026-10-07: the Fast DDS response to
+        map_server's CONFIGURE was dropped, lifecycle_manager_localization
+        stayed blocked inside that one service call forever - no error, no
+        retry, no timeout - so map_server stayed 'inactive', amcl stayed
+        'unconfigured', /competition/system_ready stayed false, and the task
+        sat in IDLE for 201 s until a human activated the nodes by hand.
+        Re-issuing the transition recovers exactly that state, and the
+        recover_grace_sec gate keeps this away from a healthy bringup.
+        """
         now = time.monotonic()
         if now - self._last_recover < self._recover_interval:
             return
         self._last_recover = now
         for name in inactive:
+            state = self._nav2_states.get(name)
+            # Pick the transition the node actually needs: an 'inactive' node
+            # wants ACTIVATE, an 'unconfigured' one wants CONFIGURE first.
+            if state == State.PRIMARY_STATE_UNCONFIGURED:
+                transition, label = Transition.TRANSITION_CONFIGURE, 'CONFIGURE'
+            elif state == State.PRIMARY_STATE_INACTIVE:
+                transition, label = Transition.TRANSITION_ACTIVATE, 'ACTIVATE'
+            else:
+                # Unknown state (never answered a query) or FINALIZED (needs a
+                # cleanup we should not race): leave it to the managers.
+                continue
             client = self._activate_clients.get(name)
             if client is None or not client.service_is_ready():
                 continue
             request = ChangeState.Request()
-            request.transition.id = Transition.TRANSITION_ACTIVATE
+            request.transition.id = transition
             self.get_logger().warning(
-                f'{name} is not active; requesting ACTIVATE.'
+                f'{name} is stuck non-active; requesting {label}.'
             )
             client.call_async(request)
 
     def _check_health(self):
+        now = time.monotonic()
         self._request_controllers()
         topic_names = {name for name, _ in self.get_topic_names_and_types()}
 
@@ -203,8 +248,31 @@ class SystemHealthCheck(Node):
                 name for name in NAV2_NODES
                 if self._nav2_states.get(name) != State.PRIMARY_STATE_ACTIVE
             )
-            if inactive_nav2 and self._auto_recover:
-                self._recover_nav2(inactive_nav2)
+            # Remember since when each node has been non-active, so the repair
+            # below never races a bringup that is simply still in progress.
+            # Only nodes whose state was actually observed may start the clock:
+            # one that has not answered a GetState yet (the manager's configure
+            # order has not reached it) must not count, or the repair fires in
+            # the middle of a healthy bringup - measured 2026-10-07, it
+            # CONFIGUREd smoother_server, velocity_smoother and
+            # waypoint_follower while the manager was still walking the list.
+            known_inactive = [
+                name for name in inactive_nav2
+                if self._nav2_states.get(name) is not None
+            ]
+            for name in known_inactive:
+                self._inactive_since.setdefault(name, now)
+            for name in list(self._inactive_since):
+                if name not in known_inactive:
+                    del self._inactive_since[name]
+            if known_inactive and self._auto_recover:
+                grace = float(self.get_parameter('recover_grace_sec').value)
+                stuck = [
+                    name for name in known_inactive
+                    if now - self._inactive_since.get(name, now) >= grace
+                ]
+                if stuck:
+                    self._recover_nav2(stuck)
         nav2_ready = (
             not self._require_nav2
             or (

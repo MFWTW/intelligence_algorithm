@@ -101,10 +101,18 @@ ros-humble-image-transport
 ros-humble-image-view
 # ros-humble-rqt-image-view
 
-### 7. Python ------------------------------------------------
+### 7. 比赛可视化：Foxglove 状态面板 --------------------------
+# foxglove_bridge 在 8765 端口起 WebSocket，Windows 上的 Foxglove 桌面版
+# 连 ws://localhost:8765（WSL mirrored 网络模式下 localhost 直接互通）。
+# 用法见 FOXGLOVE.md；competition_bringup.launch.py 的 foxglove:= 参数用它。
+ros-humble-foxglove-bridge
+# [可选] 只在需要 rosbridge 协议（例如 coStudio）时才装
+# ros-humble-rosbridge-suite
+
+### 8. Python ------------------------------------------------
 python3-numpy
 # pyyaml / requests 已由 ROS 基础包带入；task_parser 走标准库 urllib，
 # 不额外依赖 requests。
 
-### 8. [可选] 换 RMW 实现（WSL 上 DDS 抽风时的备选）---------
+### 9. [可选] 换 RMW 实现（WSL 上 DDS 抽风时的备选）---------
 # ros-humble-rmw-cyclonedds-cpp

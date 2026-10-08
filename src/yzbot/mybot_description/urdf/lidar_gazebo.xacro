@@ -35,7 +35,10 @@
 
         <gazebo reference="${prefix}_link">
             <sensor type="ray" name="lidar">
-                <update_rate>20</update_rate>
+                <!-- The local costmap refreshes at 5 Hz and the global one at
+                     1 Hz, so 10 Hz is already twice what Nav2 consumes; the old
+                     20 Hz only doubled the ray-casting cost of every frame. -->
+                <update_rate>10</update_rate>
                 <visualize>${gz_visualize}</visualize>
                 <ray>
                     <scan>

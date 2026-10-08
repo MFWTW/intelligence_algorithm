@@ -10,41 +10,99 @@ fixed_joint_pick_place:
     # obstacle, and the visual servo closes the additional distance. yaw=pi
     # points the arm west.
     navigation_frame: map
-    pickup_red_cube_1_pose: [-9.420, -6.464152, 3.141593]
+    pickup_red_cube_1_pose: [-4.945, -5.889, -3.141593]
     # red_cube_2 sits at (14.5, -2.0), only 1.35 m west of the outer east wall
     # (Wall_10, x = 15.85). The old east-side standoff (15.350, -2.0) left just
     # 0.50 m of clearance against the 0.74 m the empty footprint needs, so the
     # planner correctly refused that goal and the leg aborted. Approach from the
     # south instead: 1.35 m clearance, 1.00 m from the cube (inside the 1.5 m
     # visual handoff), camera still looking straight at it.
-    pickup_red_cube_2_pose: [14.500, -3.000, 1.570796]
-    pickup_red_cube_3_pose: [-11.420, -13.0, 3.141593]
-    pickup_red_cube_4_pose: [13.580, -9.0, 3.141593]
-    pickup_red_cube_5_pose: [-0.420, -6.0, 3.141593]
-    pickup_blue_cube_1_pose: [-7.420, -3.0, 3.141593]
-    pickup_blue_cube_2_pose: [-8.420, 3.0, 3.141593]
-    pickup_blue_cube_3_pose: [8.580, -6.0, 3.141593]
-    pickup_blue_cube_4_pose: [10.580, 4.0, 3.141593]
-    pickup_blue_cube_5_pose: [-4.420, -12.0, 3.141593]
+    pickup_red_cube_2_pose: [9.891, 0.014, -3.141593]
+    pickup_red_cube_3_pose: [-9.0, -10.225, 0.0]
+    pickup_red_cube_4_pose: [11.498, -9.761, -3.141593]
+    pickup_red_cube_5_pose: [5.611, -9.867, -3.141593]
+    pickup_blue_cube_1_pose: [-9.415, 0.015, -3.141593]
+    pickup_blue_cube_2_pose: [-9.58, 3.0, 0.0]
+    pickup_blue_cube_3_pose: [8.58, -6.0, -3.141593]
+    pickup_blue_cube_4_pose: [10.58, 4.0, -3.141593]
+    pickup_blue_cube_5_pose: [-2.988, -11.583, -3.141593]
     use_backup_pickup_pose: true
     pickup_backup_offset_m: 0.15
     # While Nav2 is moving, cancel its action on the first entry into this
     # base-centre distance and hand exclusive velocity control to vision. This
     # works even when the global path passes the cube before its final goal.
+    # 1.1 m instead of 1.5 m: the servo is capped at 0.06 m/s while Nav2 cruises
+    # at 0.5 m/s, so every metre left to the slower controller costs ~15 s, and
+    # the cube blob is 2x larger (easier to detect) at the shorter range.
     enable_visual_handoff: true
-    visual_handoff_distance_m: 1.5
+    # 2026-10-07: DWB 巡航 1.0 m/s 时交接判定(10 Hz)会前冲 ~0.16-0.2 m，实测停在
+    # 0.738 m 处视觉锁不住（SEARCHING → 75 s 超时）。提到 1.4 m 让前冲后落回
+    # 一直验证有效的 1.0-1.2 m 区间。
+    #
+    # 实测复核（371 次交接触发 + 86 段伺服日志）：触发点本身很准，全部落在
+    # 1.187-1.200 m；但触发到第一次发零速之间要等 cancel 握手，底盘仍在巡航，
+    # 视觉真正接管时的底盘-方块距离中位数只有 1.052 m、p75 0.912 m。1.4 m 让同样
+    # 的滑行量落回 1.2 m 附近；0.738-0.759 m 的 SEARCHING 超时就是滑行吃掉阈值
+    # 造成的，所以这个值不要再往下调。
+    visual_handoff_distance_m: 1.4
+    # 交接时底盘已经比这更近，相机量程（row 公式在 0.20 m 处饱和）就用不了了，
+    # 先按 visual_handoff_retreat_target_m 倒退再交出控制权。
+    # 注意：这是"兜底"，正常路径不该走到这里——真正会让底盘贴到 0.23 m 的是
+    # *_pickup_via_* 被写成停靠位坐标（见下面 blue_cube_1 / red_cube_2 的注释）。
+    visual_handoff_min_distance_m: 0.85
 
     # The plates are centred at x=5 and y=-11/-12/-13. With the tighter Nav2
     # goal checker the old shortfall compensation over-corrected the dock. A
     # headless closed-loop run measured the released cube 0.358 m in front and
     # 0.016 m left of the base goal, so compensate that physical arm offset.
-    warehouse_a_pose: [4.642, -11.016, 0.0]
-    warehouse_b_pose: [4.642, -12.016, 0.0]
-    warehouse_c_pose: [4.642, -13.016, 0.0]
+    warehouse_a_pose: [7.244, -2.483, -3.141593]
+    warehouse_b_pose: [-7.321, -3.018, -3.141593]
+    warehouse_c_pose: [0.016, -2.702, -1.570796]
+    # Aligned final approach for the delivery legs (added 2026-10-07 after the
+    # round16 recording was decomposed): of the five loaded legs, 56 s - 28% of
+    # their total - were spent crawling and rotating inside the last 0.25 m,
+    # because the global plan ended at an arbitrary heading (measured 155 deg off
+    # on red_cube_4, 43 deg on blue_cube_1) and DWB must rotate in place before it
+    # may report success. The robot therefore drives to an approach point that
+    # faces the zone yaw and only then makes the final straight run in.
+    #
+    # The points currently sit 3.0 m in front of each dock, NOT the 1.5 m this
+    # comment used to claim - the base visibly overshoots the zone, turns, and
+    # comes back, which is the intended (if unlovely) behaviour. The 3.0 m offset
+    # is deliberate: round17 measured a regression with a 1.5 m approach point,
+    # where the final leg was too short for DWB to settle the heading - red_cube_2
+    # drove a 16.6 m path for a 1.48 m leg and took 110 s, blue_cube_1 took 218 s,
+    # and the round total went 475 s -> 595 s, the base circling the goal at max
+    # yaw rate just outside xy_goal_tolerance. The dock itself is NOT blocked: a
+    # GetCostmap probe along y=-11/-12/-13 shows cost 0 from x=3.0 to 5.5 in both
+    # costmaps, so the cure belongs in the final-metre controller (creep the last
+    # 0.4 m without Nav2), not in the route. Costs ~3-4 s of driving per leg and
+    # buys back the 8-24 s of in-place rotation. Set
+    # use_aligned_warehouse_approach: false for the direct route.
+    # DISABLED 2026-10-07: removed again after comparing against round20, the
+    # last round that delivered 5/5. round18/19/20/21 all logged ZERO "aligned
+    # approach" lines - they navigated straight to `warehouse A` and let the dock
+    # creep finish - and round20's own note recorded that the 1.5 m variant turned
+    # a 475 s round into 595 s. Enabled with 3.0 m points it also makes the robot
+    # visibly overshoot the zone, turn, and come back, which costs drive time and
+    # adds a second navigation failure point per delivery leg. The direct route
+    # plus dock creep is the behaviour that was actually measured working.
+    use_aligned_warehouse_approach: false
+    warehouse_a_approach_pose: [10.244, -2.483, -3.141593]
+    warehouse_b_approach_pose: [-4.321, -3.018, -3.141593]
+    warehouse_c_approach_pose: [0.016, 0.298, -1.570796]
     # Wall_57 separates warehouse A from blue_cube_1. On a continuous
     # red_cube_1 -> A then blue_cube_1 -> B run, the direct second pickup path
     # approaches the south-east wall end and DWB repeatedly reports no progress.
     # Cross the open north end from east to west before approaching the cube.
+    #
+    # 2026-10-07: these two keys had been overwritten with the *dock* pose
+    # [-9.415, 0.015]. A clearance waypoint is driven with completion_radius_m
+    # 0.35, so the base was released 0.35 m short of the dock - only 0.23 m from
+    # the cube - and the visual handoff then fired at ~0.25 m instead of 1.2 m.
+    # Restored to the corridor points: both are free space in
+    # room_from_world.pgm (0.80-1.00 m clearance) and the whole
+    # via_2 -> dock -> cube run is unobstructed.
     blue_cube_1_pickup_via_1: [-2.3, 0.0, 3.141593]
     blue_cube_1_pickup_via_2: [-4.2, 0.0, 3.141593]
     # red_cube_2 lies north of Wall_115 and can only be reached through the
@@ -52,11 +110,59 @@ fixed_joint_pick_place:
     # let the path drift east of the doorway and then demand a ~180 deg turn at
     # the wall end, where DWB twitched in place instead of turning. Route
     # through the doorway centre heading north, then turn to the cube.
-    red_cube_2_pickup_via_1: [9.65, -7.70, 1.570796]
+    #
+    # 2026-10-07: the old corridor point here was [9.65, -7.70, pi/2], which
+    # belonged to the previous east-side dock (14.5, -3.0). The dock is now
+    # (9.891, 0.014) on the cube's west side and the base reaches it along the
+    # y ~ 0.5 corridor from the west (verified in the round44 trajectory), so
+    # that southern doorway detour no longer applies. This key had been
+    # overwritten with the dock pose itself, which is what dropped red_cube_2's
+    # handoff to 0.259-0.467 m in 24 of 100 recorded picks. Left empty: with no
+    # waypoint the base drives straight to the dock and the handoff fires at the
+    # normal 1.2-1.4 m.
+    red_cube_2_pickup_via_1: []
     # Loaded blue_cube_1 gets trapped following the single long path beside the
     # same wall. Cross its open north end west-to-east before delivery to B.
-    blue_cube_1_warehouse_b_via_1: [-4.2, 0.0, 0.0]
-    blue_cube_1_warehouse_b_via_2: [-2.3, 0.0, 0.0]
+    blue_cube_1_warehouse_b_via_1: [-7.321, -3.018, -3.141593]
+    blue_cube_1_warehouse_b_via_2: [-7.321, -3.018, -3.141593]
+    # 2026-10-07: C 区比 B 区再往南一块板，直着走会斜切北端走廊南侧 1.7 m 处的
+    # 窄口（两侧 0.50 m vs 载物足迹 0.40 m，DWB 419 条轨迹全被拒 → 任务失败）。
+    # 复用 B 区已验证的同一组北端绕行点。
+    blue_cube_1_warehouse_c_via_1: [0.016, -2.702, -1.570796]
+    blue_cube_1_warehouse_c_via_2: [0.016, -2.702, -1.570796]
+    # 2026-10-07: red_cube_1 → C 连续两轮死在同一个"口袋"里（round30 从那里被
+    # 弹飞出图，round32 出现 884 次轨迹全拒、失败时方块还挂在臂上）。x=-3.35 那堵
+    # 墙西侧是个死口袋：北面被 y=-4.4 的墙封死，用载物足迹 0.35 m 做洪泛填充，
+    # 站在口袋里根本到不了 C 区（可达集坍缩成起点一格）。那个口子太窄、拐不过来，
+    # 所以解法是"别进去"：先往南出袋，沿 y≈-6.7 向东，再从 x=+0.03 的走廊北上。
+    # 两段直线都在 0.35 m 下用洪泛填充验过通畅（不是目测）。
+    #
+    # 2026-10-07 (round48/49): x=-3.275 这个值后来落进了墙里，是"到不了目标点"
+    # 的直接原因，必须改。room_from_world.pgm 在 15:22 重建过（见
+    # run_logs/map_regen_test/），用当前的图重新量：
+    #     via_1 原值 (-3.275,-6.725) 到最近墙 = 0.000 m  <- 目标点本身就在占据格里
+    # 11x11 的邻域图（# = 墙，. = 自由）里该点正好压在墙上：
+    #     .....###...
+    #     .....######   <-- 绕行点
+    # 墙以东还有 0.05 m 的窄缝，所以 MPPI 会一直朝目标挤、报 "Failed to make
+    # progress"（实测 5 次），车轮在 0.01~0.05 rad/s 打滑，45 s 后超时。两轮运行
+    # 都停在同一个坐标 (-3.2,-7.1)，不是偶然。
+    # 墙以西是自由空间：沿 y=-6.725 扫描，x<=-3.70 才有 >=0.40 m 净空。
+    # 取 -3.850 而不是刚好 -3.70，是为了不把整条路线的拐角压到临界值，
+    # 代价只是把西行腿延长 0.12 m。实测该点净空 0.550 m（载物足迹 0.35 m），
+    # 且与 pickup(-4.945,-5.889) 和 via_2(0.025,-4.875) 在 0.35 m 可通行域内
+    # 同属一个连通分量（洪泛填充验证）。
+    red_cube_1_warehouse_c_via_1: [-3.850, -6.725, -0.475695]
+    red_cube_1_warehouse_c_via_2: [0.025, -4.875, 0.510950]
+    # 2026-10-07 (round36): blue_cube_3 → A 是第二条直着走不通的腿。方块本身没问题
+    # （埋点实测载物 z=+0.238 m，没有拖地），但 A 区对齐点仍然出现 383 次轨迹全拒和
+    # "Controller patience exceeded"，正是 round29 死掉的地方。用载物足迹 0.35 m
+    # 做洪泛填充，只有"往东绕一圈"能到 A：沿 y≈-5.98 东行到 x=+12.88，北上到
+    # y≈-3.5，再折回西边。中间那个点不能省——从 (12.88,-3.88) 直接斜切到
+    # (12.48,-3.18) 在 0.35 m 下有 11 个阻塞格。
+    blue_cube_3_warehouse_a_via_1: [12.875, -3.875, 0.454302]
+    blue_cube_3_warehouse_a_via_2: [12.875, -3.525, 1.570796]
+    blue_cube_3_warehouse_a_via_3: [12.475, -3.175, 2.422763]
 
     # Target Gazebo model/link names.
     robot_model_name: six_arm
@@ -67,14 +173,55 @@ fixed_joint_pick_place:
     empty_robot_radius_m: 0.32
     # Nav2 marks every cell within robot_radius of an obstacle as inscribed, so
     # a centre at exactly 0.32 m from a wall has all 250 rollouts rejected.
-    # 0.42 m keeps a 0.10 m legal band; raising it to 0.60 m fixed that wedge
-    # but made navigation slow enough to hit the leg timeouts.
-    empty_inflation_radius_m: 0.42
+    # 0.42 m keeps only a 0.10 m legal band, which leaves NavFn free to plan the
+    # path *inside* the inflation band (cost 100-250 there) - and MPPI's
+    # CostCritic integrates that cost along its whole horizon, so the cheaper
+    # trajectory is always the slower one. Measured 2026-10-07: with 0.42/0.50
+    # the controller self-limited to cmd_vx 0.34 m/s while vx_max was 1.0.
+    # 0.55 m gives the path a low-cost lane (same reasoning the loaded geometry
+    # already documented) and still fits the 2.09 m doorway (0.99 m centre band).
+    empty_inflation_radius_m: 0.55
+    # 2026-10-07 (round48 regression): the global costmap was silently planned
+    # with radius = robot_radius + 0.25 while the local one kept the true
+    # radius. Every cell within 0.57 m of a wall is lethal there, so as soon as
+    # the base drove closer than 0.57 m to a wall the *start* of the global plan
+    # sat inside a lethal cell. NavFn still returned a path hugging the
+    # inscribed band, but MPPI rejected every rollout from that pose:
+    #   "Failed to make progress", wheels l=0.02,r=0.02 rad/s while cmd_vx=0.22
+    # Measured with the diagnostic probe (/tmp/mybot_watch.py) on the run of
+    # run_logs/gui_20261007-205357: 44 dead-zone events, the base wedged twice at
+    # (9.2,-3.1), and the sustained wall penetration ended in a physics blow-up
+    # that threw it 100 m out of the map to (-11.1,+101.0).
+    # 0.0 makes the global costmap use the same footprint as the local one, so
+    # the planner can no longer mark the robot's own pose lethal. The margin was
+    # only ever meant to keep the global path out of the inscribed band; that
+    # job is already done by the inflation radius (0.55/0.60).
+    global_radius_margin_m: 0.0
     # At 0.35 m the blue-to-B route reached Wall_57 at exactly 0.35 m
     # clearance; BaseObstacle then rejected all 255 trajectories. 0.40 m radius
     # plus 0.20 m of inflation keeps the planned path clear of the inscribed
     # band while still fitting the 2.09 m doorway beside Wall_115.
-    loaded_robot_radius_m: 0.40
+    loaded_robot_radius_m: 0.35
+    # 2026-10-07: carried envelope measured on the real robot with a cube
+    # attached (link_states, 5 postures): the old transport posture reaches
+    # 0.352 m from the base centre, the tucked elbow posture below reaches
+    # 0.317 m with the same ground clearance, so the loaded radius drops to
+    # 0.35 and inflation to 0.50 (the wall clearance the robot needs falls
+    # from ~0.8 m to ~0.7 m). Revert all three keys together if the arm ever
+    # clips the frame while carrying.
+    # 0.50 keeps 0.10 m more corridor than 0.60, but it lets the global path hug
+    # the inscribed band, and DWB then rejects *every* rollout once the base is
+    # inside it. Measured twice on 2026-10-07 with the 0.35/0.50 pair:
+    #   round29  blue_cube_3 -> A: 30 s of "No valid trajectories out of 419!",
+    #            follow_path aborted, Spin/BackUp refused ("Collision Ahead"),
+    #            then the 300 s nav timeout killed the task (7 min on one leg);
+    #   round30  red_cube_1 -> C: same jam in a corner, but this time the
+    #            sustained wall penetration ended in a physics blow-up that threw
+    #            the base 72 m out of the map at 36 m/s while /cmd_vel was zero.
+    # 0.60 is the value this route was validated with: it keeps the planned path
+    # out of the inscribed band (lower CostCritic speed penalty too) while still
+    # leaving a 0.89 m centre band through the 2.09 m doorway. If a future route
+    # proves too tight at 0.60, loosen it per-route, not globally.
     loaded_inflation_radius_m: 0.60
     robot_attach_link: link6
     cube_link: link
@@ -84,7 +231,157 @@ fixed_joint_pick_place:
     ready_timeout_sec: 180.0
     action_timeout_sec: 30.0
     # Cross-map delivery can make slow but valid progress through narrow aisles.
-    navigation_timeout_sec: 170.0
+    # 170 s proved too tight once three progress-checker recoveries (~22 s wall
+    # each) landed on one loaded leg; the leg needs the 300 s budget and the
+    # accept radius below is the last-resort guard.
+    navigation_timeout_sec: 300.0
+    # At the deadline, a base this close to the goal counts as arrived instead
+    # of cancelling. 0.22 m < zone_half_width_m 0.25 m, so the drop still fits
+    # on the plate; verify_placement is the safety gate.
+    navigation_accept_radius_m: 0.22
+    # Sustained acceptance while the goal is still running: 0.19 m short with
+    # 2.3 deg of yaw error was measured on 2026-10-06 (round 2) and MPPI never
+    # closed it. Both tolerances must hold for this long before Nav2 is released.
+    #
+    # 0.15 -> 0.80 rad (8.6 -> 45.8 deg) on 2026-10-07, and the matching gate in
+    # _dock_creep reads this same value. Rationale: the C-zone dock kept failing
+    # on YAW ALONE while the position was already good every single time.
+    # Measured on run_logs/attachfix2_20261007-235827 (red_cube_5 -> C, 4 tries):
+    #   0.169 m / 109.9 deg   0.066 m / 2.6 deg   0.171 m / 9.6 deg   0.167 m / -22.0 deg
+    # All four are inside navigation_accept_radius_m 0.22 m; three of them were
+    # refused purely for heading. The base then burns its navigation retries
+    # spinning at ~0.543 rad/s and the leg dies with the cube still attached.
+    # The 45.8 deg bound is not arbitrary - it is the drop-geometry limit. The
+    # arm goes to a FIXED joint posture, so a base yaw error rotates the drop
+    # point about the base centre (~0.35 m lever). Successfully measured drop
+    # offsets: (0.068,-3.149) in C against centre (0.016,-3.060) = (+0.052,-0.089),
+    # and (6.874,-2.487) in A against (6.886,-2.483) = (-0.012,-0.004). With the
+    # C dock offset ~(+0.05,-0.31) and the gate |dx|<=0.485, |dy|<=0.235:
+    #   44 deg -> dx=-0.193 ok     50 deg -> dx=-0.218 ok     60 deg -> dx=-0.253 OUT
+    # so 0.80 rad keeps the cube inside the zone for every accepted pose, with the
+    # 60 deg cliff as the real limit. verify_placement stays the final gate.
+
+    # 2026-10-08 update: 0.80 -> 1.00 rad (57.3 deg), and the reason is a real
+    # trade-off rather than a clean margin. The measured heading errors at which
+    # the C/A docks actually arrive are far worse than any safe bound:
+    #   run_logs/final2_20261008-004512       53.3  58.4  -134.6  deg
+    #   run_logs/acceptfix_20261008-002353    73.6  75.5   94.7  -123.1  -157.0
+    #   run_logs/yawfix_20261008-000634       66.7  153.1  -113.1 -125.4  -141.2
+    # i.e. the base essentially never reaches even 45.8 deg, because _dock_creep
+    # has to perform the whole correction at ~0.543 rad/s inside a 14 s budget.
+    # At 1.00 rad (57.3 deg) the drop offset is ~0.19 m, still inside the 0.235 m
+    # half-width but no longer centred, so this deliberately trades placement
+    # accuracy for legs that actually finish. verify_placement is the hard gate:
+    # a drop outside |dx|<=0.485 / |dy|<=0.235 is reported as "Cube missed" and
+    # fails the leg, so an over-generous value cannot silently score a bad place.
+    # Do NOT raise this further without re-measuring the drop lever arm - the
+    # 136.6 deg case measured (+0.133,+0.615) m, i.e. well outside the zone.
+
+    # 2026-10-08 final calibration (run_logs/timing_20261008-012156): 1.00 was too
+    # generous. Measured heading error vs the resulting drop offset in zone A:
+    #     -30.0 deg -> (+0.?, +0.084)  inside
+    #     +30.4 deg -> (+0.089,-0.168) inside
+    #     -52.1 deg -> (+0.224,-0.239) MISSED by 4 mm (limit 0.235)
+    # so the y-offset grows ~0.24 m per 52 deg of heading error, and 57.3 deg sits
+    # right on the cliff - it cost one cube out of four accepted arrivals. 0.79 rad
+    # (45.3 deg) keeps the worst-case y-offset near 0.20 m, inside the 0.235 m
+    # half-width with margin, and still covers the ~30 deg arrivals that are the
+    # common case once _dock_creep has had its 2 s to polish. Anything the gate
+    # rejects now falls through to the normal retry, which succeeds (measured:
+    # rejected at -52.1 deg -> retry -> -30.0 deg -> delivered).
+    navigation_accept_yaw_rad: 0.79
+    navigation_accept_hold_sec: 1.0
+    # Final dock creep (2026-10-07). Nav2 is released as soon as the base is
+    # inside dock_creep_trigger_m of the plate, and the executor drives the rest
+    # itself: rotate to the plate yaw, then creep straight in at
+    # dock_creep_speed_mps with a small lateral correction. This removes DWB's
+    # near-goal limit cycle, which circled the goal at max yaw rate (round17:
+    # 16.6 m of path for a 1.48 m leg, 110-218 s per cube) and which the
+    # sustained-accept gate above cannot latch on to, because at 1.9 rad/s the
+    # yaw error stays inside its window for only ~0.16 s. Ending at a repeatable
+    # pose is also what the placement accuracy was calibrated against.
+    enable_dock_creep: true
+    dock_creep_trigger_m: 0.45
+    dock_creep_speed_mps: 0.12
+    dock_creep_forward_gain: 0.8
+    dock_creep_tolerance_m: 0.03
+    dock_creep_yaw_tolerance_rad: 0.06
+    # 8 -> 14 s (round21): the C dock took 8 s just to turn onto the plate yaw
+    # after two "Failed to make progress" recoveries and then timed out 0.165 m
+    # short, which pushed the released cube 0.301 m off the plate centre in y.
+    # Back to 14 s 2026-10-07 (round46, MPPI): the A dock closed only 0.068 m in
+    # 8 s and was judged at 0.264 m, the same "stalls ~0.2 m short" symptom.
+    #
+    # 2026-10-07: 试过 25 s，已回滚到 14.0。它确实把 dock creep 失败从 4 次降到
+    # 1 次（run_logs/dock25_20261007-232828: 3 次启动仅 1 次失败，且首块首次即成），
+    # 但同一轮里 "no progress for 45 s" 从基线的 0 次暴涨到 8 次，任务卡死在
+    # 2/5。原因不在这个超时本身，而在于更长的 creep 让 base 更彻底地停进 C 区
+    # 泊位（yaw 误差 1.3 deg），而 C 泊位朝向 -90 deg（朝南）、出库目标在东南
+    # (~8.6,-6.0)，出发时要原地掉头约 170 deg，车就再也出不来（8 次尝试起点都在
+    # (-0.06,-2.2) 附近打转）。也就是说：**停得越准，出库越难**。
+    # 回滚超时只降低触发概率；真正的解法是给 C 区泊位一个便于出库的离场航向，
+    # 或让出库第一步允许倒车。详见 run_logs/tools/竞赛耗时基准与优化.md。
+    dock_creep_timeout_sec: 14.0
+    # 2026-10-08: 0.22 -> 0.12 m. The docking POSITION error, not the heading,
+    # turned out to dominate the final drop offset. Re-measured on
+    # run_logs/gate45_20261008-014118 with the heading already inside the 45.3 deg
+    # gate - so heading was NOT the cause:
+    #     stopped at 0.165 m, heading +12.8 deg -> drop offset (+0.154,+0.240) MISSED
+    #     stopped at 0.119 m, heading -30.0 deg -> offset (+0.093,+0.084) ok
+    #     stopped at 0.120 m, heading -52.1 deg -> offset (+0.224,-0.239) missed
+    # A 12.8 deg heading error is worth only ~0.04 m of drop shift, yet the drop
+    # missed by 5 mm - the rest came from the 0.165 m of remaining position error.
+    # With the arm on a fixed posture the drop simply inherits the base position
+    # error, and the zone half-width is only 0.235 m, so the base must finish
+    # within ~0.10 m to leave room for the heading term. 0.12 m does that and is
+    # still comfortably inside the 0.03 m "clean" tolerance's practical reach:
+    # measured clean finishes reach 0.028-0.066 m, i.e. well under 0.12 m.
+
+    # 2026-10-08 REVERT 0.12 -> 0.22: 0.12 is not reachable by the dock creep.
+    # Measured on run_logs/esc70_20261008-093405 (0.12 gate): four attempts on one
+    # C-zone dock all failed - 0.172 m/-98.0 deg, 0.171 m/73.3 deg, 0.113 m/-104.4
+    # deg - i.e. the base sits at 0.11-0.17 m and never closes to 0.12 m inside the
+    # 14 s budget, so the retries burn out and the leg dies with the cube attached
+    # (run ended 1/5 in 343 s). The creep rotates at ~0.543 rad/s and the approach
+    # has to fix a 70-100 deg heading error; there is no time left to also grind
+    # the last 10 cm. So 0.22 m is the practical reach of this subsystem, and the
+    # placement gate has to be verified separately:
+    #   0.22 m -> drops from 0.018 to 0.256 m, occasional "Cube missed"
+    #   0.12 m -> drops <= 0.089 m but the dock never completes
+    # Finishing the leg beats a tight drop, and verify_placement still rejects a
+    # cube outside the zone, so 0.22 m stays. To actually get both, the creep
+    # needs more time (dock_creep_timeout_sec) or a two-stage approach - not a
+    # tighter gate.
+    dock_creep_accept_m: 0.22
+    # 2026-10-07: the C dock arrives mostly *sideways*, and the first creep law
+    # drove along the plate axis only, so its speed collapsed to the 0.03 m/s
+    # floor and it stalled ~0.2 m short (round22: 0.198 m in 14 s, three times,
+    # which ended the task with the cube attached). The creep now points at the
+    # goal while it is far, then holds the plate yaw for the last 0.12 m, and gets
+    # two windows before it is judged.
+    dock_creep_attempts: 1
+    # 10.0 m kept the creep on the axis-hold law for its whole travel - "exactly
+    # the round20 behaviour that passed 5/5 in 391 s" - but round20's docks were
+    # reached head-on. With the relocated zones the base arrives mostly sideways
+    # (see the note above) and the axis law collapses to the 0.03 m/s floor:
+    # measured 2026-10-07 (round46, MPPI) the A dock closed 0.068 m in 8 s and was
+    # judged at 0.264 m, and round22 recorded the same 0.198 m stall. 0.12 m
+    # restores the documented remedy - aim at the goal while far, hold the plate
+    # yaw only for the last 12 cm - WITHOUT widening dock_creep_accept_m, which
+    # would trade a cheap leg retry for a cube released outside the zone.
+    dock_creep_align_distance_m: 0.12
+    # 2026-10-08: 0.35 -> 0.70 m. This is the reverse-escape distance used both by
+    # the stall handler in _navigate_once and by the retry path in _navigate_to.
+    # 0.35 m was not enough to leave the local optimum that causes the open-space
+    # stall (costmap empty, no wall nearby, /cmd_vel_nav silent). Measured on
+    # run_logs/revescape_20261008-015951: 6 stalls, the escape fired 3 times and
+    # rescued at least one leg, but the last cube stalled again from a pose only
+    # 0.35 m away and the run ended 4/5. Backing further gives MPPI a genuinely
+    # different start state, which is the point - the cost is only the travel
+    # itself: 0.70 m at escape_speed_mps 0.08 takes 8.75 s per escape versus
+    # 4.4 s, and an escape is far cheaper than the 45 s stall plus a retry it
+    # replaces. Revert to 0.35 if escapes start pushing the base into walls.
+    escape_distance_m: 0.70
     navigation_retry_count: 2
     # Fast DDS only gives an action goal response about 100 ms to be delivered.
     # When a transport stall eats that response the controller logs
@@ -93,7 +390,8 @@ fixed_joint_pick_place:
     # so retry a lost response this many times before declaring the motion state
     # unknown (each retry waits for the possible motion first).
     action_retry_count: 2
-    service_timeout_sec: 10.0
+    service_timeout_sec: 20.0
+    link_service_attempts: 2
     # Startup discovery of every Nav2 service can exceed a single service-call
     # budget on a loaded WSL host; the dependency gate waits this long instead.
     dependency_timeout_sec: 60.0
@@ -131,8 +429,21 @@ fixed_joint_pick_place:
     # floor point to row = 360 + 66.0 / (standoff - 0.015). Row 680 keeps the
     # stop well clear of the 720 px frame edge, and the 10 px band survives
     # bottom-row jitter without letting the creep overshoot into the cube.
+    # 2026-10-07: the 640x480 experiment was ROLLED BACK (camera is 1280x720
+    # again). Equally scaling the calibration down (k=44, approach_row=453,
+    # row_tol=9.3, area=45, expected_row_tol=53) did not hold: every handoff ended
+    # in "Visual fine alignment timed out" at 0.69-1.38 m. The values below are the
+    # 720p calibration and are what round15-20 validated (rows 666-672, pre-attach
+    # 0.067-0.068 m, 5/5 picks). Do not scale them without re-calibrating on debug
+    # images.
+    visual_row_center: 360.0
     visual_approach_row: 680.0
-    visual_row_tolerance: 10.0
+    # ~14 px of row jitter is worth about 9 mm of range at the grasp standoff;
+    # the creep recomputes the remaining distance from the measured row, so a
+    # wider band costs accuracy nothing but ends the slow P-control tail sooner.
+    # 2026-10-07: widened 14 -> 18 px (about 12 mm) to leave the P-control tail
+    # earlier; the creep below then covers the extra distance twice as fast.
+    visual_row_tolerance: 18.0
     # The creep to the 0.173 m grasp standoff is computed from the measured
     # bottom row (k and offset from the same calibration), so any stop inside
     # the band lands link6 on the cube. visual_final_creep_m is a manual trim.
@@ -147,11 +458,23 @@ fixed_joint_pick_place:
     # swing (link6 reaches 0.397 m) passes above the cube instead of striking it.
     visual_target_standoff_m: 0.187
     visual_final_creep_m: 0.0
-    visual_creep_speed: 0.025
+    # 2026-10-07: 0.025 -> 0.05 m/s. The creep only covers the last ~42 mm and the
+    # remaining distance is re-measured from the bottom row, so twice the speed
+    # halves its 1.7 s while per-frame travel (5 mm at 10 Hz) stays inside the
+    # 18 px (~12 mm) band.
+    visual_creep_speed: 0.05
+    # 3 -> 2 stable frames: at 10-15 Hz vision the third frame only adds ~0.1 s,
+    # and the two-stage speed cap still guards the final approach.
+    visual_stable_frames: 2
     visual_center_tolerance: 0.04
-    visual_linear_gain: 0.25
+    # Raised from 0.25 and given a floor: a pure P term spends the last 20 cm at
+    # 0.5-3 cm/s, which is where most of the measured 40 s alignment went.
+    # _creep_to_grasp re-measures the standoff afterwards, so a small overshoot
+    # inside the ~9 mm band is corrected there instead of aborting the grasp.
+    visual_linear_gain: 0.45
+    visual_min_linear_speed: 0.06
     visual_angular_gain: 0.8
-    visual_max_linear_speed: 0.06
+    visual_max_linear_speed: 0.15
     visual_max_angular_speed: 0.25
     visual_stable_frames: 3
     # Rotate in place to find the cube when coarse parking left it out of view.
@@ -169,19 +492,19 @@ fixed_joint_pick_place:
 
     # Confirm the released cube rests inside the 1.0 x 0.5 m target zone.
     verify_placement: true
-    zone_a_centre: [5.0, -11.0]
-    zone_b_centre: [5.0, -12.0]
-    zone_c_centre: [5.0, -13.0]
+    zone_a_centre: [6.886, -2.483]
+    zone_b_centre: [-7.679, -3.018]
+    zone_c_centre: [0.016, -3.06]
     zone_half_length_m: 0.5
     zone_half_width_m: 0.25
     # 0.015 keeps the whole 0.03 m cube inside the 1.0 x 0.5 m plate edges.
     placement_tolerance_m: 0.015
-    placement_settle_sec: 1.5
+    placement_settle_sec: 0.5
     # Gazebo keeps a small residual velocity in a released cube; without this
     # the cube creeps out of the zone after the run reports success.
     stabilize_release: true
 
-    arm_motion_sec: 3.0
+    arm_motion_sec: 1.0
     gripper_motion_sec: 1.0
     settle_sec: 0.4
 
@@ -195,7 +518,7 @@ fixed_joint_pick_place:
 
     # The cube remains attached while the arm is in this folded posture and
     # Nav2 carries the robot to the selected warehouse.
-    transport_joints: [0.0, 0.6102, 1.2593, 0.0, -1.4931, 0.0]
+    transport_joints: [0.0, 0.35, 1.55, 0.0, -1.90, 0.0]
 
     # Warehouse docking yaw is zero, so placement is forward (+x). The place
     # posture is raised (q2/q3) so the released cube lands *on* the 0.02 m thick
@@ -204,9 +527,16 @@ fixed_joint_pick_place:
     pre_place_joints: [0.0, 0.9, 1.17, 0.0, -0.3, 0.0]
     place_joints: [0.0, 1.035, 1.295, 0.0, -0.3, 0.0]
 
-    # The fixed Gazebo joint, not finger contact, carries the cube. Keep the
-    # 75 mm finger gap open after attachment: even the former 35 mm gap left
-    # only 2.5 mm clearance per side, and contact jitter fought the fixed joint
-    # hard enough to launch the complete robot outside the map at >100 m/s.
+    # The fixed Gazebo joint, not finger contact, carries the cube: closing the
+    # fingers *into* the cube makes ODE fight the constraint and can fling the
+    # robot (recorded >100 m/s), so the grip must stay outside the 0.03 m cube.
+    #
+    # Measured in Gazebo (TF, gripper_probe): the two finger *centres* are
+    # 0.075 - finger_joint1 apart, and each finger block is 0.01 m thick, so the
+    # inner opening is 0.065 - finger_joint1. The old 0.048 therefore meant a
+    # 17 mm inner opening, i.e. 6.5 mm of interference per side - exactly the
+    # configuration that launched the robot. 0.022 gives a 43 mm inner opening,
+    # a visible closed grip with ~6.5 mm clearance per side; tighten it towards
+    # 0.035 only after checking the logged "cube offset in link6 frame" dy.
     gripper_open: 0.0
-    gripper_closed: 0.0
+    gripper_closed: 0.022

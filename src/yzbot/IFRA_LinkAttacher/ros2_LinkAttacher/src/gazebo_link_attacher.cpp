@@ -175,7 +175,28 @@ void GazeboLinkAttacherPrivate::Attach(
 
     // Create a fixed joint between the two links:
     JointName = _req->model1_name + "_" + _req->link1_name + "_" + _req->model2_name + "_" + _req->link2_name + "_joint";
-    gazebo::physics::JointPtr joint = model1->CreateJoint(JointName, "revolute", link1, link2);
+    // 2026-10-07: reuse the joint if it is still in the model.
+    // Detach() must not RemoveJoint() (that SIGSEGVs inside the service
+    // callback), so the joint object stays in the model after every release.
+    // A second CreateJoint() with the same name then fails and returns a null
+    // JointPtr, and the very next joint->Attach() trips:
+    //   [Wrn] Model [six_arm] already has a joint named
+    //         [six_arm_link6_red_cube_1_link_joint], skipping creating joint.
+    //   gzserver: boost/smart_ptr/shared_ptr.hpp:728: Assertion `px != 0' failed.
+    //   [ERROR] [gzserver-1]: process has died [exit code -6]
+    // exit code -6 is SIGABRT, i.e. the whole simulation dies on the second
+    // pickup. GetJoint() by name hands back the existing joint instead, which
+    // is exactly the reuse the original "joint already existed" warning asked
+    // for - without ever destroying a live physics object.
+    gazebo::physics::JointPtr joint = model1->GetJoint(JointName);
+    if (!joint) {
+      joint = model1->CreateJoint(JointName, "revolute", link1, link2);
+    }
+    if (!joint) {
+      _res->success = false;
+      _res->message = "Failed to create or reuse joint: " + JointName;
+      return;
+    }
     joint->Attach(link1, link2);
     joint->Load(link1, link2, ignition::math::Pose3d());
     joint->SetProvideFeedback(true);
@@ -184,7 +205,12 @@ void GazeboLinkAttacherPrivate::Attach(
     joint->SetUpperLimit(0, 0);
     joint->SetLowerLimit(0, 0);
     joint->SetEffortLimit(0, 0);
-    joint->SetDamping(1, 1.0);
+    // Do not set damping here. This joint is created with one DOF, so the
+    // original joint->SetDamping(1, 1.0) asked ODE for DOF index 1 and Gazebo
+    // logged on every single attach:
+    //   [Err] [ODEJoint.cc:1007] ODEJoint::SetDamping: index[1] is out of
+    //   bounds (DOF() = 1).
+    // The limits above already lock the joint, so damping adds nothing.
 
     joint->Init();
     model1->Update();
@@ -219,17 +245,25 @@ void GazeboLinkAttacherPrivate::Detach(
   // CHECK if -> Joint already exists in GV_joints:
   JointSTRUCT j;
   if (this->getJoint(_req->model1_name, _req->link1_name, _req->model2_name, _req->link2_name, j)){
+    // 2026-10-07: Detach() must NOT be followed by RemoveJoint() here.
+    // Reproduced every time the pick-and-place executor released a cube:
+    //   [INFO] DETACH: six_arm::link6 <-> red_cube_2::link
+    //   [ERROR] [gzserver-1]: process has died [pid 113542, exit code -11]
+    // exit code -11 is SIGSEGV. Destroying a joint from inside the service
+    // callback while the physics engine still holds it in its joint list
+    // (and while GV_joints keeps a JointPtr to it) dereferences freed memory.
+    // Detach() alone is enough to release the link pair, so the joint object is
+    // simply parked in the world and reused on the next attach. That also keeps
+    // the "Gazebo breaks if a joint attachment already exists" hazard noted at
+    // the top of this file from firing: the entry stays in GV_joints with a
+    // live pointer, so the Attach() path re-attaches the very same joint
+    // instead of creating a second one.
     j.joint->Detach();
     _res->success = true;
     _res->message = "DETACHED: {MODEL , LINK} -> {" + _req->model1_name + " , " + _req->link1_name + "} -- {" + _req->model2_name + " , " + _req->link2_name + "}.";
-    
-    // (+) Remove joint --> This fixes the following problem: If the object to be attached is removed and spawned again, 
-    // gazebo breaks when attaching it again, since the joint already existed. Joint must be REMOVED when detaching.
-    gazebo::physics::ModelPtr model1 = world_->ModelByName(_req->model1_name);
-    model1->RemoveJoint(JointName);
 
     IsAttached = false;
-    
+
     return;
   } else {
     _res->success = false;

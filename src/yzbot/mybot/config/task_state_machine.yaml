@@ -4,9 +4,12 @@ task_state_machine:
     # failure budgets do not multiply into an unbounded competition run.
     max_object_retries: 1
     skip_failed_object: false
-    # Measured per-cube wall time is 154-199 s (six runs, mean 184 s). 300 s
-    # leaves room for one slow leg without masking a genuinely stuck cube.
-    object_timeout_sec: 360.0
+    # Measured per-cube wall time is 154-199 s (six runs, mean 184 s); with the
+    # 300 s single-leg nav budget plus the executor's own accept-radius guard the
+    # supervisor budget must be the larger of the two, otherwise the cube dies
+    # before the leg guard can fire (2026-10-06: 360 s expired 78 s before the
+    # 300 s nav timeout would have accepted a base parked 0.19 m from the plate).
+    object_timeout_sec: 420.0
     # The problem generator guarantees x + y = 5, so every generated task has
     # five cubes and cannot fit into a fixed short budget. 0 derives the budget
     # from the queue length; set a positive value to override it outright.
@@ -18,3 +21,16 @@ task_state_machine:
     # Let a finished/failed task be executed again when the same problem is
     # regenerated (the parser republishes identical JSON).
     allow_task_replay: true
+    # Resident executor (2026-10-07): ONE executor process serves all five cubes
+    # instead of one process per cube. Round13 lost a whole run when a freshly
+    # spawned executor never discovered the Nav2 action / costmap services inside
+    # its 60 s budget, and round14 measured ~56 s of discovery on a new
+    # participant even when it did succeed. Set false for one process per cube.
+    use_resident_executor: true
+    # Nearest-first cube selection (2026-10-07): the task fixes colour, count and
+    # zone only, so pick the cheapest cubes of that colour instead of cube numbers
+    # 1..N. On the x=4, y=1 task the numbering order drove 33.9 m more than the
+    # nearest four red cubes plus blue_cube_3 (~56 s), and it used blue_cube_1's
+    # Wall_57 clearance route, which failed a whole round in round19 with
+    # "No valid trajectories out of 419". Set false to restore cube numbering.
+    select_nearest_cubes: true

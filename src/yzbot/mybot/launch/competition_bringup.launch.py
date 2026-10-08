@@ -1,10 +1,12 @@
 import os
 
+from ament_index_python.packages import PackageNotFoundError
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
 from launch.actions import (
     DeclareLaunchArgument,
     IncludeLaunchDescription,
+    LogInfo,
     RegisterEventHandler,
     SetEnvironmentVariable,
 )
@@ -43,6 +45,35 @@ def generate_launch_description():
     start_task_system = LaunchConfiguration('start_task_system')
     start_task_parser = LaunchConfiguration('start_task_parser')
     parser_linger_sec = LaunchConfiguration('parser_linger_sec')
+    start_dashboard = LaunchConfiguration('start_dashboard')
+    foxglove = LaunchConfiguration('foxglove')
+    foxglove_port = LaunchConfiguration('foxglove_port')
+
+    # The judging dashboard is optional infrastructure: a fresh machine that
+    # has not installed ros-humble-foxglove-bridge yet must still be able to
+    # start the whole competition stack, so the include is dropped (with a
+    # warning) instead of failing the launch.
+    try:
+        get_package_share_directory('foxglove_bridge')
+        foxglove_installed = True
+    except PackageNotFoundError:
+        foxglove_installed = False
+
+    if foxglove_installed:
+        foxglove_bridge = IncludeLaunchDescription(
+            PythonLaunchDescriptionSource(
+                os.path.join(mybot_share, 'launch', 'foxglove_bridge.launch.py')
+            ),
+            launch_arguments={'port': foxglove_port}.items(),
+            condition=IfCondition(foxglove),
+        )
+    else:
+        foxglove_bridge = LogInfo(
+            msg='foxglove:=true but ros-humble-foxglove-bridge is not '
+                'installed; skipping the visualization bridge. Install it '
+                'with: sudo apt install ros-humble-foxglove-bridge',
+            condition=IfCondition(foxglove),
+        )
 
     gazebo = IncludeLaunchDescription(
         PythonLaunchDescriptionSource(
@@ -87,7 +118,17 @@ def generate_launch_description():
     def start_after_gate(event, _context):
         if event.returncode == 0:
             return [moveit, navigation]
-        return []
+        # Without this the launch just goes quiet: MoveIt/Nav2 are skipped, the
+        # health check keeps reporting "not ready", and the task queue waits in
+        # IDLE with no hint of why the robot never moves.
+        return [LogInfo(msg=(
+            'STARTUP GATE FAILED (exit code '
+            f'{event.returncode}): MoveIt and Nav2 were NOT started, so '
+            '/competition/system_ready stays false and the task queue waits in '
+            'IDLE. Look above for "Switch controller timed out" or missing '
+            'topics, then stop everything and run: '
+            'ros2 run mybot reset_dds_cache.sh'
+        ))]
 
     start_stack_when_ready = RegisterEventHandler(
         OnProcessExit(target_action=startup_gate, on_exit=start_after_gate)
@@ -104,8 +145,17 @@ def generate_launch_description():
             'timeout_sec': ParameterValue(health_timeout, value_type=float),
             'require_moveit': ParameterValue(start_moveit, value_type=bool),
             'require_nav2': ParameterValue(start_nav2, value_type=bool),
-            # Nav2 lifecycle transitions remain owned by its lifecycle managers.
-            'auto_recover_nav2': False,
+            # The lifecycle managers normally own every transition, but they can
+            # wedge for good: measured 2026-10-07, map_server's CONFIGURE
+            # response was dropped and lifecycle_manager_localization blocked
+            # inside that call forever, leaving system_ready false and the task
+            # idle for 201 s. The health check now re-issues the transition
+            # (CONFIGURE or ACTIVATE as needed) once a node whose state it has
+            # actually observed stays non-active for recover_grace_sec - long
+            # enough that a healthy bringup, which configures every node within
+            # a few seconds, never reaches it.
+            'auto_recover_nav2': True,
+            'recover_grace_sec': 45.0,
         }],
     )
 
@@ -131,6 +181,18 @@ def generate_launch_description():
             parser_params,
             {'linger_sec': ParameterValue(parser_linger_sec, value_type=float)},
         ],
+    )
+
+    # Rule sheet section 三: the judges' layout reads the task, progress and
+    # work/end-effector state from standard topics. The supervisor publishes
+    # those as JSON strings, which a Foxglove Indicator cannot index into, so
+    # this node derives one small topic per displayed value.
+    dashboard = Node(
+        package='mybot',
+        executable='dashboard_bridge.py',
+        name='dashboard_bridge',
+        output='screen',
+        condition=IfCondition(start_dashboard),
     )
 
     return LaunchDescription([
@@ -173,7 +235,7 @@ def generate_launch_description():
                         'receives it. 0 exits immediately.',
         ),
         DeclareLaunchArgument(
-            'health_timeout', default_value='180.0',
+            'health_timeout', default_value='420.0',
             description='Seconds before the health checker reports a startup timeout.',
         ),
         DeclareLaunchArgument(
@@ -185,6 +247,21 @@ def generate_launch_description():
             description='Run the problem generator and the LLM task parser. '
                         'Requires DEEPSEEK_API_KEY in the environment.',
         ),
+        DeclareLaunchArgument(
+            'start_dashboard', default_value='true', choices=['true', 'false'],
+            description='Publish /competition/dashboard/* for the scoring '
+                        'layout (task counts, zones, progress, work state).',
+        ),
+        DeclareLaunchArgument(
+            'foxglove', default_value='true', choices=['true', 'false'],
+            description='Serve the Foxglove WebSocket dashboard on '
+                        'ws://localhost:<foxglove_port>. Silently skipped when '
+                        'ros-humble-foxglove-bridge is not installed.',
+        ),
+        DeclareLaunchArgument(
+            'foxglove_port', default_value='8765',
+            description='Foxglove WebSocket port.',
+        ),
         gazebo,
         # Start the heavy stacks only after sensors and all controllers are
         # actually ready; fixed delays race on slower machines.
@@ -193,4 +270,9 @@ def generate_launch_description():
         health_check,
         task_state_machine,
         task_parser,
+        dashboard,
+        # Cheap (a few MB) and harmless while the stack is still coming up:
+        # starting it here means the dashboard can be opened before the run
+        # begins, and latched /competition/* values are not missed.
+        foxglove_bridge,
     ])

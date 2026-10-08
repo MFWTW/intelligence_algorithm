@@ -38,18 +38,33 @@ source install/setup.bash
 
 ## 启动
 
-推荐使用统一入口，一次启动 Gazebo、控制器、MoveIt 2、Nav2 和系统健康检查：
+**这台 WSL 机器上最稳的启动方式**（自动预检残留进程 → 清 Fast DDS 缓存 → 无 GUI
+启动 → 等到 `system_ready` 并报告缺什么）：
 
 ```bash
-ros2 launch mybot competition_bringup.launch.py
+cd ~/dev_ws && source install/setup.bash
+ros2 run mybot start_competition.sh
 ```
 
-无图形界面启动：
+| 需求 | 命令 |
+| --- | --- |
+| 需要 Gazebo 窗口 | `ros2 run mybot start_competition.sh --gui` |
+| 需要 MoveIt RViz | `ros2 run mybot start_competition.sh --with-rviz` |
+| 上一次崩了、进程还残留 | `ros2 run mybot start_competition.sh --kill` |
+| 单纯 `ros2 launch`（不推荐，少了预检与等待） | `ros2 launch mybot competition_bringup.launch.py gui:=false moveit_rviz:=false` |
 
-```bash
-ros2 launch mybot competition_bringup.launch.py \
-  gui:=false moveit_rviz:=false nav_rviz:=false
-```
+它比裸 `ros2 launch` 多做四件事，都是实测踩出来的：
+
+1. **预检残留进程**：被 kill 的 launch 常留下孤儿 Nav2/gzserver，两套会抢
+   `/cmd_vel`，表现为机器人完全不动；有残留时脚本直接拒绝启动并给出清理命令。
+2. **清 Fast DDS 残留**：反复 Ctrl-C 之后 `/dev/shm/fastrtps_*` 会累积（实测一次
+   积到 97 个），新节点随机匹配不上端点 —— `Switch controller timed out after
+   5.000000 seconds!`、`Could not contact service /controller_manager/...`、
+   costmap 死等 `map -> base_footprint` 都是这个根因。
+3. **默认不带 GUI/RViz**：Gazebo GUI 会把场景再渲染一遍，实测满栈 RTF 只有
+   0.18～0.43（`ros2 run mybot rtf_probe.py` 可自测），可视化建议用 Foxglove。
+4. **等到就绪再交给你**：看门狗订阅 latched 的 `/competition/system_ready`，
+   就绪打印 `✅ 系统就绪`，超时则打印还缺什么。
 
 系统就绪状态发布到 `/competition/system_ready`，详细检查结果发布到
 `/competition/system_health`。也可以分别启动：
@@ -65,11 +80,23 @@ ros2 launch bot_navigation nav_bringup_gazebo2.launch.py
 出题程序（`TMSCQtest_x86_x64.bin`，x86_64 Linux ELF）每次运行输出一行中文应用题。
 任务解析节点用 DeepSeek 云端 API 把它解析成结构化任务，并在本地独立复核算术。
 
-API Key 通过环境变量提供，**不要写进任何文件**：
+API Key **存一次，以后不用管**（运行时自动加载，且绝不进入版本库）：
 
 ```bash
 cd ~/dev_ws
 source install/setup.bash
+ros2 run mybot set_deepseek_key.sh     # 交互粘贴，写进 ~/.config/mybot/deepseek_api_key (600)
+ros2 launch mybot competition_bringup.launch.py
+```
+
+查找顺序（第一个命中的生效）：`$DEEPSEEK_API_KEY` → `api_key_file` 参数 →
+`$DEEPSEEK_API_KEY_FILE` → `~/.config/mybot/deepseek_api_key` → `~/.deepseek_api_key`
+→ `./.secrets/deepseek_api_key` → `./.env`（后两个相对启动目录，已在 `.gitignore` 里）。
+`ros2 run mybot set_deepseek_key.sh --check` 可以查看当前会加载哪一个。
+
+只想手动导环境变量也行（临时用）：
+
+```bash
 export DEEPSEEK_API_KEY='sk-...'
 ros2 launch mybot task_parser.launch.py
 ```
@@ -191,8 +218,13 @@ ros2 launch mybot fixed_joint_pick_place.launch.py \
 - **抓取/放置关节角**：`grasp_joints` 使指爪正好夹住 0.03 m 方块
   （`link6` 距方块中心约 0.063 m）；`place_joints` 抬高，使方块落在
   0.02 m 厚的区域标牌**上表面**而不是嵌进去（嵌进去会被物理引擎缓慢弹出区域）。
-- **夹爪**：开口 = `0.075 − finger_joint1`，因此 `gripper_open: 0.0`（75 mm）、
-  `gripper_closed: 0.048`（27 mm）。SRDF 的 `off/on = 0.04/0.0` 对本 URDF 是反的。
+- **夹爪**：两指**中心距** = `0.075 − finger_joint1`（Gazebo TF 实测），指块本身厚 10 mm，
+  所以**内壁开口 = `0.065 − finger_joint1`**。方块 30 mm，因此
+  `gripper_open: 0.0`（内壁 65 mm）、`gripper_closed: 0.022`（内壁 43 mm，每侧约 6.5 mm 余量）。
+  曾经写在这里的 `0.048` 实际是内壁 17 mm，会每侧压进方块 6.5 mm——与固定关节对抗，
+  正是"抖动把机器人弹飞"的配置。方块由 Gazebo 固定关节承载，指爪只做"包住"动作。
+  收紧依据是运行日志里的 `Pre-attach cube offset in link6 frame`：实测方块在
+  link6 坐标系 `dy = +0.010 m`，不接触的安全上限约 `0.027`，改这个值前先看这行。
 - **视觉测距**：0.093 m 高、水平安装的相机满足
   `行 = 360 + 66.0 / (相机到方块距离 − 0.015)`；`visual_approach_row` 为停止行，
   剩余距离由 `visual_final_creep_m` 补齐。
@@ -201,6 +233,64 @@ ros2 launch mybot fixed_joint_pick_place.launch.py \
 节点在吸附前会检查 `link6` 与方块的距离（标定值 0.063 m，上限 0.09 m），
 距离过大时拒绝远距离吸附；放置后会校验落点是否在区域内。
 注意已放置的方块仍会被后续导航路径推挤，连续作业需为已放置方块预留绕行路径。
+
+## 比赛可视化：Foxglove 状态面板
+
+`competition_bringup.launch.py` 默认带 `foxglove:=true`，会额外起
+`foxglove_bridge`（WebSocket，8765）。Windows 上的 Foxglove 桌面版选
+**Foxglove WebSocket** 连 `ws://localhost:8765` 即可（WSL 是 mirrored 网络模式，
+localhost 直接互通），再导入仓库里的布局文件
+`src/yzbot/mybot/config/foxglove/competition_layout.json`：题目、大模型回复、
+结构化任务、进度、状态迁移、3D（雷达/路径/机器人）、视觉识别画面、日志
+九块面板全部绑定真实话题，没有占位文字。
+
+只想起桥（仿真已在跑）：
+
+```bash
+ros2 launch mybot foxglove_bridge.launch.py
+```
+
+安装、面板清单、双机位端口放行和排错见 [`FOXGLOVE.md`](FOXGLOVE.md)。
+
+## 性能：墙钟时间的瓶颈是仿真实时率（RTF），不是导航参数
+
+赛题按墙钟计时，而 Gazebo 在这台 WSL 机器上跑不满实时。实测：
+
+| 场景 | RTF | 说明 |
+| --- | --- | --- |
+| 只起 Gazebo（机器人+传感器） | **0.93** | 基本实时 |
+| 完整 bringup 空闲（+MoveIt+Nav2） | **0.43** | 只剩四成 |
+| 完整 bringup + 抓取执行器导航中 | **0.18** | 机器人"仿真内"0.33 m/s，墙钟只有 **0.061 m/s** |
+
+也就是说 198 s 的一次抓取配送，机器人实际只"经历"了约 34 s；5 分钟墙钟预算在这台
+机器上只买到约 55 s 的机器人时间。**单块 45 s 的目标靠调 Nav2 参数达不到**，要先把
+实时率提上去，或者接受完成数量少。
+
+已经做的降载改动（都是仿真侧，不影响算法标定）：
+
+- 相机 15 Hz → **10 Hz**（视觉伺服本来就是 10 Hz 控制周期，15 Hz 只多花渲染）
+- 雷达 20 Hz → **10 Hz**（局部代价地图 5 Hz、全局 1 Hz，10 Hz 已翻倍富余）
+- 视觉 HSV 管线只在视觉伺服窗口内运行（原来在两条导航腿上也逐帧处理 1280×720，
+  实测占约 27% 单核 + 图像话题流量，抢的就是 gzserver 的 CPU）
+- `vx_max` 0.5 → 0.6（仿真内有效，墙钟收益有限，风险最高，出问题就回 0.5）
+
+跑之前先自检，别在低实时率上做计时测试：
+
+```bash
+ros2 run mybot rtf_probe.py          # 打印 RTF + 机器人墙钟/仿真速度
+```
+
+> **必须知道的坑**：`Ctrl-C`/`kill` 一个 `ros2 launch` 后，子进程（Nav2、MoveIt、
+> gzserver）经常变成孤儿继续跑。再起一套就会**两套 Nav2 抢 `/cmd_vel`**，表现为
+> 机器人不动、TF 混乱、RTF 测出来是假数据。重拉之前确认：
+> ```bash
+> pgrep -c -f nav2_ ; pgrep -c -f gzserver     # 都应为 0 或 1
+> pkill -f 'nav2_'; pkill -f 'gzserv[e]r'; pkill -f 'move_grou[p]'
+> ros2 run mybot reset_dds_cache.sh
+> ```
+
+更快的做法：`gui:=false` 跑仿真（Gazebo GUI 会把场景再渲染一遍），可视化用 Foxglove
+（见 [`FOXGLOVE.md`](FOXGLOVE.md)），需要录制时录 Foxglove 的 3D 面板而不是 Gazebo 窗口。
 
 ## 故障排查：动作目标响应超时 / 节点互相发现不到
 

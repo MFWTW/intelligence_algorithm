@@ -1,0 +1,464 @@
+{
+ "configById": {
+  "Indicator!red_count": {
+   "path": "/competition/dashboard/red_count.data",
+   "style": "background",
+   "fontSize": 36,
+   "fallbackColor": "#e35e4b",
+   "fallbackLabel": "-",
+   "rules": [
+    {
+     "operator": "=",
+     "rawValue": "0",
+     "color": "#e35e4b",
+     "label": "0"
+    },
+    {
+     "operator": "=",
+     "rawValue": "1",
+     "color": "#e35e4b",
+     "label": "1"
+    },
+    {
+     "operator": "=",
+     "rawValue": "2",
+     "color": "#e35e4b",
+     "label": "2"
+    },
+    {
+     "operator": "=",
+     "rawValue": "3",
+     "color": "#e35e4b",
+     "label": "3"
+    },
+    {
+     "operator": "=",
+     "rawValue": "4",
+     "color": "#e35e4b",
+     "label": "4"
+    },
+    {
+     "operator": "=",
+     "rawValue": "5",
+     "color": "#e35e4b",
+     "label": "5"
+    }
+   ],
+   "foxglovePanelTitle": "红色数量"
+  },
+  "Indicator!blue_count": {
+   "path": "/competition/dashboard/blue_count.data",
+   "style": "background",
+   "fontSize": 36,
+   "fallbackColor": "#4b8fe3",
+   "fallbackLabel": "-",
+   "rules": [
+    {
+     "operator": "=",
+     "rawValue": "0",
+     "color": "#4b8fe3",
+     "label": "0"
+    },
+    {
+     "operator": "=",
+     "rawValue": "1",
+     "color": "#4b8fe3",
+     "label": "1"
+    },
+    {
+     "operator": "=",
+     "rawValue": "2",
+     "color": "#4b8fe3",
+     "label": "2"
+    },
+    {
+     "operator": "=",
+     "rawValue": "3",
+     "color": "#4b8fe3",
+     "label": "3"
+    },
+    {
+     "operator": "=",
+     "rawValue": "4",
+     "color": "#4b8fe3",
+     "label": "4"
+    },
+    {
+     "operator": "=",
+     "rawValue": "5",
+     "color": "#4b8fe3",
+     "label": "5"
+    }
+   ],
+   "foxglovePanelTitle": "蓝色数量"
+  },
+  "Indicator!blue_zone": {
+   "path": "/competition/dashboard/blue_zone.data",
+   "style": "background",
+   "fontSize": 36,
+   "fallbackColor": "#4b8fe3",
+   "fallbackLabel": "等待任务",
+   "rules": [
+    {
+     "operator": "=",
+     "rawValue": "蓝色到A区",
+     "color": "#6eebdd",
+     "label": "蓝色到A区"
+    },
+    {
+     "operator": "=",
+     "rawValue": "蓝色到B区",
+     "color": "#6eebdd",
+     "label": "蓝色到B区"
+    },
+    {
+     "operator": "=",
+     "rawValue": "蓝色到C区",
+     "color": "#6eebdd",
+     "label": "蓝色到C区"
+    }
+   ],
+   "foxglovePanelTitle": "蓝色"
+  },
+  "Indicator!red_zone": {
+   "path": "/competition/dashboard/red_zone.data",
+   "style": "background",
+   "fontSize": 36,
+   "fallbackColor": "#e35e4b",
+   "fallbackLabel": "等待任务",
+   "rules": [
+    {
+     "operator": "=",
+     "rawValue": "红色到A区",
+     "color": "#f0a58f",
+     "label": "红色到A区"
+    },
+    {
+     "operator": "=",
+     "rawValue": "红色到B区",
+     "color": "#f0a58f",
+     "label": "红色到B区"
+    },
+    {
+     "operator": "=",
+     "rawValue": "红色到C区",
+     "color": "#f0a58f",
+     "label": "红色到C区"
+    }
+   ],
+   "foxglovePanelTitle": "红色"
+  },
+  "Indicator!progress": {
+   "path": "/competition/dashboard/grab_index.data",
+   "style": "background",
+   "fontSize": 36,
+   "fallbackColor": "#d6f2cf",
+   "fallbackLabel": "待命",
+   "rules": [
+    {
+     "operator": "=",
+     "rawValue": "1",
+     "color": "#68e24a",
+     "label": "第1个"
+    },
+    {
+     "operator": "=",
+     "rawValue": "2",
+     "color": "#68e24a",
+     "label": "第2个"
+    },
+    {
+     "operator": "=",
+     "rawValue": "3",
+     "color": "#68e24a",
+     "label": "第3个"
+    },
+    {
+     "operator": "=",
+     "rawValue": "4",
+     "color": "#68e24a",
+     "label": "第4个"
+    },
+    {
+     "operator": "=",
+     "rawValue": "5",
+     "color": "#68e24a",
+     "label": "第5个"
+    }
+   ],
+   "foxglovePanelTitle": "任务进度"
+  },
+  "Indicator!work_state": {
+   "path": "/competition/dashboard/work_state.data",
+   "style": "background",
+   "fontSize": 36,
+   "fallbackColor": "#adb2d6",
+   "fallbackLabel": "待命",
+   "rules": [
+    {
+     "operator": "=",
+     "rawValue": "待命",
+     "color": "#a0a0a0",
+     "label": "待命"
+    },
+    {
+     "operator": "=",
+     "rawValue": "解析任务",
+     "color": "#f7e07a",
+     "label": "解析任务"
+    },
+    {
+     "operator": "=",
+     "rawValue": "校验任务",
+     "color": "#f7e07a",
+     "label": "校验任务"
+    },
+    {
+     "operator": "=",
+     "rawValue": "识别资源",
+     "color": "#f7e07a",
+     "label": "识别资源"
+    },
+    {
+     "operator": "=",
+     "rawValue": "前往资源点",
+     "color": "#6eebdd",
+     "label": "前往资源点"
+    },
+    {
+     "operator": "=",
+     "rawValue": "对准资源",
+     "color": "#6eebdd",
+     "label": "对准资源"
+    },
+    {
+     "operator": "=",
+     "rawValue": "执行抓取",
+     "color": "#68e24a",
+     "label": "执行抓取"
+    },
+    {
+     "operator": "=",
+     "rawValue": "已抓取",
+     "color": "#68e24a",
+     "label": "已抓取"
+    },
+    {
+     "operator": "=",
+     "rawValue": "前往放置区",
+     "color": "#6eebdd",
+     "label": "前往放置区"
+    },
+    {
+     "operator": "=",
+     "rawValue": "执行放置",
+     "color": "#68e24a",
+     "label": "执行放置"
+    },
+    {
+     "operator": "=",
+     "rawValue": "校验放置",
+     "color": "#68e24a",
+     "label": "校验放置"
+    },
+    {
+     "operator": "=",
+     "rawValue": "下一块",
+     "color": "#6eebdd",
+     "label": "下一块"
+    },
+    {
+     "operator": "=",
+     "rawValue": "全部完成",
+     "color": "#68e24a",
+     "label": "全部完成"
+    },
+    {
+     "operator": "=",
+     "rawValue": "任务失败",
+     "color": "#c0392b",
+     "label": "任务失败"
+    }
+   ],
+   "foxglovePanelTitle": "当前任务"
+  },
+  "Indicator!gripper_state": {
+   "path": "/competition/dashboard/gripper_state.data",
+   "style": "background",
+   "fontSize": 36,
+   "fallbackColor": "#80c9d2",
+   "fallbackLabel": "未使能",
+   "rules": [
+    {
+     "operator": "=",
+     "rawValue": "未抓取",
+     "color": "#a0a0a0",
+     "label": "未抓取"
+    },
+    {
+     "operator": "=",
+     "rawValue": "对准中",
+     "color": "#f7e07a",
+     "label": "对准中"
+    },
+    {
+     "operator": "=",
+     "rawValue": "抓取中",
+     "color": "#68e24a",
+     "label": "抓取中"
+    },
+    {
+     "operator": "=",
+     "rawValue": "已抓取",
+     "color": "#68e24a",
+     "label": "已抓取"
+    },
+    {
+     "operator": "=",
+     "rawValue": "携带中",
+     "color": "#6eebdd",
+     "label": "携带中"
+    },
+    {
+     "operator": "=",
+     "rawValue": "放置中",
+     "color": "#68e24a",
+     "label": "放置中"
+    },
+    {
+     "operator": "=",
+     "rawValue": "已释放",
+     "color": "#80c9d2",
+     "label": "已释放"
+    }
+   ],
+   "foxglovePanelTitle": "状态"
+  },
+  "RawMessages!problem": {
+   "topicPath": "/competition/dashboard/problem",
+   "foxglovePanelTitle": "任务题目"
+  },
+  "Image!camera": {
+   "imageMode": {
+    "imageTopic": "/camera/image_raw"
+   },
+   "foxglovePanelTitle": "识别画面"
+  },
+  "Image!debug": {
+   "imageMode": {
+    "imageTopic": "/vision/debug_image"
+   },
+   "foxglovePanelTitle": "识别画面"
+  },
+  "3D!scene": {
+   "followMode": "follow-pose",
+   "followTf": "map",
+   "topics": {
+    "/scan": {
+     "visible": true,
+     "colorField": "range",
+     "colorMode": "gradient",
+     "colorMap": "turbo",
+     "pointSize": 4,
+     "decayTime": 0.5
+    },
+    "/plan": {
+     "visible": true
+    },
+    "/local_plan": {
+     "visible": true
+    },
+    "/amcl_pose": {
+     "visible": true
+    },
+    "/robot_description": {
+     "visible": true,
+     "displayMode": "auto",
+     "showOutlines": false,
+     "showAxis": false
+    }
+   },
+   "layers": {
+    "grid": {
+     "visible": true,
+     "frameLocked": true,
+     "label": "Grid",
+     "instanceId": "grid",
+     "layerId": "foxglove.Grid",
+     "size": 20,
+     "divisions": 20,
+     "lineWidth": 1,
+     "color": "#248eff",
+     "position": [
+      0,
+      0,
+      0
+     ],
+     "rotation": [
+      0,
+      0,
+      0
+     ],
+     "order": 1
+    }
+   },
+   "foxglovePanelTitle": "三维"
+  }
+ },
+ "globalVariables": {},
+ "userNodes": {},
+ "playbackConfig": {
+  "speed": 1
+ },
+ "layout": {
+  "first": {
+   "first": {
+    "first": {
+     "first": "Indicator!red_count",
+     "second": "Indicator!blue_count",
+     "direction": "row",
+     "splitPercentage": 50
+    },
+    "second": {
+     "first": "Indicator!blue_zone",
+     "second": "Indicator!red_zone",
+     "direction": "row",
+     "splitPercentage": 50
+    },
+    "direction": "row",
+    "splitPercentage": 50
+   },
+   "second": {
+    "first": {
+     "first": "Image!camera",
+     "second": "Image!debug",
+     "direction": "row",
+     "splitPercentage": 50
+    },
+    "second": "3D!scene",
+    "direction": "column",
+    "splitPercentage": 46
+   },
+   "direction": "column",
+   "splitPercentage": 15
+  },
+  "second": {
+   "first": "Indicator!progress",
+   "second": {
+    "first": "Indicator!work_state",
+    "second": {
+     "first": "Indicator!gripper_state",
+     "second": "RawMessages!problem",
+     "direction": "column",
+     "splitPercentage": 34
+    },
+    "direction": "column",
+    "splitPercentage": 34
+   },
+   "direction": "column",
+   "splitPercentage": 26
+  },
+  "direction": "row",
+  "splitPercentage": 72
+ }
+}

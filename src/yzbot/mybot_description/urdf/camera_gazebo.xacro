@@ -33,9 +33,11 @@
 
         <gazebo reference="${prefix}_link">
             <sensor type="camera" name="camera_node">
-                <!-- 15 Hz is sufficient for the visual servo and avoids
-                     overloading Ogre/D3D12 under Gazebo Classic on WSL. -->
-                <update_rate>15.0</update_rate>
+                <!-- 10 Hz matches the visual servo's control period (it spins at
+                     0.1 s and needs 3 stable frames); the previous 15 Hz only
+                     added Ogre/D3D12 render load, and rendering is what caps
+                     the whole simulation at RTF ~0.2 on this WSL host. -->
+                <update_rate>10.0</update_rate>
                 <camera name="head">
                     <horizontal_fov>1.3962634</horizontal_fov>
                     <image>
@@ -47,11 +49,6 @@
                         <near>0.02</near>
                         <far>300</far>
                     </clip>
-                    <noise>
-                        <type>gaussian</type>
-                        <mean>0.0</mean>
-                        <stddev>0.007</stddev>
-                    </noise>
                 </camera>
                 <plugin name="gazebo_camera" filename="libgazebo_ros_camera.so">
 				    <ros>

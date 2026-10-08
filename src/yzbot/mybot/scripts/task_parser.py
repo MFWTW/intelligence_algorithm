@@ -4,8 +4,9 @@
 
 Pipeline: run the problem generator, ask the DeepSeek chat API to convert the
 Chinese word problem into JSON under the configured mapping rules, validate the
-result, and publish every intermediate stage. The API key is read from an
-environment variable only and is never written to a parameter file.
+result, and publish every intermediate stage. The API key is read from the
+environment or from a local secret file (see ``resolve_api_key``) and is never
+written into a parameter file or a log line.
 """
 
 import json
@@ -17,6 +18,7 @@ import sys
 import time
 import urllib.error
 import urllib.request
+from pathlib import Path
 
 import rclpy
 from rclpy.node import Node
@@ -27,6 +29,81 @@ from std_msgs.msg import String
 COLORS = {'red', 'blue'}
 ZONES = {'A', 'B', 'C'}
 
+# Where the operator stores the key once so plain ``ros2 launch`` picks it up
+# without exporting anything in the shell. ``set_deepseek_key.sh`` writes the
+# first one. Files may hold either a bare key or ``DEEPSEEK_API_KEY=sk-...``.
+DEFAULT_KEY_FILES = (
+    '~/.config/mybot/deepseek_api_key',
+    '~/.deepseek_api_key',
+    '.secrets/deepseek_api_key',
+    '.env',
+)
+
+# How long a *failed* parse keeps its latched status alive, so the supervisor
+# and the dashboard always get a reason instead of a silent IDLE run.
+FAILURE_HOLD_MIN_SEC = 10.0
+FAILURE_HOLD_MAX_SEC = 20.0
+# Endpoint matching on WSL/Fast DDS can take several seconds, so a status
+# published once before the supervisor matched is simply lost. Re-sending the
+# last status while holding is idempotent (the supervisor ignores it once it
+# has acted) and makes the reason reliable.
+STATUS_REPUBLISH_SEC = 2.0
+
+
+def _key_from_file(path: Path, key_env: str) -> str:
+    """Return the key stored in ``path``, or '' when the file has none.
+
+    A file is accepted in both shapes: a bare key on the first useful line, or
+    ``KEY=VALUE`` lines as in a ``.env`` file (only ``key_env`` is honoured
+    there, and ``export`` prefixes / surrounding quotes are tolerated).
+    """
+    try:
+        text = path.read_text(encoding='utf-8')
+    except (OSError, UnicodeDecodeError):
+        return ''
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith('#'):
+            continue
+        if '=' in line:
+            name, _, raw = line.partition('=')
+            if name.strip().removeprefix('export').strip() != key_env:
+                continue
+            line = raw.strip()
+        return line.strip().strip('"').strip("'")
+    return ''
+
+
+def resolve_api_key(key_env: str, key_file: str = '') -> tuple:
+    """Return ``(api_key, source)``; ``source`` is safe to log, the key is not.
+
+    Lookup order, first hit wins:
+
+    1. ``$<key_env>`` already exported in the environment;
+    2. the ``api_key_file`` node parameter, then ``$DEEPSEEK_API_KEY_FILE``;
+    3. ``~/.config/mybot/deepseek_api_key`` (written by ``set_deepseek_key.sh``);
+    4. ``~/.deepseek_api_key``;
+    5. ``.secrets/deepseek_api_key`` and ``.env`` relative to the directory the
+       launch was started from, so a gitignored workspace file also works.
+    """
+    value = os.environ.get(key_env, '').strip()
+    if value:
+        return value, f'${key_env}'
+
+    candidates = []
+    if key_file.strip():
+        candidates.append(Path(key_file.strip()).expanduser())
+    env_file = os.environ.get('DEEPSEEK_API_KEY_FILE', '').strip()
+    if env_file:
+        candidates.append(Path(env_file).expanduser())
+    candidates += [Path(p).expanduser() for p in DEFAULT_KEY_FILES]
+
+    for path in candidates:
+        value = _key_from_file(path, key_env)
+        if value:
+            return value, str(path)
+    return '', ''
+
 
 class TaskParser(Node):
     """Generate a problem, parse it with the cloud LLM, validate the JSON."""
@@ -34,8 +111,15 @@ class TaskParser(Node):
     def __init__(self) -> None:
         super().__init__('task_parser')
 
+        # 2026-10-08: default was an absolute /home/yaowei/dev_ws/... path, so a
+        # fresh clone could not find the problem generator. Resolve against the
+        # user's home instead, and expand "~"/"$HOME" in whatever the YAML or the
+        # CLI supplies so the shipped config stays machine independent. See
+        # _resolved_generator_path() for the expansion.
         self.declare_parameter(
-            'generator_path', '/home/yaowei/dev_ws/TMSCQtest_x86_x64.bin'
+            'generator_path',
+            os.path.join(os.path.expanduser('~'), 'dev_ws',
+                         'TMSCQtest_x86_x64.bin'),
         )
         self.declare_parameter('generator_timeout_sec', 10.0)
         self.declare_parameter('problem_override', '')
@@ -43,9 +127,13 @@ class TaskParser(Node):
         # exits immediately takes its durability cache with it. Keeping the node
         # alive briefly guarantees a late-starting supervisor still latches the
         # task. 0 restores the historical "parse once and exit" behaviour.
+        # On failure the hold is clamped to [FAILURE_HOLD_MIN_SEC,
+        # FAILURE_HOLD_MAX_SEC] so the reason is never lost either.
         self.declare_parameter('linger_sec', 0.0)
 
         self.declare_parameter('api_key_env', 'DEEPSEEK_API_KEY')
+        # Optional explicit key file; empty falls back to DEFAULT_KEY_FILES.
+        self.declare_parameter('api_key_file', '')
         self.declare_parameter(
             'api_base_url', 'https://api.deepseek.com/chat/completions'
         )
@@ -78,6 +166,11 @@ class TaskParser(Node):
         self.declare_parameter('expected_total_counts', 5)
 
         self._last_solved = None
+        # Source (path or env name) the key was last read from, logged once.
+        self._key_source = None
+        # Last status text, re-sent while lingering so a late-matching
+        # supervisor or dashboard still receives it.
+        self._last_status = ''
         result_qos = QoSProfile(depth=1)
         result_qos.reliability = ReliabilityPolicy.RELIABLE
         result_qos.durability = DurabilityPolicy.TRANSIENT_LOCAL
@@ -104,17 +197,36 @@ class TaskParser(Node):
         publisher.publish(message)
 
     def _status(self, text: str) -> None:
+        self._last_status = text
         self.get_logger().info(f'Task status: {text}')
         self._publish(self._status_pub, text)
 
+    def republish_status(self) -> None:
+        """Re-send the last status quietly, for a subscriber that matched late."""
+        if self._last_status:
+            self._publish(self._status_pub, self._last_status)
+
     # ------------------------------------------------------------ generate
+    def _resolved_generator_path(self) -> str:
+        """Expand ~ and $HOME in generator_path so the config stays portable.
+
+        The shipped config uses "$HOME/dev_ws/TMSCQtest_x86_x64.bin" instead of a
+        hard-coded /home/<user>/... path (2026-10-08), because the absolute form
+        only worked on the machine it was written on and a fresh clone silently
+        failed with "Problem generator not found". ROS parameters are plain
+        strings, so the shell never expands them for us and the expansion has to
+        happen here.
+        """
+        raw = str(self.get_parameter('generator_path').value).strip()
+        return os.path.expanduser(os.path.expandvars(raw))
+
     def _generate_problem(self) -> str | None:
         override = str(self.get_parameter('problem_override').value).strip()
         if override:
             self.get_logger().info('Using problem_override instead of the generator.')
             return override
 
-        path = str(self.get_parameter('generator_path').value)
+        path = self._resolved_generator_path()
         timeout = float(self.get_parameter('generator_timeout_sec').value)
         if not os.path.isfile(path):
             self.get_logger().error(f'Problem generator not found: {path}')
@@ -151,12 +263,21 @@ class TaskParser(Node):
 
     def _request(self, model: str, problem: str) -> str:
         key_env = str(self.get_parameter('api_key_env').value)
-        api_key = os.environ.get(key_env, '').strip()
+        api_key, source = resolve_api_key(
+            key_env, str(self.get_parameter('api_key_file').value)
+        )
         if not api_key:
             raise RuntimeError(
-                f'API key environment variable {key_env} is empty; export it '
-                'before starting this node.'
+                f'No DeepSeek API key: ${key_env} is empty and none of the '
+                'secret files were found. Run "ros2 run mybot '
+                'set_deepseek_key.sh" once (stores it in '
+                '~/.config/mybot/deepseek_api_key), or export '
+                f'{key_env}=sk-... before launching.'
             )
+        if source != self._key_source:
+            self._key_source = source
+            # Never log the key itself, only where it came from.
+            self.get_logger().info(f'Using DeepSeek API key from {source}.')
 
         system_prompt = str(self.get_parameter('system_prompt').value).strip()
         payload = {
@@ -538,27 +659,47 @@ def main(args=None) -> None:
     rclpy.init(args=args)
     node = TaskParser()
     exit_code = 1
+    linger = float(node.get_parameter('linger_sec').value)
     try:
         exit_code = 0 if node.run_once() else 1
-        linger = float(node.get_parameter('linger_sec').value)
-        if exit_code == 0 and linger > 0.0:
-            # Keep the transient-local sample alive so a supervisor that starts
-            # after this node finished can still receive /competition/task.
-            node.get_logger().info(
-                f'Holding /competition/task for {linger:.0f}s so late '
-                'subscribers latch it.'
-            )
-            deadline = time.monotonic() + linger
-            while rclpy.ok() and time.monotonic() < deadline:
-                rclpy.spin_once(node, timeout_sec=0.2)
     except KeyboardInterrupt:
-        pass
-    except Exception as exc:
-        node.get_logger().error(f'Task parser crashed: {exc}')
-    finally:
         node.destroy_node()
         if rclpy.ok():
             rclpy.shutdown()
+        return
+    except Exception as exc:
+        # An unhandled crash used to exit within milliseconds, so neither the
+        # supervisor nor the Foxglove dashboard ever latched a FAILED status:
+        # the run just sat in IDLE and looked like "the robot does not move".
+        node.get_logger().error(f'Task parser crashed: {exc}')
+        exit_code = 1
+        try:
+            node._status('FAILED:CRASH')
+        except Exception:
+            pass
+
+    # Keep the transient-local samples alive so a supervisor or dashboard that
+    # starts later still sees the task (on success) or the reason (on failure).
+    if exit_code == 0:
+        hold = linger
+    else:
+        hold = min(max(linger, FAILURE_HOLD_MIN_SEC), FAILURE_HOLD_MAX_SEC)
+    if hold > 0.0:
+        node.get_logger().info(
+            f'Holding the last /competition/* status for {hold:.0f}s so late '
+            'subscribers latch it.'
+        )
+        deadline = time.monotonic() + hold
+        next_republish = time.monotonic() + STATUS_REPUBLISH_SEC
+        while rclpy.ok() and time.monotonic() < deadline:
+            rclpy.spin_once(node, timeout_sec=0.2)
+            if time.monotonic() >= next_republish:
+                next_republish = time.monotonic() + STATUS_REPUBLISH_SEC
+                node.republish_status()
+
+    node.destroy_node()
+    if rclpy.ok():
+        rclpy.shutdown()
     sys.exit(exit_code)
 
 

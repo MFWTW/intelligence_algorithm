@@ -1,0 +1,149 @@
+{
+  "configById": {
+    "3D!competition": {
+      "followTf": "base_footprint",
+      "topics": {
+        "/scan": {
+          "visible": true
+        },
+        "/plan": {
+          "visible": true
+        },
+        "/local_plan": {
+          "visible": true
+        },
+        "/amcl_pose": {
+          "visible": true
+        },
+        "/odom": {
+          "visible": true
+        }
+      },
+      "layers": {
+        "grid": {
+          "visible": true,
+          "frameLocked": true,
+          "label": "Grid",
+          "instanceId": "grid",
+          "layerId": "foxglove.Grid",
+          "size": 50,
+          "divisions": 25,
+          "lineWidth": 1,
+          "color": "#248eff",
+          "position": [
+            0,
+            0,
+            0
+          ],
+          "rotation": [
+            0,
+            0,
+            0
+          ],
+          "order": 1
+        },
+        "urdf": {
+          "visible": true,
+          "instanceId": "urdf",
+          "layerId": "foxglove.Urdf",
+          "label": "URDF",
+          "order": 2,
+          "controlMode": "transforms",
+          "jointStatesTopic": "/joint_states",
+          "displayMode": "auto",
+          "fallbackColor": "#ffffff",
+          "showAxis": false,
+          "axisScale": 1,
+          "showOutlines": true,
+          "opacity": 1,
+          "sourceType": "topic",
+          "topic": "/robot_description",
+          "url": "",
+          "filePath": "",
+          "parameter": "",
+          "framePrefix": ""
+        }
+      }
+    },
+    "Image!vision": {
+      "imageMode": {
+        "imageTopic": "/vision/debug_image"
+      }
+    },
+    "StateTransitions!state": {
+      "paths": [
+        {
+          "value": "/competition/state",
+          "timestampMethod": "receiveTime"
+        }
+      ]
+    },
+    "RawMessages!problem": {
+      "topicPath": "/competition/task_problem"
+    },
+    "RawMessages!llm": {
+      "topicPath": "/competition/task_raw_reply"
+    },
+    "RawMessages!task": {
+      "topicPath": "/competition/task"
+    },
+    "RawMessages!progress": {
+      "topicPath": "/competition/progress"
+    },
+    "RawMessages!error": {
+      "topicPath": "/competition/error"
+    },
+    "Log!rosout": {
+      "topicToRender": "/rosout",
+      "minLogLevel": 1,
+      "searchTerms": [],
+      "nameFilter": {}
+    }
+  },
+  "globalVariables": {},
+  "userNodes": {},
+  "playbackConfig": {
+    "speed": 1
+  },
+  "layout": {
+    "first": {
+      "first": "RawMessages!problem",
+      "second": {
+        "first": "RawMessages!llm",
+        "second": {
+          "first": "RawMessages!task",
+          "second": {
+            "first": "RawMessages!progress",
+            "second": "RawMessages!error",
+            "direction": "row",
+            "splitPercentage": 55
+          },
+          "direction": "column",
+          "splitPercentage": 50
+        },
+        "direction": "column",
+        "splitPercentage": 45
+      },
+      "direction": "column",
+      "splitPercentage": 34
+    },
+    "second": {
+      "first": {
+        "first": "3D!competition",
+        "second": "Image!vision",
+        "direction": "row",
+        "splitPercentage": 60
+      },
+      "second": {
+        "first": "StateTransitions!state",
+        "second": "Log!rosout",
+        "direction": "row",
+        "splitPercentage": 55
+      },
+      "direction": "column",
+      "splitPercentage": 58
+    },
+    "direction": "row",
+    "splitPercentage": 33
+  }
+}

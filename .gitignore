@@ -18,6 +18,7 @@ Thumbs.db
 # Local environment and secrets
 .env
 .env.*
+.secrets/
 *.local
 
 # Preserved metadata from the vendored upstream repository

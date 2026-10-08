@@ -1,0 +1,46 @@
+<!--
+  Same replanning pipeline as nav2_bt_navigator's stock
+  navigate_to_pose_w_replanning_and_recovery.xml, with a cheaper recovery round.
+
+  Why: on this WSL/Gazebo map the stock RoundRobin is
+  ClearEntireCostmap -> Spin 1.57 rad -> Wait 5 s -> BackUp 0.30 m @ 0.05 m/s,
+  i.e. roughly 12 simulated seconds per attempt, and every simulated second
+  costs 1/RTF wall seconds.  Measured on 2026-10-06 a single loaded delivery leg
+  hit three progress-checker failures; the recovery cost and the 20 s progress
+  window together pushed the leg past its wall-clock budget while the base was
+  0.14 m from the goal.
+
+  This tree keeps the same structure and retry count but recovers in about
+  4 simulated seconds: clear both costmaps, back up 0.15 m, spin 0.8 rad.
+  The `Wait` action is intentionally dropped: its `wait_duration` port is in
+  milliseconds in this Nav2 version, so the stock "5" is a no-op anyway.
+-->
+<root main_tree_to_execute="MainTree">
+  <BehaviorTree ID="MainTree">
+    <RecoveryNode number_of_retries="6" name="NavigateRecovery">
+      <PipelineSequence name="NavigateWithReplanning">
+        <RateController hz="1.0">
+          <RecoveryNode number_of_retries="1" name="ComputePathToPose">
+            <ComputePathToPose goal="{goal}" path="{path}" planner_id="GridBased"/>
+            <ClearEntireCostmap name="ClearGlobalCostmap-Context" service_name="global_costmap/clear_entirely_global_costmap"/>
+          </RecoveryNode>
+        </RateController>
+        <RecoveryNode number_of_retries="1" name="FollowPath">
+          <FollowPath path="{path}" controller_id="FollowPath"/>
+          <ClearEntireCostmap name="ClearLocalCostmap-Context" service_name="local_costmap/clear_entirely_local_costmap"/>
+        </RecoveryNode>
+      </PipelineSequence>
+      <ReactiveFallback name="RecoveryFallback">
+        <GoalUpdated/>
+        <RoundRobin name="RecoveryActions">
+          <Sequence name="ClearingActions">
+            <ClearEntireCostmap name="ClearLocalCostmap-Subtree" service_name="local_costmap/clear_entirely_local_costmap"/>
+            <ClearEntireCostmap name="ClearGlobalCostmap-Subtree" service_name="global_costmap/clear_entirely_global_costmap"/>
+          </Sequence>
+          <BackUp backup_dist="0.5" backup_speed="0.05"/>
+          <Spin spin_dist="0.8"/>
+        </RoundRobin>
+      </ReactiveFallback>
+    </RecoveryNode>
+  </BehaviorTree>
+</root>

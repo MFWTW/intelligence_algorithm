@@ -4,8 +4,10 @@ from launch import LaunchDescription
 from launch.actions import (
     DeclareLaunchArgument,
     IncludeLaunchDescription,
+    LogInfo,
     RegisterEventHandler,
     SetEnvironmentVariable,
+    TimerAction,
 )
 from launch.conditions import IfCondition
 from launch.event_handlers import OnProcessExit
@@ -75,62 +77,111 @@ def generate_launch_description():
     )
 
     # ========== 使用 spawner 加载控制器（替代 ros2 control 命令） ==========
-    # 1. 关节状态广播器
-    load_joint_state_broadcaster = Node(
-        package='controller_manager',
-        executable='spawner',
-        arguments=[
-            'joint_state_broadcaster', '-c', '/controller_manager',
-            '--controller-manager-timeout', '120',
-            '--service-call-timeout', '60',
-        ],
-        output='screen'
-    )
+    # Three things were learned the hard way on this WSL host:
+    #   * --switch-timeout matters as much as the discovery timeout; with the
+    #     default 5 s the activate call fails as "Switch controller timed out
+    #     after 5.000000 seconds!".
+    #   * Even then a spawner can fail to reach /controller_manager at all
+    #     ("Could not contact service /controller_manager/list_controllers"
+    #     after waiting --controller-manager-timeout), while the very next
+    #     spawner one second later succeeds. Fast DDS on WSL randomly loses
+    #     that endpoint.
+    #   * A single failed spawner used to abort the whole bringup: no
+    #     controllers -> the startup gate times out -> MoveIt/Nav2 never start
+    #     -> /competition/system_ready stays false and the task queue waits in
+    #     IDLE, which looks exactly like "the robot does not move".
+    # So each spawner is retried a few times before giving up.
+    def controller_spawner(controller: str) -> Node:
+        return Node(
+            package='controller_manager',
+            executable='spawner',
+            arguments=[
+                controller, '-c', '/controller_manager',
+                '--controller-manager-timeout', '120',
+                '--service-call-timeout', '60',
+                '--switch-timeout', '60',
+            ],
+            output='screen',
+        )
 
-    # 2. 机械臂轨迹控制器
-    load_arm_controller = Node(
-        package='controller_manager',
-        executable='spawner',
-        arguments=[
-            'arm_controller', '-c', '/controller_manager',
-            '--controller-manager-timeout', '120',
-            '--service-call-timeout', '60',
-        ],
-        output='screen'
-    )
+    def start_after(event, _context, action, label):
+        """Start ``action`` once the previous step succeeded."""
+        if event.returncode == 0:
+            return [action]
+        return [LogInfo(msg=(
+            f'{label} exited with code {event.returncode}; not starting the '
+            'next startup step. Check the lines above.'
+        ))]
 
-    # 3. 夹爪控制器
-    load_gripper_controller = Node(
-        package='controller_manager',
-        executable='spawner',
-        arguments=[
-            'gripper_controller', '-c', '/controller_manager',
-            '--controller-manager-timeout', '120',
-            '--service-call-timeout', '60',
-        ],
-        output='screen'
-    )
+    def retry_on_failure(controller, next_action, attempts=4):
+        """Handler for a spawner's exit: retry the same controller, else move on.
 
-    # ========== 事件顺序（保证控制器按顺序加载） ==========
-    # 当机器人生成完成后，加载关节状态广播器
+        The retry is what makes startup survive this host: a spawner can fail
+        with "Could not contact service /controller_manager/list_controllers"
+        even though the controller manager is alive and the *next* spawner one
+        second later succeeds (Fast DDS on WSL loses that endpoint). A fresh
+        Node is created per attempt because a launch action may only be
+        executed once.
+        """
+        remaining = {'left': attempts}
+
+        def on_exit(event, _context):
+            if event.returncode == 0:
+                return [] if next_action is None else [next_action]
+            if remaining['left'] <= 0:
+                return [LogInfo(msg=(
+                    f'{controller}: still failing after {attempts} attempts, '
+                    'giving up. MoveIt/Nav2 will not start, /competition/'
+                    'system_ready stays false and the task queue waits in IDLE. '
+                    'Stop everything, run ros2 run mybot reset_dds_cache.sh, '
+                    'then start again.'
+                ))]
+            remaining['left'] -= 1
+            attempt = attempts - remaining['left']
+            return [
+                LogInfo(msg=(
+                    f'{controller} failed (exit {event.returncode}); retrying '
+                    f'{attempt}/{attempts} in 3 s.'
+                )),
+                TimerAction(
+                    period=3.0,
+                    actions=[controller_spawner(controller)],
+                ),
+            ]
+
+        return on_exit
+
+    load_joint_state_broadcaster = controller_spawner('joint_state_broadcaster')
+    load_arm_controller = controller_spawner('arm_controller')
+    load_gripper_controller = controller_spawner('gripper_controller')
+
+    # ========== 事件顺序（依次加载，每个控制器失败自动重试 4 次） ==========
+    # 机器人 spawn 成功 -> joint_state_broadcaster -> arm_controller
+    # -> gripper_controller；任一环节失败只重试它自己，不跳过下一步。
     evt1 = RegisterEventHandler(
         event_handler=OnProcessExit(
             target_action=spawn_entity_cmd,
-            on_exit=[load_joint_state_broadcaster]
+            on_exit=lambda event, context: start_after(
+                event, context, load_joint_state_broadcaster, 'spawn_entity'
+            ),
         )
     )
-    # 当关节状态广播器加载完成后，加载手臂控制器
     evt2 = RegisterEventHandler(
         event_handler=OnProcessExit(
             target_action=load_joint_state_broadcaster,
-            on_exit=[load_arm_controller]
+            on_exit=retry_on_failure('joint_state_broadcaster', load_arm_controller),
         )
     )
-    # 当手臂控制器加载完成后，加载夹爪控制器
     evt3 = RegisterEventHandler(
         event_handler=OnProcessExit(
             target_action=load_arm_controller,
-            on_exit=[load_gripper_controller]
+            on_exit=retry_on_failure('arm_controller', load_gripper_controller),
+        )
+    )
+    evt4 = RegisterEventHandler(
+        event_handler=OnProcessExit(
+            target_action=load_gripper_controller,
+            on_exit=retry_on_failure('gripper_controller', None),
         )
     )
 
@@ -161,5 +212,6 @@ def generate_launch_description():
     ld.add_action(evt1)
     ld.add_action(evt2)
     ld.add_action(evt3)
+    ld.add_action(evt4)
 
     return ld

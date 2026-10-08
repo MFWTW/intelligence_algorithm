@@ -2,14 +2,27 @@ task_parser:
   ros__parameters:
     # ---- 出题程序 ----------------------------------------------------
     # 题目生成器（x86_64 Linux ELF）。运行一次向 stdout 输出一行题目。
-    generator_path: /home/yaowei/dev_ws/TMSCQtest_x86_x64.bin
+    #
+    # 2026-10-08: was an absolute /home/yaowei/dev_ws/... path, which only worked
+    # on the machine it was written on. task_parser.py now expands "~" and "$HOME"
+    # itself, so keep this relative to the workspace: copy TMSCQtest_x86_x64.bin to
+    # the top of your dev_ws checkout (it is untracked, so it must be supplied by
+    # hand) and this resolves for any user. Override with an absolute path if you
+    # keep the binary elsewhere.
+    generator_path: $HOME/dev_ws/TMSCQtest_x86_x64.bin
     generator_timeout_sec: 10.0
     # 调试用：非空时直接解析这段题目，不调用出题程序。
     problem_override: ''
 
     # ---- 云端大模型 --------------------------------------------------
-    # API Key 只从环境变量 DEEPSEEK_API_KEY 读取，绝不写入本文件。
+    # API Key 绝不写入本文件。运行时按顺序找：
+    #   $DEEPSEEK_API_KEY > api_key_file 参数 > $DEEPSEEK_API_KEY_FILE
+    #   > ~/.config/mybot/deepseek_api_key > ~/.deepseek_api_key
+    #   > ./.secrets/deepseek_api_key > ./.env
+    # 一次性保存：ros2 run mybot set_deepseek_key.sh
     api_key_env: DEEPSEEK_API_KEY
+    # 显式指定密钥文件（留空则用上面的默认位置）。
+    api_key_file: ''
     api_base_url: https://api.deepseek.com/chat/completions
     model: deepseek-chat
     temperature: 0.0
