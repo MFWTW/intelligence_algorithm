@@ -17,6 +17,7 @@ from unittest.mock import Mock, patch
 import numpy as np
 from action_msgs.msg import GoalStatus
 from builtin_interfaces.msg import Time
+from rclpy.qos import DurabilityPolicy, ReliabilityPolicy
 
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / 'scripts' / 'fixed_joint_pick_place.py'
@@ -1657,6 +1658,19 @@ class StartButtonGateTests(unittest.TestCase):
 
     def test_waiting_for_start_is_a_known_state(self):
         self.assertIn('WAITING_FOR_START', supervisor.VALID_STATES)
+
+    def test_a_plain_volatile_publisher_can_also_release_the_gate(self):
+        """`ros2 topic pub` and the Foxglove button publish VOLATILE.
+
+        The latched reader is RELIABLE + TRANSIENT_LOCAL, so it silently drops
+        those (measured 2026-10-13: the documented command printed "publishing
+        #1" and the run stayed in WAITING_FOR_START). The start topic therefore
+        needs a second reader whose requested durability and reliability are the
+        weakest DDS allows, which matches every publisher.
+        """
+        qos = supervisor.start_button_fallback_qos()
+        self.assertEqual(qos.durability, DurabilityPolicy.VOLATILE)
+        self.assertEqual(qos.reliability, ReliabilityPolicy.BEST_EFFORT)
 
     def test_the_gate_parks_without_starting_an_object(self):
         """_tick must wait, not call _start_current, while the gate is closed."""

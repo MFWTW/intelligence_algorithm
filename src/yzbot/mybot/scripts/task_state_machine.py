@@ -48,6 +48,29 @@ VALID_STATES = {
 }
 
 
+def start_button_fallback_qos() -> QoSProfile:
+    """The weakest reader profile that still matches a publisher.
+
+    The latched reader on the start topic is RELIABLE + TRANSIENT_LOCAL, which
+    only matches publishers that ALSO offer TRANSIENT_LOCAL durability. A plain
+    `ros2 topic pub` is VOLATILE, so its message is dropped without any warning:
+    measured 2026-10-13, the documented command printed "publishing #1" and the
+    run stayed in WAITING_FOR_START (a `--qos-durability transient_local`
+    publisher released it immediately). The Foxglove layout declares no QoS for
+    the 「开始任务」 button either, so whether that button works depends on the
+    Studio default - not something to gamble on during a competition.
+
+    VOLATILE + BEST_EFFORT is compatible with every publisher (requested
+    durability and reliability are both the weakest allowed), so this second
+    reader accepts the button, the CLI and anything else. The latched reader
+    stays, so a press made before the system is ready still counts.
+    """
+    fallback = QoSProfile(depth=1)
+    fallback.reliability = ReliabilityPolicy.BEST_EFFORT
+    fallback.durability = DurabilityPolicy.VOLATILE
+    return fallback
+
+
 class TaskStateMachine(Node):
     """Supervise parsing readiness and sequential pick/place subprocesses."""
 
@@ -192,9 +215,15 @@ class TaskStateMachine(Node):
         self._pending_object_id = 0
         self._timer = self.create_timer(0.2, self._tick)
         self._start_requested = False
+        start_topic = str(self.get_parameter('start_topic').value)
         self.create_subscription(
-            Bool, str(self.get_parameter('start_topic').value),
-            self._start_button_cb, qos
+            Bool, start_topic, self._start_button_cb, qos
+        )
+        # Same topic and handler, weakest compatible QoS: the latched reader
+        # above ignores a VOLATILE publisher (plain CLI, Foxglove button).
+        self.create_subscription(
+            Bool, start_topic, self._start_button_cb,
+            start_button_fallback_qos()
         )
         self._set_state('IDLE')
         self._publish_progress()

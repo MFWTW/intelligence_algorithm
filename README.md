@@ -162,11 +162,17 @@ MYBOT_REQUIRE_START_BUTTON=true ros2 run mybot start_competition.sh
 打开后状态机会停在 `WAITING_FOR_START`，直到 `/competition/start` 收到 `true`：
 
 ```bash
-# 命令行模拟按钮
-ros2 topic pub --once /competition/start std_msgs/msg/Bool "{data: true}"
+# 命令行模拟按钮。连发几秒，别用 --once：单发可能赶在 DDS 匹配完成之前
+# 就发完了，消息会丢。状态机同时挂了 TRANSIENT_LOCAL 与最宽松的 VOLATILE
+# 两条订阅，所以界面按钮和这条命令都能解除等待。
+timeout 5 ros2 topic pub -r 2 /competition/start std_msgs/msg/Bool "{data: true}"
 ```
 
 **默认关闭**，保持自动开跑。按钮可以提前按（会记住），但**每接受一个新任务都会重置**。
+
+> 2026-10-13 之前：状态机只挂 `TRANSIENT_LOCAL`，而 `ros2 topic pub` 与
+> Foxglove 按钮默认发 `VOLATILE`，durability 不兼容 → 消息**静默丢弃**，
+> 命令行会打印 "publishing #1" 却什么也不发生。现已修复（多挂一条最宽松订阅）。
 
 ### 第 6 步：用 Foxglove 看（推荐）
 
