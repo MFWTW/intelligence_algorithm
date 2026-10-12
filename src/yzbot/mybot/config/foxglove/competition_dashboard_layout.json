@@ -536,7 +536,7 @@
     },
     "Publish!start": {
       "foxglovePanelTitle": "开始按钮",
-      "messageType": "std_msgs/msg/Bool",
+      "schemaName": "std_msgs/msg/Bool",
       "topicName": "/competition/start",
       "value": "{\"data\": true}",
       "buttonText": "开始任务",

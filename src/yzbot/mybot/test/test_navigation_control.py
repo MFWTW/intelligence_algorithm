@@ -1191,10 +1191,19 @@ class ZoneSlotTests(unittest.TestCase):
 class StartButtonPanelTests(unittest.TestCase):
     """The 「开始任务」 button lives in the dashboard layout, so its config is code.
 
-    It shipped with messageType "std_msgs/Bool" (the ROS 1 form). Foxglove on a
-    ROS 2 bridge cannot resolve that schema, so the panel showed
-    "请在面板设置中配置主题和消息..." and the button stayed greyed out even
-    though topic and payload were correct.
+    Two faults kept this button dead, and the second hid behind the first:
+
+    * the type name was the ROS 1 form "std_msgs/Bool"; and
+    * the field was called `messageType`, which the Foxglove Publish panel does
+      not read - its settings are topic / message schema / editing mode / button
+      title / tooltip / colour, so the schema has to arrive as `schemaName`.
+      With no schema the panel shows "请在面板设置中配置主题和消息..." and greys
+      the button out even though the topic and payload are correct.
+
+    Measured 2026-10-13: renaming the field to `schemaName` (value unchanged,
+    "std_msgs/msg/Bool") turned the button live, and pressing it made the state
+    machine log "Start button pressed; releasing the gate." - the CLI-equivalent
+    test below is not enough, because the panel never reads the field it checks.
     """
 
     def panel(self):
@@ -1206,8 +1215,10 @@ class StartButtonPanelTests(unittest.TestCase):
 
     def test_the_schema_uses_the_ros2_type_name(self):
         panel = self.panel()
-        self.assertEqual(panel['messageType'], 'std_msgs/msg/Bool')
-        self.assertNotEqual(panel['messageType'], 'std_msgs/Bool')
+        # `schemaName` is the field the Publish panel reads; a `messageType` key
+        # leaves the schema empty and the button disabled.
+        self.assertEqual(panel['schemaName'], 'std_msgs/msg/Bool')
+        self.assertNotEqual(panel['schemaName'], 'std_msgs/Bool')
 
     def test_the_button_publishes_true_on_the_start_topic(self):
         import json
