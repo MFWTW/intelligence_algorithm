@@ -239,8 +239,15 @@ ros2 run mybot dashboard_bridge.py     # 已默认随 competition_bringup 启动
 └───────────────────────────────────────────┘
 ```
 
-导入：Foxglove → `Layouts` → `Import from file…` → 选该文件（也在
-`C:\Users\26807\Downloads\competition_dashboard_layout.json`）。
+导入：Foxglove → `Layouts` → `Import from file…` → 选**仓库里那份**（路径见
+[启动流程.md](启动流程.md) 第三节）：
+
+```
+\\wsl.localhost\Ubuntu-22.04\home\yaowei\dev_ws\src\yzbot\mybot\config\foxglove\competition_dashboard_layout.json
+```
+
+> 别再导入 `Downloads\competition_dashboard_layout.json` —— 那是更早的一份
+> （11 个面板、**没有「开始任务」按钮**），照它导入会看不到开始按钮。
 
 说明两点：
 
