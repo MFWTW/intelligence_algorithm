@@ -7,6 +7,7 @@ an object's pre-grasp pose, a bounded HSV image servo centers the requested
 colour and corrects the final standoff before the fixed-joint grasp sequence.
 """
 
+import contextlib
 import json
 import math
 import sys
@@ -25,6 +26,7 @@ from gazebo_msgs.srv import SetEntityState
 from geometry_msgs.msg import PoseStamped, Twist
 from linkattacher_msgs.srv import AttachLink, DetachLink
 from nav2_msgs.action import NavigateToPose
+from nav2_msgs.msg import SpeedLimit
 from nav2_msgs.srv import ClearEntireCostmap
 from rcl_interfaces.msg import (
     Parameter,
@@ -109,6 +111,34 @@ class FixedJointPickPlace(Node):
         # Saved runtime state places A/B/C at x=5, y=-11/-12/-13 with
         # 1.0 x 0.5 m plates. The goals below are pre-compensated by the
         # measured docking shortfall and carried-cube offset.
+        # Every delivery used to aim at the SAME spot inside the zone, so the
+        # 2nd/3rd/4th cube landed on top of the ones already there and slid off.
+        # Measured 2026-10-12 (seed 995410, x=4 red -> A): delivery 1 placed at
+        # (6.883,-2.519), delivery 3 was released at the nominal (6.886,-2.483)
+        # - on top of delivery 1 - and ended at (6.334,-2.446), 0.552 m off and
+        # outside the +/-0.485 acceptance box. The dock creep itself was fine
+        # (0.020 m); the miss was stacking, not docking.
+        # These offsets are applied to the dock pose by how many cubes have
+        # already been delivered to that zone, and are chosen to stay inside the
+        # 1.0 x 0.5 m plate: 0.12 m in y (box half-width 0.235) and 0.24 m in x
+        # (box half-length 0.485). Cubes are 0.03 m, so 0.12 m apart never stacks
+        # (0.09 m of clearance between neighbours).
+        #
+        # 2026-10-13: the y slots used to be +/-0.16, which left only 0.075 m of
+        # the 0.235 acceptance half-width for the placement error, and the error
+        # is a systematic ~0.02-0.08 m in -y (the cube comes to rest slightly
+        # beyond the dock point). Measured on four slot-3 deliveries:
+        #   y offset -0.182 / -0.217 / -0.231 / -0.244  ->  margins
+        #   +0.053 / +0.018 / +0.004 / -0.009 m, i.e. the last one missed the
+        #   zone by 9 mm and failed the round (VERIFY_PLACE:...CUBE_RELEASED).
+        # Slots 1/2/4, which sit at 0.00/+0.16, always had 0.17-0.23 m of margin
+        # and never failed. Pulling the y slots in to +/-0.12 raises the budget
+        # to 0.115 m, which the worst measured error (0.084 m) still fits.
+        self._zone_deliveries = {}
+        self.declare_parameter(
+            'zone_slot_offsets',
+            [0.0, 0.0, 0.0, 0.12, 0.0, -0.12, -0.24, 0.0],
+        )
         self.declare_parameter('warehouse_a_pose', [4.792, -10.74, 0.0])
         self.declare_parameter('warehouse_b_pose', [4.792, -11.74, 0.0])
         self.declare_parameter('warehouse_c_pose', [4.792, -12.74, 0.0])
@@ -199,16 +229,22 @@ class FixedJointPickPlace(Node):
         # patience exceeded" on the A aligned approach - exactly where round29
         # died. A flood fill with the loaded 0.35 m footprint reaches A only by
         # looping east: out along y=-5.98 to x=+12.88, north to y=-3.5, then back
-        # west. The middle point is kept because the shortcut from (12.88,-3.88)
-        # straight to (12.48,-3.18) has 11 blocked cells at 0.35 m.
+        # west. The middle point is kept because the original shortcut from
+        # (12.88,-3.88) to (12.48,-3.18) had 11 blocked cells at 0.35 m.
+        # Even the new third target cannot safely be cut to in a straight line
+        # from via_1 (static occupied-edge clearance dips to 0.318 m).
         self.declare_parameter(
             'blue_cube_3_warehouse_a_via_1', [12.875, -3.875, 0.454302]
         )
         self.declare_parameter(
             'blue_cube_3_warehouse_a_via_2', [12.875, -3.525, 1.570796]
         )
+        # Keep the standalone/default executor aligned with the validated YAML.
+        # The old target's nominal via_2 chord entered the 0.35 m loaded
+        # footprint; two same-task five-cube runs reached this open-area target
+        # in ~3 s without the previously repeated 45 s stall.
         self.declare_parameter(
-            'blue_cube_3_warehouse_a_via_3', [12.475, -3.175, 2.422763]
+            'blue_cube_3_warehouse_a_via_3', [12.700, -2.800, 2.422763]
         )
         self.declare_parameter('robot_model_name', 'six_arm')
         self.declare_parameter('robot_base_link', 'base_footprint')
@@ -303,6 +339,29 @@ class FixedJointPickPlace(Node):
         # "hold the plate yaw"; the arm's drop point is calibrated for the latter.
         self.declare_parameter('dock_creep_align_distance_m', 0.12)
         self.declare_parameter('navigation_retry_count', 2)
+        # Tight-passage speed caps: flat [x, y, radius_m, speed_mps, ...]. Empty
+        # means the executor never publishes a speed limit at all and the
+        # controller keeps running with its own desired_linear_vel.
+        # Default is the single-element sentinel [0.0], meaning "no zones".
+        # Measured 2026-10-11: a Type enum default raises
+        # ParameterUninitializedException when no parameter file supplies the
+        # name (the production configuration), while a bare [] default raises
+        # InvalidParameterTypeException when a file DOES supply a double array.
+        # A non-empty, correctly typed default is the only form that works in
+        # both cases; a list shorter than one group of four means "off".
+        self.declare_parameter('slow_zones', [0.0])
+        # Hard-wedge detector. A base wedged by the controller's own collision
+        # check cannot move at all, and the only thing that frees it is this
+        # executor's escape - so waiting out navigation_stall_timeout_sec (45 s)
+        # buys nothing. The signal below is not a proxy: the controller emits
+        # "detected collision ahead" while refusing to move, and it is absent
+        # (measured: exactly 0 messages) during every legitimate stationary
+        # phase, which all happen at a dock AFTER Nav2 hands control back.
+        # Disabled unless wedge_collision_window_sec is > 0.
+        self.declare_parameter('wedge_collision_window_sec', 0.0)
+        self.declare_parameter('wedge_collision_min_messages', 5)
+        self.declare_parameter('wedge_collision_radius_m', 0.05)
+        self.declare_parameter('wedge_collision_timeout_sec', 6.0)
         # Dead-zone escape. Nav2 marks every cell within robot_radius of an
         # obstacle as inscribed, and DWB's BaseObstacle rejects a rollout as soon
         # as the footprint touches one - including the rollout that *is* the
@@ -373,6 +432,16 @@ class FixedJointPickPlace(Node):
         self.declare_parameter('visual_timeout_sec', 45.0)
         self.declare_parameter('visual_detection_stale_sec', 0.5)
         self.declare_parameter('visual_min_contour_area', 800.0)
+        # The strict HSV gates are what keep the brick-red walls out, but a shaded
+        # cube drops under them and the blob then vanishes for seconds. Measured
+        # 2026-10-12 with the cubes in their new positions: vision_align went from
+        # 8.8-9.2 s to 28-64 s with repeated "Visual blob lost for 3.1 s;
+        # restarting the search". The relaxed tier is only consulted when the
+        # strict one finds nothing, and every shape and expected-row gate still
+        # applies to it. Set the three scales to 1.0 to disable the fallback.
+        self.declare_parameter('visual_relaxed_saturation_scale', 0.65)
+        self.declare_parameter('visual_relaxed_value_scale', 0.60)
+        self.declare_parameter('visual_relaxed_dominance_scale', 0.80)
         # Deliberately strict pure-red gate: the Gazebo cube is nearly pure red,
         # while brick/wood walls are darker and contain much more green/blue.
         self.declare_parameter('visual_red_min_saturation', 200)
@@ -423,11 +492,35 @@ class FixedJointPickPlace(Node):
         self.declare_parameter('visual_min_linear_speed', 0.02)
         self.declare_parameter('visual_max_angular_speed', 0.25)
         self.declare_parameter('visual_stable_frames', 3)
+        # The final standoff used to come from ONE frame - whichever happened to
+        # satisfy the acceptance gate. Measured 2026-10-12: with
+        # visual_row_tolerance 18 px the accepting row can be anywhere in 662-698
+        # and standoff = 0.015 + 66/(row-360) sweeps 0.210-0.234 m, i.e. 23 mm of
+        # spread from the gate alone; a single noisy frame (partial blob, shadow)
+        # moved it further and the base stopped ~40 mm too far, giving
+        # "Pre-attach distance 0.107 m (limit 0.090)" and a refused grasp in a
+        # round that had already aligned (centre_error -0.002). So: average over
+        # the agreeing frames instead of trusting the last one.
+        self.declare_parameter('visual_standoff_frames', 5)
+        self.declare_parameter('visual_stable_span_px', 8.0)
         # If the cube is not in view (e.g. Nav2 parked off-target because of
         # localization drift), rotate in place to find it before giving up.
         self.declare_parameter('visual_search_rate', 0.35)
         self.declare_parameter('visual_search_timeout_sec', 18.0)
+        # 2026-10-10: with a bad coarse parking pose the blob can slip out of the
+        # frame during centring. This loop used to sit still until the 75 s
+        # timeout; now it re-enters the search after this many seconds without a
+        # fresh detection. Measured cost of the old behaviour: 72 s of silence in
+        # run_logs/speed_rpp15_trial1_20261010-143655.
+        self.declare_parameter('visual_research_after_sec', 3.0)
         self.declare_parameter('proximity_timeout_sec', 5.0)
+        # One missed /gazebo/link_states window used to end the whole round:
+        # measured 2026-10-12 (official_run3 and vision_stab1), the run stopped at
+        # "Timed out waiting for /gazebo/link_states" during VERIFY_GRASP after
+        # 3/5 deliveries, with nothing wrong with the robot. A bounded retry rides
+        # out a transient DDS/gzserver stall while still failing in finite time
+        # (attempts x proximity_timeout_sec).
+        self.declare_parameter('proximity_retry_attempts', 3)
         self.declare_parameter('max_attach_distance_m', 0.16)
         self.declare_parameter('max_attached_distance_m', 0.20)
         self.declare_parameter('arm_motion_sec', 3.0)
@@ -499,6 +592,18 @@ class FixedJointPickPlace(Node):
         self._bridge = CvBridge()
         self._visual_detection = None
         self._visual_detection_time = 0.0
+        self._speed_limit_pub = None
+        self._active_speed_limit = 0.0
+        self._slow_zones = self._parse_slow_zones()
+        self._controller_collisions = deque()
+        self._wedge_log_sub = None
+        self._wedge_enabled = bool(self.get_parameter(
+            'wedge_collision_timeout_sec').value > 0.0
+            and self.get_parameter('wedge_collision_window_sec').value > 0.0)
+        if self._wedge_enabled:
+            from rcl_interfaces.msg import Log as _Log
+            self._wedge_log_sub = self.create_subscription(
+                _Log, '/rosout', self._wedge_log, 50)
         # The HSV pipeline only runs while the servo owns the base. Processing
         # every 1280x720 frame during the two navigation legs cost ~27% of a
         # core and ~40 MB/s of image traffic for no benefit, and on this host
@@ -696,114 +801,163 @@ class FixedJointPickPlace(Node):
             return
 
         hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
-        if self._target_colour == 'blue':
-            min_saturation = int(
-                self.get_parameter('visual_blue_min_saturation').value
-            )
-            min_value = int(
-                self.get_parameter('visual_blue_min_value').value
-            )
-            hue_min = int(self.get_parameter('visual_blue_hue_min').value)
-            hue_max = int(self.get_parameter('visual_blue_hue_max').value)
-            mask = cv2.inRange(
-                hsv,
-                np.array([hue_min, min_saturation, min_value]),
-                np.array([hue_max, 255, 255]),
-            )
-            # Hue alone also matches the desaturated blue-grey of shadowed
-            # brick/wood walls, so require the blue channel to dominate both
-            # red and green exactly as the red gate does.
-            blue, green, red = cv2.split(image)
-            ratio = float(
-                self.get_parameter('visual_blue_dominance_ratio').value
-            )
-            blue_float = blue.astype(np.float32)
-            dominant = np.where(
-                (blue_float >= ratio * red.astype(np.float32))
-                & (blue_float >= ratio * green.astype(np.float32)),
-                255,
-                0,
-            ).astype(np.uint8)
-            mask = cv2.bitwise_and(mask, dominant)
-            box_colour = (255, 0, 0)
-        else:
-            min_saturation = int(
-                self.get_parameter('visual_red_min_saturation').value
-            )
-            min_value = int(self.get_parameter('visual_red_min_value').value)
-            low_red = cv2.inRange(
-                hsv,
-                np.array([0, min_saturation, min_value]),
-                np.array([6, 255, 255]),
-            )
-            high_red = cv2.inRange(
-                hsv,
-                np.array([174, min_saturation, min_value]),
-                np.array([180, 255, 255]),
-            )
-            mask = cv2.bitwise_or(low_red, high_red)
-            # HSV hue alone cannot distinguish pure red from brick red. Require
-            # the red channel to dominate both green and blue as well.
-            blue, green, red = cv2.split(image)
-            ratio = float(
-                self.get_parameter('visual_red_dominance_ratio').value
-            )
-            red_float = red.astype(np.float32)
-            dominant = np.where(
-                (red_float >= ratio * green.astype(np.float32))
-                & (red_float >= ratio * blue.astype(np.float32)),
-                255,
-                0,
-            ).astype(np.uint8)
-            mask = cv2.bitwise_and(mask, dominant)
-            box_colour = (0, 0, 255)
-        kernel = np.ones((3, 3), dtype=np.uint8)
-        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
-        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
-        contours, _ = cv2.findContours(
-            mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
-        )
-        minimum = float(self.get_parameter('visual_min_contour_area').value)
+        # Two tiers (2026-10-12): the strict HSV gates below are what keep the
+        # brick-red walls out, but a shaded cube drops under them and the blob
+        # then disappears for seconds - measured with the cubes in their new
+        # positions, vision_align went from 8.8-9.2 s to 28-64 s with repeated
+        # "Visual blob lost for 3.1 s; restarting the search". The relaxed tier is
+        # only consulted when the strict one finds NO candidate, and every shape
+        # and expected-row gate below still applies to it, so a wall cannot sneak
+        # in merely because the cube was dim. Set the three *_scale parameters to
+        # 1.0 to disable the fallback entirely.
         image_height, image_width = image.shape[:2]
-        expected_bottom = None
-        if self._visual_range_gate_active:
-            cube = str(self.get_parameter('cube_name').value)
-            base_distance = self._cached_planar_distance_to_cube(cube)
-            if base_distance is not None:
-                camera_offset = float(
-                    self.get_parameter('camera_forward_offset_m').value
+        box_colour = (0, 0, 255)
+
+        def build_mask(sat_scale: float, val_scale: float, dom_scale: float):
+            """Colour mask with the brightness gates optionally loosened."""
+            nonlocal box_colour
+            if self._target_colour == 'blue':
+                min_saturation = int(
+                    self.get_parameter('visual_blue_min_saturation').value
+                    * sat_scale
                 )
-                row_offset = float(
-                    self.get_parameter('visual_row_distance_offset_m').value
+                min_value = int(
+                    self.get_parameter('visual_blue_min_value').value
+                    * val_scale
                 )
-                row_k = float(self.get_parameter('visual_row_distance_k').value)
-                row_center = float(self.get_parameter('visual_row_center').value)
-                camera_standoff = max(0.05, base_distance - camera_offset)
-                expected_bottom = row_center + row_k / max(
-                    0.05, camera_standoff - row_offset
+                hue_min = int(self.get_parameter('visual_blue_hue_min').value)
+                hue_max = int(self.get_parameter('visual_blue_hue_max').value)
+                mask = cv2.inRange(
+                    hsv,
+                    np.array([hue_min, min_saturation, min_value]),
+                    np.array([hue_max, 255, 255]),
                 )
-        best = None
-        for contour in contours:
-            area = cv2.contourArea(contour)
-            if area < minimum:
-                continue
-            x, y, width, height = cv2.boundingRect(contour)
-            aspect = width / max(1.0, float(height))
-            # The merged cube row is taller than wide once the near cube gets
-            # close, so the aspect window must stay permissive here.
-            bottom_row = float(y + height)
-            if bottom_row < 0.50 * image_height or not 0.15 <= aspect <= 3.0:
-                continue
-            if expected_bottom is not None:
-                row_gate = float(
-                    self.get_parameter('visual_expected_row_tolerance').value
+                # Hue alone also matches the desaturated blue-grey of shadowed
+                # brick/wood walls, so require the blue channel to dominate both
+                # red and green exactly as the red gate does.
+                blue, green, red = cv2.split(image)
+                ratio = float(
+                    self.get_parameter('visual_blue_dominance_ratio').value
+                ) * dom_scale
+                blue_float = blue.astype(np.float32)
+                dominant = np.where(
+                    (blue_float >= ratio * red.astype(np.float32))
+                    & (blue_float >= ratio * green.astype(np.float32)),
+                    255,
+                    0,
+                ).astype(np.uint8)
+                mask = cv2.bitwise_and(mask, dominant)
+                box_colour = (255, 0, 0)
+            else:
+                min_saturation = int(
+                    self.get_parameter('visual_red_min_saturation').value
+                    * sat_scale
                 )
-                if abs(bottom_row - expected_bottom) > row_gate:
+                min_value = int(
+                    self.get_parameter('visual_red_min_value').value * val_scale
+                )
+                low_red = cv2.inRange(
+                    hsv,
+                    np.array([0, min_saturation, min_value]),
+                    np.array([6, 255, 255]),
+                )
+                high_red = cv2.inRange(
+                    hsv,
+                    np.array([174, min_saturation, min_value]),
+                    np.array([180, 255, 255]),
+                )
+                mask = cv2.bitwise_or(low_red, high_red)
+                # HSV hue alone cannot distinguish pure red from brick red. Require
+                # the red channel to dominate both green and blue as well.
+                blue, green, red = cv2.split(image)
+                ratio = float(
+                    self.get_parameter('visual_red_dominance_ratio').value
+                ) * dom_scale
+                red_float = red.astype(np.float32)
+                dominant = np.where(
+                    (red_float >= ratio * green.astype(np.float32))
+                    & (red_float >= ratio * blue.astype(np.float32)),
+                    255,
+                    0,
+                ).astype(np.uint8)
+                mask = cv2.bitwise_and(mask, dominant)
+                box_colour = (0, 0, 255)
+
+            kernel = np.ones((3, 3), dtype=np.uint8)
+            opened = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
+            return cv2.morphologyEx(opened, cv2.MORPH_CLOSE, kernel)
+
+        def pick_best(mask):
+            """Largest contour passing the shape and expected-row gates."""
+            # NOTE: the accumulator must be the SAME name the loop writes and the
+            # function returns. A refactor once initialised `found`, let the loop
+            # fill `best`, and returned `found` - so the detector silently returned
+            # None for every frame, the vision search timed out after 18 s, and a
+            # competition round failed 0/5 while every source-grep test passed.
+            best = None
+            minimum = float(self.get_parameter('visual_min_contour_area').value)
+            expected_bottom = None
+            if self._visual_range_gate_active:
+                cube = str(self.get_parameter('cube_name').value)
+                base_distance = self._cached_planar_distance_to_cube(cube)
+                if base_distance is not None:
+                    camera_offset = float(
+                        self.get_parameter('camera_forward_offset_m').value
+                    )
+                    row_offset = float(
+                        self.get_parameter('visual_row_distance_offset_m').value
+                    )
+                    row_k = float(self.get_parameter('visual_row_distance_k').value)
+                    row_center = float(self.get_parameter('visual_row_center').value)
+                    camera_standoff = max(0.05, base_distance - camera_offset)
+                    expected_bottom = row_center + row_k / max(
+                        0.05, camera_standoff - row_offset
+                    )
+            contours, _ = cv2.findContours(
+                mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+            )
+            for contour in contours:
+                area = cv2.contourArea(contour)
+                if area < minimum:
                     continue
-            if width > 0.60 * image_width or height > 0.95 * image_height:
-                continue
-            if best is None or area > best[0]:
-                best = (area, x, y, width, height)
+                x, y, width, height = cv2.boundingRect(contour)
+                aspect = width / max(1.0, float(height))
+                # The merged cube row is taller than wide once the near cube gets
+                # close, so the aspect window must stay permissive here.
+                bottom_row = float(y + height)
+                if bottom_row < 0.50 * image_height or not 0.15 <= aspect <= 3.0:
+                    continue
+                if expected_bottom is not None:
+                    row_gate = float(
+                        self.get_parameter('visual_expected_row_tolerance').value
+                    )
+                    if abs(bottom_row - expected_bottom) > row_gate:
+                        continue
+                if width > 0.60 * image_width or height > 0.95 * image_height:
+                    continue
+                if best is None or area > best[0]:
+                    best = (area, x, y, width, height)
+
+
+            return best
+
+        mask = build_mask(1.0, 1.0, 1.0)
+        best = pick_best(mask)
+        if best is None:
+            relaxed_mask = build_mask(
+                float(self.get_parameter(
+                    'visual_relaxed_saturation_scale').value),
+                float(self.get_parameter('visual_relaxed_value_scale').value),
+                float(self.get_parameter('visual_relaxed_dominance_scale').value),
+            )
+            best = pick_best(relaxed_mask)
+            if best is not None:
+                # Only reached when the strict gates saw nothing at all, which is
+                # exactly the shaded-cube case this fallback exists for.
+                mask = relaxed_mask
+                self.get_logger().warning(
+                    'Strict colour gates found no blob; using the relaxed tier.'
+                )
 
         if best is not None:
             area, x, y, width, height = best
@@ -872,8 +1026,16 @@ class FixedJointPickPlace(Node):
     def _dependency_specs(self):
         """Every remote endpoint this executor needs, as (key, description, ready).
 
-        The callables read the self._*_client attributes lazily, so a client
-        rebuilt by _rebuild_dependency_client() is picked up automatically.
+        Every callable MUST look the self._*_client attribute up when it is
+        called. The action entries always did; the service entries used to pass
+        the bound method of whichever client object existed when this list was
+        built. After _rebuild_dependency_client() destroyed and replaced that
+        client, the stale bound method called into the destroyed object and
+        rclpy raised "cannot use Destroyable because destruction was requested"
+        straight out of the resident loop: measured 2026-10-10, both costmap
+        service clients were rebuilt and the executor died with
+        OBJECT_FAILED: executor exited 1 at 0/5, 20 s into the first cube
+        (run_logs/speed_rpp15_combined_trial2_20261010-170156).
         """
         return [
             (
@@ -891,87 +1053,99 @@ class FixedJointPickPlace(Node):
                 'Nav2 navigate_to_pose action',
                 lambda: self._navigate_client.wait_for_server(timeout_sec=0.0),
             ),
-            ('attach', '/ATTACHLINK', self._attach_client.service_is_ready),
-            ('detach', '/DETACHLINK', self._detach_client.service_is_ready),
+            ('attach', '/ATTACHLINK',
+             lambda: self._attach_client.service_is_ready()),
+            ('detach', '/DETACHLINK',
+             lambda: self._detach_client.service_is_ready()),
             (
                 'clear_global',
                 'global costmap clear service',
-                self._clear_global_client.service_is_ready,
+                lambda: self._clear_global_client.service_is_ready(),
             ),
             (
                 'clear_local',
                 'local costmap clear service',
-                self._clear_local_client.service_is_ready,
+                lambda: self._clear_local_client.service_is_ready(),
             ),
             (
                 'params_global',
                 'global costmap parameter service',
-                self._global_costmap_params_client.service_is_ready,
+                lambda: self._global_costmap_params_client.service_is_ready(),
             ),
             (
                 'params_local',
                 'local costmap parameter service',
-                self._local_costmap_params_client.service_is_ready,
+                lambda: self._local_costmap_params_client.service_is_ready(),
             ),
             (
                 'set_state',
                 '/gazebo/set_entity_state',
-                self._set_state_client.service_is_ready,
+                lambda: self._set_state_client.service_is_ready(),
             ),
         ]
 
     def _rebuild_dependency_client(self, key: str) -> None:
         """Drop and re-create one unmatched client so DDS discovery runs again."""
         if key == 'arm':
+            self._arm_client.destroy()
             self._arm_client = ActionClient(
                 self,
                 FollowJointTrajectory,
                 '/arm_controller/follow_joint_trajectory',
             )
         elif key == 'gripper':
+            self._gripper_client.destroy()
             self._gripper_client = ActionClient(
                 self,
                 FollowJointTrajectory,
                 '/gripper_controller/follow_joint_trajectory',
             )
         elif key == 'navigate':
+            self._navigate_client.destroy()
             self._navigate_client = ActionClient(
                 self, NavigateToPose, '/navigate_to_pose'
             )
         elif key == 'attach':
+            self.destroy_client(self._attach_client)
             self._attach_client = self.create_client(
                 AttachLink, '/ATTACHLINK'
             )
         elif key == 'detach':
+            self.destroy_client(self._detach_client)
             self._detach_client = self.create_client(
                 DetachLink, '/DETACHLINK'
             )
         elif key == 'clear_global':
+            self.destroy_client(self._clear_global_client)
             self._clear_global_client = self.create_client(
                 ClearEntireCostmap,
                 '/global_costmap/clear_entirely_global_costmap',
             )
         elif key == 'clear_local':
+            self.destroy_client(self._clear_local_client)
             self._clear_local_client = self.create_client(
                 ClearEntireCostmap,
                 '/local_costmap/clear_entirely_local_costmap',
             )
         elif key == 'params_global':
+            self.destroy_client(self._global_costmap_params_client)
             self._global_costmap_params_client = self.create_client(
                 SetParameters,
                 '/global_costmap/global_costmap/set_parameters',
             )
         elif key == 'params_local':
+            self.destroy_client(self._local_costmap_params_client)
             self._local_costmap_params_client = self.create_client(
                 SetParameters,
                 '/local_costmap/local_costmap/set_parameters',
             )
         elif key == 'set_state':
+            self.destroy_client(self._set_state_client)
             self._set_state_client = self.create_client(
                 SetEntityState, '/gazebo/set_entity_state'
             )
 
-    def _wait_for_dependencies(self) -> bool:
+    def _wait_for_dependencies__timed(self) -> bool:
         if bool(self.get_parameter('require_system_ready').value):
             timeout = float(self.get_parameter('ready_timeout_sec').value)
             self.get_logger().info('Waiting for /competition/system_ready=true ...')
@@ -1060,7 +1234,7 @@ class FixedJointPickPlace(Node):
                     rclpy.spin_once(self, timeout_sec=0.1)
         return None
 
-    def _execute_trajectory(
+    def _execute_trajectory__timed(
         self,
         label: str,
         client: ActionClient,
@@ -1152,7 +1326,19 @@ class FixedJointPickPlace(Node):
             raise ValueError(
                 f'warehouse must be A, B or C; got {warehouse!r}.'
             )
-        return warehouse, self._double_list(parameter_names[warehouse], 3)
+        goal = list(self._double_list(parameter_names[warehouse], 3))
+        offsets = [float(v) for v in self.get_parameter('zone_slot_offsets').value]
+        if len(offsets) >= 2:
+            slots = [offsets[i:i + 2] for i in range(0, len(offsets) - 1, 2)]
+            index = self._zone_deliveries.get(warehouse, 0) % len(slots)
+            dx, dy = slots[index]
+            goal[0] += dx
+            goal[1] += dy
+            self.get_logger().info(
+                f'warehouse {warehouse}: slot {index + 1}/{len(slots)} '
+                f'(offset {dx:+.2f}, {dy:+.2f}) -> dock ({goal[0]:.3f}, {goal[1]:.3f})'
+            )
+        return warehouse, goal
 
     def _pickup_goal(self) -> tuple[str, list[float]]:
         cube = str(self.get_parameter('cube_name').value).strip()
@@ -1161,7 +1347,7 @@ class FixedJointPickPlace(Node):
             raise ValueError(f'No calibrated pickup pose for cube {cube!r}.')
         return cube, self._double_list(parameter_name, 3)
 
-    def _clear_costmaps(self) -> bool:
+    def _clear_costmaps__timed(self) -> bool:
         for label, client in (
             ('global', self._clear_global_client),
             ('local', self._clear_local_client),
@@ -1176,7 +1362,7 @@ class FixedJointPickPlace(Node):
                 return False
         return True
 
-    def _set_costmap_geometry(
+    def _set_costmap_geometry__timed(
         self, radius: float, inflation_radius: float, label: str,
         remember: bool = True,
     ) -> bool:
@@ -1454,7 +1640,7 @@ class FixedJointPickPlace(Node):
         )
         return pose.position.x, pose.position.y, yaw
 
-    def _creep_to_dock(self, label: str, x: float, y: float, yaw: float) -> bool:
+    def _creep_to_dock__timed(self, label: str, x: float, y: float, yaw: float) -> bool:
         """Drive the last few centimetres to the plate with Nav2 released.
 
         Rotate to the plate yaw first, then creep straight in with a small
@@ -1681,7 +1867,33 @@ class FixedJointPickPlace(Node):
         )
         return False
 
-    def _navigate_once(
+    def _release_nav_control(self, label, goal_handle, result_future, timeout):
+        """Wait for a terminal Nav2 result before sending manual base commands.
+
+        An acknowledged cancel request alone is not enough: FollowPath may still
+        be publishing while cancellation is in flight. Fail closed if the
+        action transport cannot establish that the previous goal has ended.
+        """
+        if not result_future.done():
+            cancel_future = goal_handle.cancel_goal_async()
+            rclpy.spin_until_future_complete(self, cancel_future, timeout_sec=timeout)
+            rclpy.spin_until_future_complete(self, result_future, timeout_sec=timeout)
+        if not result_future.done():
+            raise RuntimeError(
+                f'NAV_STATE_UNKNOWN: {label} cancellation not confirmed'
+            )
+        result = result_future.result()
+        if result is None or result.status not in (
+            GoalStatus.STATUS_SUCCEEDED,
+            GoalStatus.STATUS_CANCELED,
+            GoalStatus.STATUS_ABORTED,
+        ):
+            raise RuntimeError(
+                f'NAV_STATE_UNKNOWN: {label} has no terminal result'
+            )
+        self._stop_base()
+
+    def _navigate_once__timed(
         self,
         label: str,
         values: Sequence[float],
@@ -1750,9 +1962,8 @@ class FixedJointPickPlace(Node):
         )
         best_distance = None
         stall_since = None
-        # One reverse escape per navigate attempt (2026-10-08): see the stall
-        # branch below. Reset here so every attempt gets its own chance.
-        reverse_recovery_done = False
+        # Do not drive an escape while a Nav2 goal is still active. On stall,
+        # cancel the goal and let _navigate_to perform one escape before retry.
         nomotion_timeout = float(
             self.get_parameter('navigation_nomotion_timeout_sec').value
         )
@@ -1763,6 +1974,7 @@ class FixedJointPickPlace(Node):
         motion_since = None
         while rclpy.ok() and not result_future.done() and time.monotonic() < deadline:
             rclpy.spin_once(self, timeout_sec=0.1)
+            self._apply_slow_zones()
             self._log_carried_cube_state(label)
             if nomotion_timeout > 0.0:
                 # "The base has not moved at all", straight from its position -
@@ -1780,6 +1992,33 @@ class FixedJointPickPlace(Node):
                         motion_anchor = position
                         motion_since = now
                     elif (
+                        self._wedge_enabled
+                        and motion_since is not None
+                        and now - motion_since > float(self.get_parameter(
+                            'wedge_collision_timeout_sec').value)
+                        and self._wedge_collisions_since(motion_since) >= int(
+                            self.get_parameter(
+                                'wedge_collision_min_messages').value)
+                    ):
+                        # Hard wedge: the controller is refusing to move because
+                        # its own collision check sees the footprint intruding,
+                        # and no amount of waiting changes that - only the escape
+                        # below does. Measured cost of waiting instead: 42.7 s in
+                        # run_logs/speed_rpp15_combined_trial5_20261010-173315,
+                        # with 353 collision messages and zero motion.
+                        self.get_logger().error(
+                            f'{label}: controller reported '
+                            f'{self._wedge_collisions_since(motion_since)} collision '
+                            f'refusals while the base stood still for '
+                            f'{now - motion_since:.1f} s; abandoning early so the '
+                            'escape can free it.'
+                        )
+                        self._release_nav_control(
+                            label, goal_handle, result_future,
+                            min(5.0, response_timeout),
+                        )
+                        return False
+                    elif (
                         motion_since is not None
                         and now - motion_since > nomotion_timeout
                     ):
@@ -1788,15 +2027,10 @@ class FixedJointPickPlace(Node):
                             f'{nomotion_radius:.2f} m in {nomotion_timeout:.0f} s; '
                             'stopping this attempt.'
                         )
-                        cancel_future = goal_handle.cancel_goal_async()
-                        cancel_timeout = min(5.0, response_timeout)
-                        rclpy.spin_until_future_complete(
-                            self, cancel_future, timeout_sec=cancel_timeout
+                        self._release_nav_control(
+                            label, goal_handle, result_future,
+                            min(5.0, response_timeout),
                         )
-                        rclpy.spin_until_future_complete(
-                            self, result_future, timeout_sec=cancel_timeout
-                        )
-                        self._stop_base()
                         return False
             if stall_timeout > 0.0:
                 # Abandon an attempt that has stopped closing the distance, so
@@ -1854,55 +2088,19 @@ class FixedJointPickPlace(Node):
                                 best_distance = live_distance
                                 stall_since = now
                                 continue
-                        # 2026-10-08: try a REVERSE ESCAPE before abandoning.
-                        # The open-space stall (costmap empty, no wall nearby,
-                        # /cmd_vel_nav silent, "Failed to make progress") is the
-                        # one failure that still kills whole runs:
-                        #   run_logs/timing_20261008-012156 : 1 stall -> leg failed
-                        #   run_logs/pos12_20261008-014657  : 3 stalls in a row ->
-                        #     retries all died within 0.1 m of the same spot and
-                        #     the task ended 2/5 with the cube attached.
-                        # A retry re-sends the same goal from essentially the same
-                        # pose, so MPPI lands in the same bad optimum. Physically
-                        # moving the base first breaks that: back off along the
-                        # clearer axis (the same helper the retry path uses, with
-                        # the lidar picking the direction) and keep the SAME goal
-                        # running, so the leg continues instead of restarting.
-                        if not reverse_recovery_done:
-                            reverse_recovery_done = True
-                            self.get_logger().warning(
-                                f'{label}: no progress for {stall_timeout:.0f} s '
-                                f'(still {live_distance:.2f} m from the goal); '
-                                'driving out of the stall before giving up.'
-                            )
-                            self._back_off(
-                                label,
-                                distance_m=float(
-                                    self.get_parameter('escape_distance_m').value
-                                ),
-                                speed=float(
-                                    self.get_parameter('escape_speed_mps').value
-                                ),
-                            )
-                            best_distance = None
-                            stall_since = None
-                            motion_anchor = None
-                            motion_since = None
-                            continue
+                        # Never publish an escape Twist against a live Nav2
+                        # controller. The former in-goal _back_off raced with
+                        # FollowPath on /cmd_vel_nav; the outer retry will move
+                        # only after this goal's cancellation is confirmed.
                         self.get_logger().warning(
                             f'{label}: no progress for {stall_timeout:.0f} s '
                             f'(still {live_distance:.2f} m from the goal); '
                             'abandoning this attempt so the retry can free the base.'
                         )
-                        cancel_future = goal_handle.cancel_goal_async()
-                        cancel_timeout = min(5.0, response_timeout)
-                        rclpy.spin_until_future_complete(
-                            self, cancel_future, timeout_sec=cancel_timeout
+                        self._release_nav_control(
+                            label, goal_handle, result_future,
+                            min(5.0, response_timeout),
                         )
-                        rclpy.spin_until_future_complete(
-                            self, result_future, timeout_sec=cancel_timeout
-                        )
-                        self._stop_base()
                         return False
             if completion_radius_m is not None:
                 point_distance = self._cached_planar_distance_to_point(x, y)
@@ -1956,15 +2154,10 @@ class FixedJointPickPlace(Node):
                             f'{label}: base is {goal_distance:.3f} m from the '
                             'plate; releasing Nav2 for the final dock creep.'
                         )
-                        cancel_future = goal_handle.cancel_goal_async()
-                        cancel_timeout = min(5.0, response_timeout)
-                        rclpy.spin_until_future_complete(
-                            self, cancel_future, timeout_sec=cancel_timeout
+                        self._release_nav_control(
+                            label, goal_handle, result_future,
+                            min(5.0, response_timeout),
                         )
-                        rclpy.spin_until_future_complete(
-                            self, result_future, timeout_sec=cancel_timeout
-                        )
-                        self._stop_base()
                         return self._creep_to_dock(label, x, y, yaw)
                     if (
                         accept_radius > 0.0
@@ -1999,33 +2192,37 @@ class FixedJointPickPlace(Node):
             if distance is None or distance > handoff_distance:
                 continue
 
-            if distance < min_handoff_distance:
-                # Arriving almost on top of the cube leaves the camera servo
-                # nothing to work with, so open the standoff before handing over.
-                self._stop_base()
-                distance = self._retreat_to_handoff_standoff(
-                    visual_handoff_cube, distance
-                )
             self.get_logger().info(
                 f'Visual handoff reached for {visual_handoff_cube}: '
                 f'base-to-cube distance={distance:.3f} m <= '
                 f'{handoff_distance:.3f} m; cancelling Nav2 before camera control.'
             )
-            cancel_future = goal_handle.cancel_goal_async()
-            cancel_timeout = min(5.0, response_timeout)
-            rclpy.spin_until_future_complete(
-                self, cancel_future, timeout_sec=cancel_timeout
+            # The previous order reversed while FollowPath was still active:
+            # two competing publishers drove /cmd_vel_nav at the same time.
+            self._release_nav_control(
+                label, goal_handle, result_future, min(5.0, response_timeout)
             )
-            rclpy.spin_until_future_complete(
-                self, result_future, timeout_sec=cancel_timeout
-            )
+            distance = self._cached_planar_distance_to_cube(visual_handoff_cube)
+            if distance is None or distance > handoff_distance:
+                self.get_logger().warning(
+                    f'{visual_handoff_cube}: visual handoff pose changed while '
+                    'cancelling Nav2; retrying navigation.'
+                )
+                return False
+            if distance < min_handoff_distance:
+                # Only retreat once cancellation/result have been confirmed.
+                distance = self._retreat_to_handoff_standoff(
+                    visual_handoff_cube, distance
+                )
+                if distance < min_handoff_distance or distance > handoff_distance:
+                    self.get_logger().error(
+                        f'{visual_handoff_cube}: retreat ended outside visual '
+                        f'handoff range ({distance:.3f} m); refusing blind servo.'
+                    )
+                    return False
             for _ in range(3):
                 self._stop_base()
                 rclpy.spin_once(self, timeout_sec=0.1)
-            if not cancel_future.done() or not result_future.done():
-                raise RuntimeError(
-                    'NAV_STATE_UNKNOWN: visual handoff cancellation was not confirmed'
-                )
             self.get_logger().info(
                 f'Nav2 control released at the {visual_handoff_cube} visual handoff.'
             )
@@ -2178,8 +2375,9 @@ class FixedJointPickPlace(Node):
             return
         self._escaping = True
         self.get_logger().warning(
-            f'{label}: base is inside its own footprint radius; costmap radius '
-            f'temporarily {radius:.2f} -> {escape:.2f} m so Nav2 can plan a way out.'
+            f'{label}: retry escape requested after navigation failure; '
+            f'costmap radius temporarily {radius:.2f} -> {escape:.2f} m. '
+            'No local clearance measurement was made; do not infer a dead zone.'
         )
 
     def _restore_nominal_geometry(self, label: str) -> None:
@@ -2206,9 +2404,9 @@ class FixedJointPickPlace(Node):
     def _back_off(self, label: str, distance_m: float = 0.12, speed: float = 0.08) -> None:
         """Drive briefly along the clearer axis to free a jammed base.
 
-        Published straight to the smoother input (the same channel the visual
-        servo and the dock creep use) because the failed Nav2 goal is already
-        aborted by the time a retry is scheduled. The direction comes from the
+        Published to the smoother input (the same channel the visual servo and
+        dock creep use) only after the previous Nav2 goal has a confirmed
+        terminal result. The direction comes from the
         lidar: measured 2026-10-07 (round32), always reversing pushed the base
         0.03 m *deeper* into the wall it was already trapped against.
         """
@@ -2229,6 +2427,214 @@ class FixedJointPickPlace(Node):
             'jam before retrying.'
         )
 
+    def _parse_slow_zones(self):
+        """Read the tight-passage speed caps and create the publisher lazily.
+
+        Returns [] and creates nothing unless the parameter is set, so a default
+        configuration behaves exactly as before: no extra publisher and no
+        message ever sent to the controller.
+        """
+        try:
+            raw = list(self.get_parameter('slow_zones').value or [])
+        except Exception:
+            raw = []
+        zones = []
+        if len(raw) < 4:
+            # Includes the [0.0] "off" sentinel and an absent parameter.
+            return []
+        if len(raw) % 4 != 0:
+            raise RuntimeError(
+                f'slow_zones needs groups of 4 (x, y, radius_m, speed_mps); '
+                f'got {len(raw)} values'
+            )
+        for index in range(0, len(raw), 4):
+            x, y, radius, speed = (float(v) for v in raw[index:index + 4])
+            if not (radius > 0.0) or not (0.0 < speed <= 1.5):
+                raise RuntimeError(
+                    f'slow_zones entry {index // 4} is invalid: radius must be '
+                    f'>0 and speed in (0, 1.5], got radius={radius} speed={speed}'
+                )
+            zones.append((x, y, radius, speed))
+        if zones:
+            self._speed_limit_pub = self.create_publisher(
+                SpeedLimit, 'speed_limit', 10
+            )
+            self.get_logger().warning(
+                f'{len(zones)} slow zone(s) configured; the base will be capped '
+                'while inside them.'
+            )
+        return zones
+
+    def _wedge_log(self, msg) -> None:
+        """Remember when the controller last refused to move for collision."""
+        try:
+            if msg.name != 'controller_server':
+                return
+            if 'detected collision ahead' not in msg.msg:
+                return
+        except AttributeError:
+            return
+        self._controller_collisions.append(time.monotonic())
+
+    def _wedge_collisions_since(self, since: float) -> int:
+        window = float(self.get_parameter('wedge_collision_window_sec').value)
+        cutoff = max(since, time.monotonic() - window)
+        while self._controller_collisions and self._controller_collisions[0] < cutoff:
+            self._controller_collisions.popleft()
+        return len(self._controller_collisions)
+
+    # ------------------------------------------------------------------ timers
+    def _clear_costmaps(self, *a, **k):
+        with self._op('svc:clear_costmaps'):
+            return self._clear_costmaps__timed(*a, **k)
+
+    def _set_costmap_geometry(self, *a, **k):
+        with self._op('svc:set_costmap_geometry'):
+            return self._set_costmap_geometry__timed(*a, **k)
+
+    def _attach(self, *a, **k):
+        with self._op('svc:attach'):
+            return self._attach__timed(*a, **k)
+
+    def _detach(self, *a, **k):
+        with self._op('svc:detach'):
+            return self._detach__timed(*a, **k)
+
+    def _wait_for_dependencies(self, *a, **k):
+        with self._op('deps:discovery'):
+            return self._wait_for_dependencies__timed(*a, **k)
+
+    def _creep_to_grasp(self, *a, **k):
+        with self._op('creep_to_grasp'):
+            return self._creep_to_grasp__timed(*a, **k)
+    # Thin wrappers so each discrete operation reports its own cost without
+    # touching the body of the original implementation.
+    def _execute_trajectory(self, label, *a, **k):
+        with self._op(f'arm:{label}'):
+            return self._execute_trajectory__timed(label, *a, **k)
+
+    def _creep_to_dock(self, label, *a, **k):
+        with self._op(f'creep:{label}'):
+            return self._creep_to_dock__timed(label, *a, **k)
+
+    def _visual_align_active(self, *a, **k):
+        with self._op('vision_align'):
+            return self._visual_align_active__timed(*a, **k)
+
+    def _navigate_once(self, label, *a, **k):
+        with self._op(f'nav:{label}'):
+            return self._navigate_once__timed(label, *a, **k)
+
+    def _spin_for_fresh_detection(self, deadline: float, stale_limit: float) -> None:
+        """Spin until a new camera frame has been processed, or briefly give up.
+
+        Bounded so a dead camera cannot hang the loop: it returns after
+        `timeout` seconds even without a frame, and the caller then sees a stale
+        detection and takes its existing lost-blob path.
+        """
+        last = self._visual_detection_time
+        timeout = 0.25
+        end = min(deadline, time.monotonic() + timeout)
+        while rclpy.ok() and time.monotonic() < end:
+            if self._visual_detection_time > last:
+                return
+            rclpy.spin_once(self, timeout_sec=0.02)
+
+    def _log_cube_positions(self, when: str) -> None:
+        """Log every cube's XY so displacement after placement is detectable.
+
+        Requested to check whether the base shoves an already-placed cube while
+        driving to the next one: verify_placement only looks at the cube it just
+        released, so a cube moved later was previously invisible. Uses the cached
+        Gazebo LinkStates the node already receives.
+        """
+        msg = self._latest_link_states
+        if msg is None:
+            return
+        for name in msg.name:
+            if 'cube' not in name:
+                continue
+            try:
+                index = msg.name.index(name)
+                pose = msg.pose[index]
+            except (ValueError, IndexError):
+                continue
+            self.get_logger().info(
+                f'CUBEPOS {when} {name} {pose.position.x:.4f} {pose.position.y:.4f}'
+            )
+
+    @contextlib.contextmanager
+    def _op(self, label: str):
+        """Time one discrete operation and log it as a parseable TIMING line.
+
+        Requested so every operation's cost can be accounted for offline rather
+        than inferred from stage totals. Deliberately logs at INFO with a fixed
+        shape so run_logs/tools/op_timings.py can aggregate it; it changes no
+        control behaviour.
+        """
+        started = time.monotonic()
+        try:
+            yield
+        finally:
+            self.get_logger().info(
+                f'TIMING {label} {time.monotonic() - started:.3f}'
+            )
+
+    def _apply_slow_zones(self) -> None:
+        """Cap the controller's speed while the base is inside a tight passage.
+
+        Nav2 exposes this properly: controller_server subscribes to
+        ``nav2_msgs/msg/SpeedLimit`` and calls ``setSpeedLimit()`` on the active
+        controller plugin (RegulatedPurePursuitController honours it by
+        rewriting desired_linear_vel). A cap is always the cautious direction,
+        but it exists for a concrete reason rather than as blanket caution:
+
+        blue_cube_3 -> A can only reach zone A through one passage whose chord
+        clearance is 0.318 m against the 0.35 m loaded footprint - the route was
+        chosen by flood fill and the margin is documented in
+        fixed_joint_pick_place.yaml. At 1.5 m/s the tracking error exceeds that
+        margin, the footprint clips the wall, RPP then refuses to move (and the
+        recovery behaviours refuse too, because their footprint test sees the
+        same intrusion), and the leg burns the whole navigation stall timeout
+        before the dead-zone escape frees it: measured
+        (12.778,-3.790) at 0.340 m from the nearest lethal cell, i.e. 1 cm
+        inside, costing 45 s (run_logs/speed_rpp15_combined_trial5_20261010-173315).
+        Slow down there and the passage costs seconds instead.
+        """
+        if self._speed_limit_pub is None or not self._slow_zones:
+            return
+        position = self._cached_base_position()
+        if position is None:
+            return
+        limit = 0.0
+        for x, y, radius, speed in self._slow_zones:
+            if math.hypot(position[0] - x, position[1] - y) <= radius:
+                limit = speed if limit == 0.0 else min(limit, speed)
+        if limit == self._active_speed_limit:
+            return
+        message = SpeedLimit()
+        message.header.stamp = self.get_clock().now().to_msg()
+        message.percentage = False
+        message.speed_limit = limit
+        self._speed_limit_pub.publish(message)
+        self._active_speed_limit = limit
+        if limit > 0.0:
+            self.get_logger().warning(
+                f'Slow zone: capping the base to {limit:.2f} m/s near '
+                f'({position[0]:.2f}, {position[1]:.2f}).'
+            )
+
+    def _clear_speed_limit(self) -> None:
+        """Always hand the controller back its own speed limit."""
+        if self._speed_limit_pub is None or self._active_speed_limit == 0.0:
+            return
+        message = SpeedLimit()
+        message.header.stamp = self.get_clock().now().to_msg()
+        message.percentage = False
+        message.speed_limit = 0.0
+        self._speed_limit_pub.publish(message)
+        self._active_speed_limit = 0.0
+
     def _navigate_to(
         self,
         label: str,
@@ -2237,6 +2643,7 @@ class FixedJointPickPlace(Node):
         completion_radius_m: float | None = None,
     ) -> bool:
         attempts = max(1, int(self.get_parameter('navigation_retry_count').value) + 1)
+        self._log_cube_positions(f'before:{label}')
         try:
             for attempt in range(1, attempts + 1):
                 if self._navigate_once(
@@ -2278,6 +2685,9 @@ class FixedJointPickPlace(Node):
             # Never leave a shrunk footprint behind: the next stage (and the
             # placement drop) is calibrated against the nominal radius.
             self._restore_nominal_geometry(label)
+            # ...and never leave the controller throttled either: the next leg
+            # must get its own desired_linear_vel back.
+            self._clear_speed_limit()
 
     def _navigate_to_pickup(self) -> bool:
         empty_radius = float(self.get_parameter('empty_robot_radius_m').value)
@@ -2392,8 +2802,9 @@ class FixedJointPickPlace(Node):
 
         Nav2 publishes zero velocity through the smoother after a goal, so the
         servo writes to the smoother's *input* topic (``cmd_vel_nav``). The
-        smoother then owns the single ``/cmd_vel`` output and the differential
-        drive controller never sees two competing publishers.
+        smoother forwards servo commands to ``/cmd_vel``. Nav2's recovery
+        behavior_server can also publish directly to ``/cmd_vel``; this method
+        relies on confirmed Nav2 goal termination, not exclusive topic ownership.
         """
         if not bool(self.get_parameter('enable_visual_alignment').value):
             self.get_logger().warning('Visual fine alignment is disabled.')
@@ -2412,7 +2823,7 @@ class FixedJointPickPlace(Node):
                 self._stop_base()
                 rclpy.spin_once(self, timeout_sec=0.1)
 
-    def _visual_align_active(self) -> bool:
+    def _visual_align_active__timed(self) -> bool:
         cube = str(self.get_parameter('cube_name').value).lower()
         self._target_colour = 'blue' if cube.startswith('blue') else 'red'
         self._visual_detection = None
@@ -2422,6 +2833,12 @@ class FixedJointPickPlace(Node):
         )
         stable = 0
         required = max(1, int(self.get_parameter('visual_stable_frames').value))
+        standoff_frames = max(1, int(
+            self.get_parameter('visual_standoff_frames').value
+        ))
+        span_limit = float(self.get_parameter('visual_stable_span_px').value)
+        # Rows of the frames that currently agree, newest last.
+        stable_rows: list[float] = []
         approach_row = float(self.get_parameter('visual_approach_row').value)
         row_tolerance = float(self.get_parameter('visual_row_tolerance').value)
         centre_tolerance = float(
@@ -2438,86 +2855,148 @@ class FixedJointPickPlace(Node):
         # Phase 1: search. Turn slowly until the colour blob is in view, so a
         # coarse parking error does not abort the whole pick.
         search_rate = float(self.get_parameter('visual_search_rate').value)
-        search_deadline = time.monotonic() + float(
+        search_timeout = float(
             self.get_parameter('visual_search_timeout_sec').value
         )
         search_command = Twist()
         search_command.angular.z = search_rate
-        while rclpy.ok() and time.monotonic() < search_deadline:
-            rclpy.spin_once(self, timeout_sec=0.1)
-            detection = self._visual_detection
-            if (
-                detection is not None
-                and time.monotonic() - self._visual_detection_time <= stale_limit
-            ):
-                break
-            self._fine_cmd_pub.publish(search_command)
-            self._publish_vision_state(f'SEARCHING:{self._target_colour}')
-        self._stop_base()
 
-        # Phase 2: centre and approach.
+        def search_until_visible() -> bool:
+            """Rotate until a fresh blob is seen. True if one is in view."""
+            search_deadline = min(deadline, time.monotonic() + search_timeout)
+            while rclpy.ok() and time.monotonic() < search_deadline:
+                rclpy.spin_once(self, timeout_sec=0.1)
+                detection = self._visual_detection
+                if (
+                    detection is not None
+                    and time.monotonic() - self._visual_detection_time <= stale_limit
+                ):
+                    return True
+                self._fine_cmd_pub.publish(search_command)
+                self._publish_vision_state(f'SEARCHING:{self._target_colour}')
+            return False
+
+        # 2026-10-10: the search is re-entered whenever the blob is lost, instead
+        # of sitting still until the timeout. Measured on the 1.5 m/s rounds
+        # (run_logs/speed_rpp15_trial1_20261010-143655 and
+        # speed_rpp15_udp_trial1_20261010-144630): a fast handoff left the cube at
+        # centre_error -0.80 (near the frame edge), the centring motion pushed it
+        # out of view, and this loop then only called _stop_base() and waited -
+        # a single ALIGNING sample followed by 72 s of silence and
+        # "Visual fine alignment timed out". 29 slower rounds never lost the blob,
+        # which is why the hole went unnoticed. Re-searching can only help find
+        # the cube; every acceptance gate below is unchanged.
+        lost_since = None
+        research_after = float(
+            self.get_parameter('visual_research_after_sec').value
+        )
         while rclpy.ok() and time.monotonic() < deadline:
-            rclpy.spin_once(self, timeout_sec=0.1)
-            detection = self._visual_detection
-            if (
-                detection is None
-                or time.monotonic() - self._visual_detection_time > stale_limit
-            ):
-                stable = 0
-                self._stop_base()
-                continue
-            centre_x, width, area, image_width, bottom_row = detection
-            centre_error = (centre_x - image_width / 2.0) / (image_width / 2.0)
-            # Bottom row grows as the robot approaches: it is the range error.
-            row_error = (approach_row - bottom_row) / approach_row
-            centred = abs(centre_error) <= centre_tolerance
-            at_range = abs(bottom_row - approach_row) <= row_tolerance
-            if centred and at_range:
-                stable += 1
-                self._stop_base()
-                if stable >= required:
-                    self.get_logger().info(
-                        f'Visual alignment complete: centre_error={centre_error:.3f}, '
-                        f'bottom_row={bottom_row:.0f}.'
-                    )
-                    return self._creep_to_grasp(bottom_row)
-                continue
+            if not search_until_visible():
+                break
+            self._stop_base()
+            # Phase 2: centre and approach.
+            while rclpy.ok() and time.monotonic() < deadline:
+                # Consume one CAMERA frame per iteration, not "the next callback
+                # in the queue". Measured 2026-10-11: the detection pipeline
+                # costs 12.1 ms/frame (cv_bridge 2.0 + HSV 10.1) so this node can
+                # process ~82 Hz, the camera publishes at 10 Hz, yet this loop ran
+                # at only 2.4-3.1 Hz because a single spin_once() serviced one
+                # arbitrary callback from a queue dominated by the high-rate
+                # gazebo LinkStates/odom subscriptions. The per-iteration travel is
+                # speed/rate - 0.06 m/s at 3 Hz is 20 mm per step against an
+                # acceptance band of +/-9 px (~6 mm) - so the rate, not the speed
+                # cap, is what forces the crawl (raising visual_max_linear_speed
+                # 0.15 -> 0.30 changed nothing). Waiting for a fresh frame lets the
+                # same control law converge at the camera's own rate.
+                self._spin_for_fresh_detection(deadline, stale_limit)
+                detection = self._visual_detection
+                if (
+                    detection is None
+                    or time.monotonic() - self._visual_detection_time > stale_limit
+                ):
+                    stable = 0
+                    self._stop_base()
+                    now = time.monotonic()
+                    if lost_since is None:
+                        lost_since = now
+                    elif now - lost_since >= research_after:
+                        # Stop waiting out the timeout: go back and look again.
+                        self.get_logger().warning(
+                            'Visual blob lost for '
+                            f'{now - lost_since:.1f} s; restarting the search.'
+                        )
+                        lost_since = None
+                        break
+                    continue
+                lost_since = None
+                centre_x, width, area, image_width, bottom_row = detection
+                centre_error = (centre_x - image_width / 2.0) / (image_width / 2.0)
+                # Bottom row grows as the robot approaches: it is the range error.
+                row_error = (approach_row - bottom_row) / approach_row
+                centred = abs(centre_error) <= centre_tolerance
+                at_range = abs(bottom_row - approach_row) <= row_tolerance
+                if centred and at_range:
+                    stable += 1
+                    stable_rows.append(float(bottom_row))
+                    if len(stable_rows) > standoff_frames:
+                        stable_rows.pop(0)
+                    self._stop_base()
+                    if stable >= required:
+                        span = max(stable_rows) - min(stable_rows)
+                        # Accept once the agreeing frames really agree. If they
+                        # never settle, take their median anyway rather than hold
+                        # out for a gate that may not come: the median of several
+                        # readings still beats the last one, and the deadline
+                        # above bounds the loop, so this cannot hang.
+                        if span <= span_limit or stable >= required * 3:
+                            used_row = float(np.median(stable_rows))
+                            self.get_logger().info(
+                                f'Visual alignment complete: '
+                                f'centre_error={centre_error:.3f}, '
+                                f'bottom_row={used_row:.0f} '
+                                f'(median of {len(stable_rows)} frames, '
+                                f'span {span:.0f} px, last {bottom_row:.0f}).'
+                            )
+                            return self._creep_to_grasp(used_row)
+                        # Readings disagree: keep servoing and collect more.
+                    continue
 
-            stable = 0
-            command = Twist()
-            # Two-stage approach (2026-10-07): d(row)/d(distance) is about
-            # 1500 px/m at the 0.19 m standoff, so 0.15 m/s moves the bottom row
-            # ~15 px per frame while the accepted band is only +-9.3 px: the
-            # servo overshot the band and never collected 3 stable frames
-            # (measured as a 75 s alignment timeout). Go fast while far, gentle
-            # inside the last quarter of the row error.
-            effective_max = max_linear
-            if abs(row_error) < 0.25:
-                effective_max = min(max_linear, 0.06)
-            vx = max(-0.5 * effective_max, min(effective_max, linear_gain * row_error))
-            # A pure P term crawls below 1 cm/s over the last few centimetres,
-            # which dominated the 40 s alignment measured on the red_cube_1 leg;
-            # hold a floor while still outside the tolerance band so the tail
-            # takes ~1 s instead of ~5 s. _creep_to_grasp re-measures the
-            # standoff afterwards, so a small overshoot is recovered there.
-            if row_error > 0.0 and vx < min_linear and effective_max > min_linear:
-                vx = min_linear
-            command.linear.x = vx
-            command.angular.z = max(
-                -max_angular, min(max_angular, -angular_gain * centre_error)
-            )
-            self._fine_cmd_pub.publish(command)
-            self._publish_vision_state(
-                f'ALIGNING:{self._target_colour}:x={centre_error:.3f}:'
-                f'bottom={bottom_row:.0f}'
-            )
+                stable = 0
+                stable_rows.clear()
+                command = Twist()
+                # Two-stage approach (2026-10-07): d(row)/d(distance) is about
+                # 1500 px/m at the 0.19 m standoff, so 0.15 m/s moves the bottom row
+                # ~15 px per frame while the accepted band is only +-9.3 px: the
+                # servo overshot the band and never collected 3 stable frames
+                # (measured as a 75 s alignment timeout). Go fast while far, gentle
+                # inside the last quarter of the row error.
+                effective_max = max_linear
+                if abs(row_error) < 0.25:
+                    effective_max = min(max_linear, 0.06)
+                vx = max(-0.5 * effective_max, min(effective_max, linear_gain * row_error))
+                # A pure P term crawls below 1 cm/s over the last few centimetres,
+                # which dominated the 40 s alignment measured on the red_cube_1 leg;
+                # hold a floor while still outside the tolerance band so the tail
+                # takes ~1 s instead of ~5 s. _creep_to_grasp re-measures the
+                # standoff afterwards, so a small overshoot is recovered there.
+                if row_error > 0.0 and vx < min_linear and effective_max > min_linear:
+                    vx = min_linear
+                command.linear.x = vx
+                command.angular.z = max(
+                    -max_angular, min(max_angular, -angular_gain * centre_error)
+                )
+                self._fine_cmd_pub.publish(command)
+                self._publish_vision_state(
+                    f'ALIGNING:{self._target_colour}:x={centre_error:.3f}:'
+                    f'bottom={bottom_row:.0f}'
+                )
 
         self._stop_base()
         self._publish_vision_state(f'FAILED:{self._target_colour}')
         self.get_logger().error('Visual fine alignment timed out; grasp is inhibited.')
         return False
 
-    def _creep_to_grasp(self, bottom_row: float) -> bool:
+    def _creep_to_grasp__timed(self, bottom_row: float) -> bool:
         """Close the last centimetres the level camera cannot measure.
 
         Below roughly 0.20 m the nearest cube's floor contact leaves the image,
@@ -2615,24 +3094,54 @@ class FixedJointPickPlace(Node):
             f'Placement check: cube at ({cube_pose.position.x:.3f}, '
             f'{cube_pose.position.y:.3f}), zone {warehouse} centre at '
             f'({centre_x:.3f}, {centre_y:.3f}), offset '
-            f'({offset_x:+.3f}, {offset_y:+.3f}) m, inside limits '
-            f'[{half_length:.2f} x {half_width:.2f}] m.'
+            f'({offset_x:+.3f}, {offset_y:+.3f}) m, effective acceptance '
+            f'limits [±{half_length - tolerance:.3f} x '
+            f'±{half_width - tolerance:.3f}] m'
         )
         if inside:
-            self.get_logger().info(message)
+            # Only a cube that actually landed inside counts towards the slot
+            # rotation, so a failed delivery does not consume a slot.
+            warehouse = str(self.get_parameter('warehouse').value).upper()
+            self._zone_deliveries[warehouse] = \
+                self._zone_deliveries.get(warehouse, 0) + 1
+            self.get_logger().info(
+                f'{message}, inside limits. '
+                f'(zone {warehouse}: {self._zone_deliveries[warehouse]} placed)')
             return True
-        self.get_logger().error(f'Cube missed warehouse {warehouse}. {message}')
+        self.get_logger().error(f'Cube missed warehouse {warehouse}. '
+                                f'{message}, OUTSIDE limits.')
+        return False
+
+    def _refresh_link_states(self) -> bool:
+        """Refresh the cached Gazebo LinkStates, with a bounded retry.
+
+        Every caller that needs a FRESH link state must go through here. There
+        used to be two independent refresh sites - _link_pose and _link_offset -
+        and when only the first was given a retry, a round still died at
+        "Timed out waiting for /gazebo/link_states" in VERIFY_GRASP while the
+        topic was publishing happily at 18 Hz. One shared helper is the only way
+        to keep that from being re-learned a third time.
+        """
+        timeout = float(self.get_parameter('proximity_timeout_sec').value)
+        attempts = max(1, int(self.get_parameter('proximity_retry_attempts').value))
+        for attempt in range(1, attempts + 1):
+            self._latest_link_states = None
+            if self._wait_until(
+                lambda: self._latest_link_states is not None,
+                timeout,
+                '/gazebo/link_states',
+            ):
+                return True
+            if attempt < attempts:
+                self.get_logger().warning(
+                    f'No fresh Gazebo link states for {timeout:.0f} s; '
+                    f'retrying ({attempt}/{attempts - 1}).'
+                )
         return False
 
     def _link_pose(self, model: str, link: str):
         """Return a Gazebo link pose, refreshing cached link states first."""
-        self._latest_link_states = None
-        timeout = float(self.get_parameter('proximity_timeout_sec').value)
-        if not self._wait_until(
-            lambda: self._latest_link_states is not None,
-            timeout,
-            f'{model}::{link}',
-        ):
+        if not self._refresh_link_states():
             return None
         try:
             index = list(self._latest_link_states.name).index(f'{model}::{link}')
@@ -2657,13 +3166,7 @@ class FixedJointPickPlace(Node):
         before it touches the cube: with 10 mm thick fingers the inner opening is
         ``0.065 - finger_joint1`` and the cube is 0.03 m wide.
         """
-        self._latest_link_states = None
-        timeout = float(self.get_parameter('proximity_timeout_sec').value)
-        if not self._wait_until(
-            lambda: self._latest_link_states is not None,
-            timeout,
-            '/gazebo/link_states',
-        ):
+        if not self._refresh_link_states():
             return None
 
         model1, link1, model2, link2 = self._link_request_values()
@@ -2706,15 +3209,9 @@ class FixedJointPickPlace(Node):
         )
 
     def _link_distance(self) -> float | None:
-        # Discard cached data so verification observes a state published after
-        # the preceding attach, arm motion, or navigation operation.
-        self._latest_link_states = None
-        timeout = float(self.get_parameter('proximity_timeout_sec').value)
-        if not self._wait_until(
-            lambda: self._latest_link_states is not None,
-            timeout,
-            '/gazebo/link_states',
-        ):
+        # The helper discards cached data, so verification observes a state
+        # published after the preceding attach, arm motion or navigation.
+        if not self._refresh_link_states():
             return None
 
         model1, link1, model2, link2 = self._link_request_values()
@@ -2784,7 +3281,7 @@ class FixedJointPickPlace(Node):
             return False
         return True
 
-    def _attach(self) -> bool:
+    def _attach__timed(self) -> bool:
         if not self._check_attach_proximity():
             return False
         request = AttachLink.Request()
@@ -2796,7 +3293,7 @@ class FixedJointPickPlace(Node):
         ) = self._link_request_values()
         return self._call_link_service('ATTACH', self._attach_client, request)
 
-    def _detach(self) -> bool:
+    def _detach__timed(self) -> bool:
         request = DetachLink.Request()
         (
             request.model1_name,
@@ -3011,12 +3508,23 @@ class FixedJointPickPlace(Node):
             ('PLACING', 'open gripper', lambda: self._move_gripper('Open gripper', open_position)),
             ('PLACING', 'detach cube', self._detach),
             ('VERIFY_PLACE', 'settle after release', self._settle_after_release),
+            # Check the landing position IMMEDIATELY after release, before the
+            # 40 s of retreat/return-home arm motion. Measured 2026-10-12
+            # (twotier5, blue_cube_5 -> A): the carry was verified attached at
+            # the dock (0.070 m of a 0.120 m limit), yet the single end-of-
+            # sequence check found the cube 1.9 m away and could not say whether
+            # it was placed badly or knocked away afterwards. This early check
+            # answers that, and reports a bad placement ~40 s sooner.
+            ('VERIFY_PLACE', 'verify placement', self._verify_placement),
             (
                 'VERIFY_PLACE', 'retreat',
                 lambda: self._move_arm('Retreat from place', 'pre_place_joints'),
             ),
             ('VERIFY_PLACE', 'return home', lambda: self._move_arm('Return home', 'home_joints')),
-            ('VERIFY_PLACE', 'verify placement', self._verify_placement),
+            # Final confirmation in the resting position: a cube that the
+            # retreat later nudged out of the plate still counts as missed.
+            ('VERIFY_PLACE', 'verify placement after retreat',
+             self._verify_placement),
         ]
 
         attached = False

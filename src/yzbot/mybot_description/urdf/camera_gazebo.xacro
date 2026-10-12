@@ -1,5 +1,7 @@
 <?xml version="1.0"?>
 <robot xmlns:xacro="http://www.ros.org/wiki/xacro" name="camera">
+    <xacro:arg name="camera_update_rate" default="10.0" />
+    <xacro:property name="camera_update_rate" value="$(arg camera_update_rate)" />
 
     <xacro:macro name="mipi_camera" params="prefix:=camera">
         <!-- Create camera reference frame -->
@@ -37,7 +39,7 @@
                      0.1 s and needs 3 stable frames); the previous 15 Hz only
                      added Ogre/D3D12 render load, and rendering is what caps
                      the whole simulation at RTF ~0.2 on this WSL host. -->
-                <update_rate>10.0</update_rate>
+                <update_rate>${camera_update_rate}</update_rate>
                 <camera name="head">
                     <horizontal_fov>1.3962634</horizontal_fov>
                     <image>

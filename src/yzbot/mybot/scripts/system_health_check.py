@@ -45,6 +45,7 @@ class SystemHealthCheck(Node):
         self.declare_parameter('auto_recover_nav2', True)
         self.declare_parameter('recover_interval_sec', 5.0)
         self.declare_parameter('recover_grace_sec', 45.0)
+        self.declare_parameter('action_rebuild_grace_sec', 20.0)
         self.declare_parameter('controller_query_timeout_sec', 5.0)
 
         self._timeout_sec = float(self.get_parameter('timeout_sec').value)
@@ -68,6 +69,7 @@ class SystemHealthCheck(Node):
         )
         self._nav2_states = {}
         self._inactive_since = {}
+        self._nav2_client_missing_since = {}
         self._state_clients = {}
         self._activate_clients = {}
         self._state_client_created = {}
@@ -273,12 +275,31 @@ class SystemHealthCheck(Node):
                 ]
                 if stuck:
                     self._recover_nav2(stuck)
+        nav2_action_up = self._navigate_client.wait_for_server(timeout_sec=0.0)
+        if self._require_nav2 and not nav2_action_up and not inactive_nav2:
+            # Every Nav2 node is ACTIVE and the action server exists, yet this
+            # client cannot see it: the client was built at node construction,
+            # before Nav2 existed, and the discovery never completed. It does not
+            # recover on its own - measured 2026-10-11 the stack sat with
+            # /competition/system_ready false and the state machine IDLE forever
+            # while `ros2 action list` showed /navigate_to_pose. Rebuild the
+            # client after a grace period so a lost discovery costs seconds.
+            self._nav2_client_missing_since.setdefault(now, now)
+            grace = float(self.get_parameter('action_rebuild_grace_sec').value)
+            if now - self._nav2_client_missing_since[now] >= grace:
+                self.get_logger().warning(
+                    f'/navigate_to_pose has been unreachable for {grace:.0f}s '
+                    'while every Nav2 node is active; rebuilding the action '
+                    'client for DDS discovery.')
+                self._navigate_client.destroy()
+                self._navigate_client = ActionClient(
+                    self, NavigateToPose, '/navigate_to_pose')
+                del self._nav2_client_missing_since[now]
+        else:
+            self._nav2_client_missing_since.clear()
         nav2_ready = (
             not self._require_nav2
-            or (
-                self._navigate_client.wait_for_server(timeout_sec=0.0)
-                and not inactive_nav2
-            )
+            or (nav2_action_up and not inactive_nav2)
         )
         ready = not missing_topics and not missing_controllers
         ready = ready and moveit_ready and nav2_ready

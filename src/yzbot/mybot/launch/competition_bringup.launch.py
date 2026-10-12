@@ -24,26 +24,86 @@ def generate_launch_description():
     navigation_map = os.path.join(
         navigation_share, 'maps', 'room_from_world.yaml'
     )
-    navigation_params = os.path.join(
+    # The validated fast profile lives IN THE REPO (config/profiles) rather than
+    # in run_logs/tools, which is gitignored: the whole提速配置 used to be
+    # reachable only through env vars pointing at that ignored directory, so a
+    # plain `start_competition.sh` silently ran the slow MPPI baseline while the
+    # measured rounds ran RPP at 1.5 m/s.
+    _profiles = os.path.join(mybot_share, 'config', 'profiles')
+    _fast_nav = os.path.join(_profiles, 'nav_rpp15.yaml')
+    navigation_params = _fast_nav if os.path.isfile(_fast_nav) else os.path.join(
         navigation_share, 'param', 'originbot_nav2_2.yaml'
     )
-    state_machine_params = os.path.join(
+    _fast_state = os.path.join(_profiles, 'state_machine_fast.yaml')
+    state_machine_params = _fast_state if os.path.isfile(_fast_state) else os.path.join(
         mybot_share, 'config', 'task_state_machine.yaml'
     )
-    executor_params = os.path.join(
+    _fast_executor = os.path.join(_profiles, 'executor_fast.yaml')
+    executor_params = _fast_executor if os.path.isfile(_fast_executor) else os.path.join(
         mybot_share, 'config', 'fixed_joint_pick_place.yaml'
     )
     parser_params = os.path.join(mybot_share, 'config', 'task_parser.yaml')
+
+    def _yaml_default(env_name, yaml_path, node_key, param, fallback):
+        """Read a switch's default from its YAML, with an env override.
+
+        These arguments used to hard-code their default ('2' for mapping_rule,
+        'false' for competition_mode and require_start_button). Because the launch
+        ALWAYS passes the parameter, that value silently OVERRODE the YAML:编辑
+        task_parser.yaml 的 competition_mode: true 完全没效果，仍然是练习模式;
+        same for mapping_rule before it was fixed. The YAML is the source of
+        truth here; the environment variable and an explicit `param:=value` on
+        the command line still win.
+        """
+        override = os.environ.get(env_name)
+        if override:
+            return str(override)
+        try:
+            import yaml
+            with open(yaml_path, encoding='utf-8') as handle:
+                params = yaml.safe_load(handle)[node_key]['ros__parameters']
+            value = params.get(param)
+        except Exception:                                  # noqa: BLE001
+            return fallback
+        if value is None:
+            return fallback
+        if isinstance(value, bool):
+            return 'true' if value else 'false'
+        return str(value)
+
+    def _mapping_rule_default() -> str:
+        return _yaml_default('MYBOT_MAPPING_RULE', parser_params, 'task_parser',
+                             'mapping_rule', '2')
+
+    def _competition_mode_default() -> str:
+        return _yaml_default('MYBOT_COMPETITION_MODE', parser_params,
+                             'task_parser', 'competition_mode', 'false')
+
+    def _require_start_button_default() -> str:
+        return _yaml_default('MYBOT_REQUIRE_START_BUTTON', state_machine_params,
+                             'task_state_machine', 'require_start_button', 'false')
 
     gui = LaunchConfiguration('gui')
     start_moveit = LaunchConfiguration('start_moveit')
     start_nav2 = LaunchConfiguration('start_nav2')
     moveit_rviz = LaunchConfiguration('moveit_rviz')
     nav_rviz = LaunchConfiguration('nav_rviz')
+    smoother_udp_experiment = LaunchConfiguration('smoother_udp_experiment')
+    smoother_trace_experiment = LaunchConfiguration('smoother_trace_experiment')
+    smoother_trace_udp_experiment = LaunchConfiguration('smoother_trace_udp_experiment')
+    smoother_trace_file = LaunchConfiguration('smoother_trace_file')
+    smoother_poll_fallback_sec = LaunchConfiguration('smoother_poll_fallback_sec')
     health_timeout = LaunchConfiguration('health_timeout')
     nav_map = LaunchConfiguration('nav_map')
+    nav_params_file = LaunchConfiguration('nav_params_file')
+    executor_params_file = LaunchConfiguration('executor_params_file')
+    state_machine_params_file = LaunchConfiguration('state_machine_params_file')
+    require_start_button = LaunchConfiguration('require_start_button')
     start_task_system = LaunchConfiguration('start_task_system')
     start_task_parser = LaunchConfiguration('start_task_parser')
+    mapping_rule = LaunchConfiguration('mapping_rule')
+    competition_mode = LaunchConfiguration('competition_mode')
+    moving_obstacles = LaunchConfiguration('moving_obstacles')
     parser_linger_sec = LaunchConfiguration('parser_linger_sec')
     start_dashboard = LaunchConfiguration('start_dashboard')
     foxglove = LaunchConfiguration('foxglove')
@@ -98,8 +158,13 @@ def generate_launch_description():
             'use_sim_time': 'true',
             'use_rviz': nav_rviz,
             'map': nav_map,
-            'params_file': navigation_params,
+            'params_file': nav_params_file,
             'slam': 'False',
+            'smoother_udp_experiment': smoother_udp_experiment,
+            'smoother_trace_experiment': smoother_trace_experiment,
+            'smoother_trace_udp_experiment': smoother_trace_udp_experiment,
+            'smoother_trace_file': smoother_trace_file,
+            'smoother_poll_fallback_sec': smoother_poll_fallback_sec,
         }.items(),
         condition=IfCondition(start_nav2),
     )
@@ -166,8 +231,12 @@ def generate_launch_description():
         output='screen',
         condition=IfCondition(start_task_system),
         parameters=[
-            state_machine_params,
-            {'executor_params_file': executor_params},
+            state_machine_params_file,
+            {'executor_params_file': executor_params_file},
+            # Opt-in manual start for the layout's 「开始任务」 button; off by
+            # default so a task still starts by itself when the system is ready.
+            {'require_start_button': ParameterValue(require_start_button,
+                                                    value_type=bool)},
         ],
     )
 
@@ -180,7 +249,30 @@ def generate_launch_description():
         parameters=[
             parser_params,
             {'linger_sec': ParameterValue(parser_linger_sec, value_type=float)},
+            # Which of the three published mapping rules this run uses. The
+            # judge picks one before timing, so it must be switchable per launch
+            # without editing the YAML:
+            #   ros2 launch mybot competition_bringup.launch.py mapping_rule:=3
+            {'mapping_rule': ParameterValue(mapping_rule, value_type=int)},
+            # Competition mode appends 11470507 to the generator, which makes the
+            # problem change on a 30-minute wall-clock window instead of being
+            # random per run.
+            {'competition_mode': ParameterValue(competition_mode,
+                                                value_type=bool)},
         ],
+    )
+
+    # Opt-in moving obstacles: boxes that patrol the base's own routes so
+    # avoidance is exercised while it fetches and delivers. Off by default so
+    # timed rounds are unchanged; the matching world variant is
+    # offic_room_movers.world (select it with MYBOT_WORLD_NAME).
+    moving_obstacles_node = Node(
+        package='mybot',
+        executable='moving_obstacles.py',
+        name='moving_obstacles',
+        output='screen',
+        condition=IfCondition(moving_obstacles),
+        parameters=[{'use_sim_time': True}],
     )
 
     # Rule sheet section 三: the judges' layout reads the task, progress and
@@ -224,9 +316,81 @@ def generate_launch_description():
             description='Start a second RViz window for Nav2.',
         ),
         DeclareLaunchArgument(
+            'smoother_udp_experiment', default_value='false', choices=['true', 'false'],
+            description='Isolated single-process DDS transport test; never enable by default.',
+        ),
+        DeclareLaunchArgument(
+            'smoother_trace_experiment', default_value='false', choices=['true', 'false'],
+            description='Isolated instrumented smoother test; never enable by default.',
+        ),
+        DeclareLaunchArgument(
+            'smoother_trace_udp_experiment', default_value='false', choices=['true', 'false'],
+            description='Isolated instrumented smoother on UDP transport; never enable by default.',
+        ),
+        DeclareLaunchArgument(
+            'smoother_poll_fallback_sec', default_value='',
+            description='Opt-in P0 input-poll fallback; empty keeps stock behaviour.',
+        ),
+        DeclareLaunchArgument(
+            'smoother_trace_file', default_value='',
+            description='Absolute JSONL output for internal smoother telemetry.',
+        ),
+        DeclareLaunchArgument(
             'nav_map', default_value=navigation_map,
             description='Nav2 static map YAML. Defaults to the map generated '
                         'from the Gazebo world so AMCL has matching features.',
+        ),
+        DeclareLaunchArgument(
+            'state_machine_params_file', default_value=state_machine_params,
+            description='Supervisor parameter file. Overriding it is how the '
+                        'base-plausibility limit is raised in step with a higher '
+                        'commanded speed, without editing the production YAML.',
+        ),
+        DeclareLaunchArgument(
+            'executor_params_file', default_value=executor_params,
+            description='Executor (pick-and-place) parameter file. Overriding it '
+                        'is how an opt-in, reversible behaviour experiment runs '
+                        'without editing the production YAML.',
+        ),
+        DeclareLaunchArgument(
+            'nav_params_file', default_value=navigation_params,
+            description='Nav2 parameter file. Overriding it is how an opt-in, '
+                        'reversible speed experiment is run without editing the '
+                        'production YAML.',
+        ),
+        DeclareLaunchArgument(
+            'competition_mode',
+            default_value=_competition_mode_default(),
+            choices=['true', 'false'],
+            description='Pass 11470507 to the problem generator so the problem '
+                        'matches the judges\' 30-minute window.',
+        ),
+        DeclareLaunchArgument(
+            'require_start_button',
+            default_value=_require_start_button_default(),
+            choices=['true', 'false'],
+            description='Hold the run in WAITING_FOR_START until true arrives on '
+                        '/competition/start (the Foxglove 「开始任务」 button).',
+        ),
+        DeclareLaunchArgument(
+            'moving_obstacles',
+            # ON by default (requested 2026-10-12): the patrol boxes must be part
+            # of the scene whenever `ros2 run mybot start_competition.sh` starts,
+            # so a competition run never silently rehearses on an empty floor.
+            # Set MYBOT_MOVING_OBSTACLES=false to get the old behaviour.
+            default_value=os.environ.get('MYBOT_MOVING_OBSTACLES') or 'true',
+            choices=['true', 'false'],
+            description='Start the patrolling obstacle boxes (needs the '
+                        'offic_room_movers.world variant to have the models).',
+        ),
+        DeclareLaunchArgument(
+            'mapping_rule',
+            default_value=_mapping_rule_default(),
+            choices=['1', '2', '3'],
+            description='Competition mapping rule (1, 2 or 3). The judge picks '
+                        'one before timing; defaults to whatever '
+                        'task_parser.yaml says, and can be overridden with '
+                        'MYBOT_MAPPING_RULE or mapping_rule:=N.',
         ),
         DeclareLaunchArgument(
             'parser_linger_sec', default_value='45.0',
@@ -270,6 +434,7 @@ def generate_launch_description():
         health_check,
         task_state_machine,
         task_parser,
+        moving_obstacles_node,
         dashboard,
         # Cheap (a few MB) and harmless while the stack is still coming up:
         # starting it here means the dashboard can be opened before the run

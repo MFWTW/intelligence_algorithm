@@ -3,11 +3,11 @@ import re
 from launch import LaunchDescription
 from launch.actions import (
     DeclareLaunchArgument,
+    ExecuteProcess,
     IncludeLaunchDescription,
     LogInfo,
     RegisterEventHandler,
     SetEnvironmentVariable,
-    TimerAction,
 )
 from launch.conditions import IfCondition
 from launch.event_handlers import OnProcessExit
@@ -27,7 +27,16 @@ def generate_launch_description():
     model_pkg_name = 'mybot_description'
     urdf_name = "originbot_with_rgbd_gazebo_arm.xacro"
     #world_name = 'room_aboxa3.world'
-    world_name = 'offic_room.world'
+    # Opt-in world override, used to A/B a world-level setting (the physics step)
+    # without editing the production world. Unset means offic_room.world, so the
+    # default launch is byte-for-byte the same as before.
+    # The patrol boxes are NOT part of any world file: with their planar_move
+    # plugins present at load time, the robot's own spawn fails ("Entity pushed
+    # to spawn queue, but spawn service timed out waiting for entity to appear
+    # in simulation under the name [six_arm]"), while the same world without the
+    # plugins spawns fine. moving_obstacles.py inserts them at runtime instead,
+    # so the world selection stays exactly as it was.
+    world_name = os.environ.get('MYBOT_WORLD_NAME') or 'offic_room.world'
 
     model_pkg_share = FindPackageShare(package=model_pkg_name).find(model_pkg_name)
     gazebo_ros_share = FindPackageShare(package='gazebo_ros').find('gazebo_ros')
@@ -52,7 +61,14 @@ def generate_launch_description():
     )
 
     # 解析 xacro 并去除注释。process_file 会正确管理文件读取过程。
-    robot_description = xacro.process_file(urdf_model_path).toxml()
+    # Opt-in camera-rate override for the render-load A/B. The vision servo's
+    # own loop was measured at 2.4-3.1 Hz (it spends ~0.3 s per 1280x720 frame
+    # on HSV), so a 10 Hz camera feeds it ~3x more frames than it consumes;
+    # render load is what caps this host's real-time factor. Unset keeps 10 Hz.
+    robot_description = xacro.process_file(
+        urdf_model_path,
+        mappings={'camera_update_rate': os.environ.get('MYBOT_CAMERA_RATE') or '10.0'},
+    ).toxml()
     params = {'robot_description': remove_comments(robot_description)}
 
     # robot_state_publisher 节点
@@ -64,16 +80,43 @@ def generate_launch_description():
     )
 
     # 在 Gazebo 中生成机器人（通过 robot_description 话题）
-    spawn_entity_cmd = Node(
-        package='gazebo_ros',
-        executable='spawn_entity.py',
-        arguments=[
-            '-entity', robot_name_in_model,
-            '-topic', 'robot_description',
-            '-timeout', '120.0',
-            '-x', '0.0', '-y', '0.0', '-z', '0.0', '-Y', '0.0'
-        ],
-        output='screen'
+    # Retry INSIDE the process, for the same reason as the controller spawners
+    # below: the whole bringup hangs off this action's exit, so it must not be
+    # replaced by a new one. Gazebo sometimes answers the spawn call almost
+    # immediately with "Entity pushed to spawn queue, but spawn service timed out
+    # waiting for entity to appear in simulation under the name [six_arm]"
+    # (measured 2026-10-12 +3.53 s, 0.17 s after the call) and spawn_entity.py
+    # then exits 1 - with no robot there are no controllers, no /scan, no /map,
+    # and the task sits in IDLE forever. One retry turns that into a few seconds.
+    _spawn_cmd = (
+        'ros2 run gazebo_ros spawn_entity.py'
+        f' -entity {robot_name_in_model} -topic robot_description'
+        ' -timeout 120.0 -x 0.0 -y 0.0 -z 0.0 -Y 0.0'
+    )
+    spawn_entity_cmd = ExecuteProcess(
+        cmd=['bash', '-c', (
+            'for attempt in 1 2 3 4; do '
+            'echo "[spawn_entity] attempt $attempt/4"; '
+            f'out=$({_spawn_cmd} 2>&1); code=$?; printf "%s\\n" "$out"; '
+            # "already exists" means the FIRST call did create the robot - Gazebo
+            # just failed to confirm it in time. Measured 2026-10-12: attempt 1
+            # reported "Entity pushed to spawn queue, but spawn service timed out
+            # waiting for entity to appear", attempts 2-4 reported "Entity
+            # [six_arm] already exists", and /gazebo/link_states listed
+            # six_arm::base_footprint - the robot was there all along. Treating
+            # that as failure exhausted the retries, aborted the chain, left
+            # every controller unloaded and /competition/system_ready false, so
+            # the task waited in IDLE forever looking like "the robot does not
+            # move". The same lesson was already applied to the patrol boxes;
+            # this is the robot's turn.
+            'if [ $code -eq 0 ] || printf "%s" "$out" | grep -q "already exists"; '
+            'then echo "[spawn_entity] ok on attempt $attempt"; exit 0; fi; '
+            'echo "[spawn_entity] attempt $attempt failed; retrying in 5s"; '
+            'sleep 5; done; '
+            'echo "[spawn_entity] FAILED after 4 attempts - run: '
+            'ros2 run mybot reset_dds_cache.sh, then start again"; exit 1'
+        )],
+        output='screen',
     )
 
     # ========== 使用 spawner 加载控制器（替代 ros2 control 命令） ==========
@@ -90,72 +133,55 @@ def generate_launch_description():
     #     controllers -> the startup gate times out -> MoveIt/Nav2 never start
     #     -> /competition/system_ready stays false and the task queue waits in
     #     IDLE, which looks exactly like "the robot does not move".
-    # So each spawner is retried a few times before giving up.
-    def controller_spawner(controller: str) -> Node:
-        return Node(
-            package='controller_manager',
-            executable='spawner',
-            arguments=[
-                controller, '-c', '/controller_manager',
-                '--controller-manager-timeout', '120',
-                '--service-call-timeout', '60',
-                '--switch-timeout', '60',
-            ],
-            output='screen',
+    # So each spawner retries INSIDE its own process (see below); the retry
+    # must never be a new launch action or the chain breaks.
+    def controller_spawner(controller: str) -> ExecuteProcess:
+        """Load and activate one controller, retrying INSIDE the process.
+
+        The retry must not be a new launch action. The previous version had the
+        OnProcessExit handler start a fresh spawner Node on failure, but launch
+        only fires that handler for the exact action object it was registered
+        with - so when the replacement succeeded nobody was listening and the
+        chain stopped dead. Measured 2026-10-11 (movers_live/startbtn_round.log):
+        joint_state_broadcaster failed once, its retry succeeded, and
+        arm_controller / gripper_controller were then never even attempted -
+        /competition/system_ready stayed false and the task sat in IDLE forever,
+        which looks exactly like "the robot does not move".
+
+        Keeping the retry inside one shell process makes the exit code mean
+        "succeeded after up to 4 tries", so the chain's target action never
+        changes and the next step always runs on success.
+        """
+        spawner = (
+            f'ros2 run controller_manager spawner {controller} '
+            '-c /controller_manager --controller-manager-timeout 120 '
+            '--service-call-timeout 60 --switch-timeout 60'
         )
+        script = (
+            f'for attempt in 1 2 3 4; do '
+            f'echo "[{controller}] attempt $attempt/4"; '
+            f'{spawner} && exit 0; '
+            f'echo "[{controller}] attempt $attempt failed; retrying in 3s"; '
+            f'sleep 3; done; '
+            f'echo "[{controller}] FAILED after 4 attempts - stop everything, '
+            f'run: ros2 run mybot reset_dds_cache.sh, then start again"; exit 1'
+        )
+        return ExecuteProcess(cmd=['bash', '-c', script], output='screen')
 
     def start_after(event, _context, action, label):
         """Start ``action`` once the previous step succeeded."""
         if event.returncode == 0:
-            return [action]
+            return [] if action is None else [action]
         return [LogInfo(msg=(
             f'{label} exited with code {event.returncode}; not starting the '
             'next startup step. Check the lines above.'
         ))]
 
-    def retry_on_failure(controller, next_action, attempts=4):
-        """Handler for a spawner's exit: retry the same controller, else move on.
-
-        The retry is what makes startup survive this host: a spawner can fail
-        with "Could not contact service /controller_manager/list_controllers"
-        even though the controller manager is alive and the *next* spawner one
-        second later succeeds (Fast DDS on WSL loses that endpoint). A fresh
-        Node is created per attempt because a launch action may only be
-        executed once.
-        """
-        remaining = {'left': attempts}
-
-        def on_exit(event, _context):
-            if event.returncode == 0:
-                return [] if next_action is None else [next_action]
-            if remaining['left'] <= 0:
-                return [LogInfo(msg=(
-                    f'{controller}: still failing after {attempts} attempts, '
-                    'giving up. MoveIt/Nav2 will not start, /competition/'
-                    'system_ready stays false and the task queue waits in IDLE. '
-                    'Stop everything, run ros2 run mybot reset_dds_cache.sh, '
-                    'then start again.'
-                ))]
-            remaining['left'] -= 1
-            attempt = attempts - remaining['left']
-            return [
-                LogInfo(msg=(
-                    f'{controller} failed (exit {event.returncode}); retrying '
-                    f'{attempt}/{attempts} in 3 s.'
-                )),
-                TimerAction(
-                    period=3.0,
-                    actions=[controller_spawner(controller)],
-                ),
-            ]
-
-        return on_exit
-
     load_joint_state_broadcaster = controller_spawner('joint_state_broadcaster')
     load_arm_controller = controller_spawner('arm_controller')
     load_gripper_controller = controller_spawner('gripper_controller')
 
-    # ========== 事件顺序（依次加载，每个控制器失败自动重试 4 次） ==========
+    # ========== 事件顺序（依次加载；每个 spawner 在自己的进程内重试 4 次） ==========
     # 机器人 spawn 成功 -> joint_state_broadcaster -> arm_controller
     # -> gripper_controller；任一环节失败只重试它自己，不跳过下一步。
     evt1 = RegisterEventHandler(
@@ -169,19 +195,25 @@ def generate_launch_description():
     evt2 = RegisterEventHandler(
         event_handler=OnProcessExit(
             target_action=load_joint_state_broadcaster,
-            on_exit=retry_on_failure('joint_state_broadcaster', load_arm_controller),
+            on_exit=lambda event, context: start_after(
+                event, context, load_arm_controller, 'joint_state_broadcaster'
+            ),
         )
     )
     evt3 = RegisterEventHandler(
         event_handler=OnProcessExit(
             target_action=load_arm_controller,
-            on_exit=retry_on_failure('arm_controller', load_gripper_controller),
+            on_exit=lambda event, context: start_after(
+                event, context, load_gripper_controller, 'arm_controller'
+            ),
         )
     )
     evt4 = RegisterEventHandler(
         event_handler=OnProcessExit(
             target_action=load_gripper_controller,
-            on_exit=retry_on_failure('gripper_controller', None),
+            on_exit=lambda event, context: start_after(
+                event, context, None, 'gripper_controller'
+            ),
         )
     )
 

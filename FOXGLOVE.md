@@ -101,13 +101,18 @@ Foxglove → 右上 `Layouts` → `Import from file…` → 选上面那个文�
 | 进度              | `/competition/progress`     | `std_msgs/String`（JSON，latched） | `task_state_machine` |
 | 异常              | `/competition/error`        | `std_msgs/String`（latched） | `task_state_machine` |
 | 状态迁移          | `/competition/state`        | `std_msgs/String`（latched） | `task_state_machine` |
-| 3D（地图/路径/雷达/机器人） | `/scan`、`/plan`、`/local_plan`、`/amcl_pose`、`/odom`、`/tf`、`/joint_states`、`/robot_description` | LaserScan / Path / Pose / Odometry / TF / JointState | Nav2、Gazebo、`robot_state_publisher` |
+| 3D（地图/路径/雷达/机器人） | `/map`、`/global_costmap/costmap`、`/scan`、`/plan`、`/local_plan`、`/amcl_pose`、`/odom`、`/tf`、`/joint_states`、`/robot_description` | OccupancyGrid / LaserScan / Path / Pose /
 | 视觉识别画面      | `/vision/debug_image`       | `sensor_msgs/Image`   | `fixed_joint_pick_place.py` |
 | 日志              | `/rosout`                   | `rcl_interfaces/Log`  | 全部节点             |
 
 3D 面板里已经配好两层：`foxglove.Grid` 网格，以及 `foxglove.Urdf`
 （`sourceType: topic`，取 `/robot_description`，关节跟随 `/joint_states`），
 所以机器人模型会跟着 Gazebo 一起动。
+
+面板的固定坐标系是 **`map`**，并绑定了 **`/map`**（静态地图）、
+**`/global_costmap/costmap`**（全局代价图）与 `/local_costmap/costmap`（默认隐藏）。
+**注意**：这几个话题只有在竞赛栈运行时才有数据——不跑 `run_one_round.sh`
+（或 `start_competition.sh`）时 3D 面板只会是空的，这不是布局问题。
 
 ## 5. 赛题还要求、但没塞进布局的面板
 
@@ -241,5 +246,14 @@ ros2 run mybot dashboard_bridge.py     # 已默认随 competition_bringup 启动
 
 - 「识别画面（识别框）」绑 `/vision/debug_image`，只在视觉精定位那几秒有画面（省 CPU
   的刻意设计）；要它常亮可以让我加 `visual_debug_always` 开关。
-- 示意图里的「开始按钮」在本工程没有对应语义（任务由出题程序 + 大模型自动生成并自动
-  开跑），所以那一格换成了赛题要求的**任务题目**面板。
+「开始按钮」已经做成**真能用的**：Foxglove 的 Publish 面板，绑 `/competition/start`
+（`std_msgs/Bool`，值为 `true`）。按下它之前需要先打开启动门：
+
+```bash
+MYBOT_REQUIRE_START_BUTTON=true     # 或 launch 参数 require_start_button:=true
+```
+
+打开后，任务不会自动开跑，而是停在 `WAITING_FOR_START`，直到按钮按下——
+适合"裁判说开始、你再按"的现场节奏。默认**关闭**，保持自动开跑，
+所以既有的整轮流程不受影响。按钮可以**提前按**（会记住），但每接受一个新任务
+都会重置，重跑同一题需要再按一次。

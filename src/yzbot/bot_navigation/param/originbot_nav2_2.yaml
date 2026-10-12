@@ -156,6 +156,9 @@ controller_server:
       # model dt". 56 steps x 0.1 s keeps a 5.6 s horizon.
       model_dt: 0.1
       batch_size: 2000
+      # Keep 3.0: a full 5/5 A/B with 8.0 slowed IDLE->COMPLETED
+      # 634 -> 702 s (run_logs/ax8retry_20261008-121822). The earlier
+      # single-corridor speed gain did not translate to a faster round.
       ax_max: 3.0
       ax_min: -3.0
       ay_max: 3.0
@@ -183,7 +186,10 @@ controller_server:
       temperature: 0.3
       gamma: 0.015
       motion_model: "DiffDrive"
-      visualize: true
+      # A/B 2026-10-08: disable 2000-rollout trajectory visualization only;
+      # controller, critics, safety geometry and paths stay unchanged.
+      # Measure full-round wall time and 5/5 before claiming a speedup.
+      visualize: false
       regenerate_noises: true
       TrajectoryVisualizer:
         trajectory_step: 5

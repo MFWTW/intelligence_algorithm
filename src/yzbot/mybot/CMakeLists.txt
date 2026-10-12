@@ -18,6 +18,7 @@ install(FILES .setup_assistant DESTINATION share/${PROJECT_NAME})
 install(PROGRAMS
   scripts/dashboard_bridge.py
   scripts/fixed_joint_pick_place.py
+  scripts/moving_obstacles.py
   scripts/reset_dds_cache.sh
   scripts/rtf_probe.py
   scripts/set_deepseek_key.sh

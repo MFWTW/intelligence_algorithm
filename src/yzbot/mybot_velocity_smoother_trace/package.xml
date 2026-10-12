@@ -1,0 +1,14 @@
+<?xml version="1.0"?>
+<package format="3">
+  <name>mybot_velocity_smoother_trace</name>
+  <version>0.0.1</version>
+  <description>Opt-in read-only telemetry copy of Nav2 Humble velocity smoother 1.1.20.</description>
+  <maintainer email="maintainer@example.com">Mybot diagnostics</maintainer>
+  <license>Apache-2.0</license>
+  <buildtool_depend>ament_cmake</buildtool_depend>
+  <depend>rclcpp</depend>
+  <depend>rclcpp_components</depend>
+  <depend>geometry_msgs</depend>
+  <depend>nav2_util</depend>
+  <export><build_type>ament_cmake</build_type></export>
+</package>

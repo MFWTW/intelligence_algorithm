@@ -1,0 +1,15 @@
+task_state_machine:
+  ros__parameters:
+    max_object_retries: 1
+    skip_failed_object: false
+    object_timeout_sec: 420.0
+    task_timeout_sec: 0.0
+    task_timeout_per_object_sec: 420.0
+    task_startup_grace_sec: 180.0
+    health_loss_grace_sec: 3.0
+    autostart: true
+    allow_task_replay: true
+    use_resident_executor: true
+    select_nearest_cubes: true
+    max_plausible_speed_mps: 3.0
+    require_start_button: true

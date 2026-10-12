@@ -1,464 +1,618 @@
 {
- "configById": {
-  "Indicator!red_count": {
-   "path": "/competition/dashboard/red_count.data",
-   "style": "background",
-   "fontSize": 36,
-   "fallbackColor": "#e35e4b",
-   "fallbackLabel": "-",
-   "rules": [
-    {
-     "operator": "=",
-     "rawValue": "0",
-     "color": "#e35e4b",
-     "label": "0"
+  "configById": {
+    "Indicator!red_count": {
+      "path": "/competition/dashboard/red_count.data",
+      "style": "background",
+      "fontSize": 36,
+      "fallbackColor": "#e35e4b",
+      "fallbackLabel": "-",
+      "rules": [
+        {
+          "operator": "=",
+          "rawValue": "0",
+          "color": "#e35e4b",
+          "label": "0"
+        },
+        {
+          "operator": "=",
+          "rawValue": "1",
+          "color": "#e35e4b",
+          "label": "1"
+        },
+        {
+          "operator": "=",
+          "rawValue": "2",
+          "color": "#e35e4b",
+          "label": "2"
+        },
+        {
+          "operator": "=",
+          "rawValue": "3",
+          "color": "#e35e4b",
+          "label": "3"
+        },
+        {
+          "operator": "=",
+          "rawValue": "4",
+          "color": "#e35e4b",
+          "label": "4"
+        },
+        {
+          "operator": "=",
+          "rawValue": "5",
+          "color": "#e35e4b",
+          "label": "5"
+        }
+      ],
+      "foxglovePanelTitle": "红色数量"
     },
-    {
-     "operator": "=",
-     "rawValue": "1",
-     "color": "#e35e4b",
-     "label": "1"
+    "Indicator!blue_count": {
+      "path": "/competition/dashboard/blue_count.data",
+      "style": "background",
+      "fontSize": 36,
+      "fallbackColor": "#4b8fe3",
+      "fallbackLabel": "-",
+      "rules": [
+        {
+          "operator": "=",
+          "rawValue": "0",
+          "color": "#4b8fe3",
+          "label": "0"
+        },
+        {
+          "operator": "=",
+          "rawValue": "1",
+          "color": "#4b8fe3",
+          "label": "1"
+        },
+        {
+          "operator": "=",
+          "rawValue": "2",
+          "color": "#4b8fe3",
+          "label": "2"
+        },
+        {
+          "operator": "=",
+          "rawValue": "3",
+          "color": "#4b8fe3",
+          "label": "3"
+        },
+        {
+          "operator": "=",
+          "rawValue": "4",
+          "color": "#4b8fe3",
+          "label": "4"
+        },
+        {
+          "operator": "=",
+          "rawValue": "5",
+          "color": "#4b8fe3",
+          "label": "5"
+        }
+      ],
+      "foxglovePanelTitle": "蓝色数量"
     },
-    {
-     "operator": "=",
-     "rawValue": "2",
-     "color": "#e35e4b",
-     "label": "2"
+    "Indicator!blue_zone": {
+      "path": "/competition/dashboard/blue_zone.data",
+      "style": "background",
+      "fontSize": 36,
+      "fallbackColor": "#4b8fe3",
+      "fallbackLabel": "等待任务",
+      "rules": [
+        {
+          "operator": "=",
+          "rawValue": "蓝色到A区",
+          "color": "#6eebdd",
+          "label": "蓝色到A区"
+        },
+        {
+          "operator": "=",
+          "rawValue": "蓝色到B区",
+          "color": "#6eebdd",
+          "label": "蓝色到B区"
+        },
+        {
+          "operator": "=",
+          "rawValue": "蓝色到C区",
+          "color": "#6eebdd",
+          "label": "蓝色到C区"
+        }
+      ],
+      "foxglovePanelTitle": "蓝色"
     },
-    {
-     "operator": "=",
-     "rawValue": "3",
-     "color": "#e35e4b",
-     "label": "3"
+    "Indicator!red_zone": {
+      "path": "/competition/dashboard/red_zone.data",
+      "style": "background",
+      "fontSize": 36,
+      "fallbackColor": "#e35e4b",
+      "fallbackLabel": "等待任务",
+      "rules": [
+        {
+          "operator": "=",
+          "rawValue": "红色到A区",
+          "color": "#f0a58f",
+          "label": "红色到A区"
+        },
+        {
+          "operator": "=",
+          "rawValue": "红色到B区",
+          "color": "#f0a58f",
+          "label": "红色到B区"
+        },
+        {
+          "operator": "=",
+          "rawValue": "红色到C区",
+          "color": "#f0a58f",
+          "label": "红色到C区"
+        }
+      ],
+      "foxglovePanelTitle": "红色"
     },
-    {
-     "operator": "=",
-     "rawValue": "4",
-     "color": "#e35e4b",
-     "label": "4"
+    "Indicator!progress": {
+      "path": "/competition/dashboard/grab_index.data",
+      "style": "background",
+      "fontSize": 36,
+      "fallbackColor": "#d6f2cf",
+      "fallbackLabel": "待命",
+      "rules": [
+        {
+          "operator": "=",
+          "rawValue": "1",
+          "color": "#68e24a",
+          "label": "第1个"
+        },
+        {
+          "operator": "=",
+          "rawValue": "2",
+          "color": "#68e24a",
+          "label": "第2个"
+        },
+        {
+          "operator": "=",
+          "rawValue": "3",
+          "color": "#68e24a",
+          "label": "第3个"
+        },
+        {
+          "operator": "=",
+          "rawValue": "4",
+          "color": "#68e24a",
+          "label": "第4个"
+        },
+        {
+          "operator": "=",
+          "rawValue": "5",
+          "color": "#68e24a",
+          "label": "第5个"
+        }
+      ],
+      "foxglovePanelTitle": "任务进度"
     },
-    {
-     "operator": "=",
-     "rawValue": "5",
-     "color": "#e35e4b",
-     "label": "5"
+    "Indicator!work_state": {
+      "path": "/competition/dashboard/work_state.data",
+      "style": "background",
+      "fontSize": 36,
+      "fallbackColor": "#adb2d6",
+      "fallbackLabel": "待命",
+      "rules": [
+        {
+          "operator": "=",
+          "rawValue": "待命",
+          "color": "#a0a0a0",
+          "label": "待命"
+        },
+        {
+          "operator": "=",
+          "rawValue": "解析任务",
+          "color": "#f7e07a",
+          "label": "解析任务"
+        },
+        {
+          "operator": "=",
+          "rawValue": "校验任务",
+          "color": "#f7e07a",
+          "label": "校验任务"
+        },
+        {
+          "operator": "=",
+          "rawValue": "识别资源",
+          "color": "#f7e07a",
+          "label": "识别资源"
+        },
+        {
+          "operator": "=",
+          "rawValue": "前往资源点",
+          "color": "#6eebdd",
+          "label": "前往资源点"
+        },
+        {
+          "operator": "=",
+          "rawValue": "对准资源",
+          "color": "#6eebdd",
+          "label": "对准资源"
+        },
+        {
+          "operator": "=",
+          "rawValue": "执行抓取",
+          "color": "#68e24a",
+          "label": "执行抓取"
+        },
+        {
+          "operator": "=",
+          "rawValue": "已抓取",
+          "color": "#68e24a",
+          "label": "已抓取"
+        },
+        {
+          "operator": "=",
+          "rawValue": "前往放置区",
+          "color": "#6eebdd",
+          "label": "前往放置区"
+        },
+        {
+          "operator": "=",
+          "rawValue": "执行放置",
+          "color": "#68e24a",
+          "label": "执行放置"
+        },
+        {
+          "operator": "=",
+          "rawValue": "校验放置",
+          "color": "#68e24a",
+          "label": "校验放置"
+        },
+        {
+          "operator": "=",
+          "rawValue": "下一块",
+          "color": "#6eebdd",
+          "label": "下一块"
+        },
+        {
+          "operator": "=",
+          "rawValue": "全部完成",
+          "color": "#68e24a",
+          "label": "全部完成"
+        },
+        {
+          "operator": "=",
+          "rawValue": "任务失败",
+          "color": "#c0392b",
+          "label": "任务失败"
+        }
+      ],
+      "foxglovePanelTitle": "当前任务"
+    },
+    "Indicator!gripper_state": {
+      "path": "/competition/dashboard/gripper_state.data",
+      "style": "background",
+      "fontSize": 36,
+      "fallbackColor": "#80c9d2",
+      "fallbackLabel": "未使能",
+      "rules": [
+        {
+          "operator": "=",
+          "rawValue": "未抓取",
+          "color": "#a0a0a0",
+          "label": "未抓取"
+        },
+        {
+          "operator": "=",
+          "rawValue": "对准中",
+          "color": "#f7e07a",
+          "label": "对准中"
+        },
+        {
+          "operator": "=",
+          "rawValue": "抓取中",
+          "color": "#68e24a",
+          "label": "抓取中"
+        },
+        {
+          "operator": "=",
+          "rawValue": "已抓取",
+          "color": "#68e24a",
+          "label": "已抓取"
+        },
+        {
+          "operator": "=",
+          "rawValue": "携带中",
+          "color": "#6eebdd",
+          "label": "携带中"
+        },
+        {
+          "operator": "=",
+          "rawValue": "放置中",
+          "color": "#68e24a",
+          "label": "放置中"
+        },
+        {
+          "operator": "=",
+          "rawValue": "已释放",
+          "color": "#80c9d2",
+          "label": "已释放"
+        }
+      ],
+      "foxglovePanelTitle": "状态"
+    },
+    "RawMessages!problem": {
+      "topicPath": "/competition/dashboard/problem",
+      "foxglovePanelTitle": "题目"
+    },
+    "Image!camera": {
+      "imageMode": {
+        "imageTopic": "/camera/image_raw"
+      },
+      "foxglovePanelTitle": "识别画面"
+    },
+    "Image!debug": {
+      "imageMode": {
+        "imageTopic": "/vision/debug_image"
+      },
+      "foxglovePanelTitle": "识别画面"
+    },
+    "3D!scene": {
+      "followMode": "follow-pose",
+      "followTf": "map",
+      "topics": {
+        "/scan": {
+          "visible": true,
+          "colorField": "range",
+          "colorMode": "gradient",
+          "colorMap": "turbo",
+          "pointSize": 4,
+          "decayTime": 0.5
+        },
+        "/plan": {
+          "visible": true
+        },
+        "/local_plan": {
+          "visible": true
+        },
+        "/amcl_pose": {
+          "visible": true
+        },
+        "/robot_description": {
+          "visible": true,
+          "displayMode": "auto",
+          "showOutlines": false,
+          "showAxis": false
+        },
+        "/map": {
+          "visible": true
+        },
+        "/global_costmap/costmap": {
+          "visible": true
+        },
+        "/local_costmap/costmap": {
+          "visible": false
+        }
+      },
+      "layers": {
+        "grid": {
+          "visible": true,
+          "frameLocked": true,
+          "label": "Grid",
+          "instanceId": "grid",
+          "layerId": "foxglove.Grid",
+          "size": 20,
+          "divisions": 20,
+          "lineWidth": 1,
+          "color": "#248eff",
+          "position": [
+            0,
+            0,
+            0
+          ],
+          "rotation": [
+            0,
+            0,
+            0
+          ],
+          "order": 1
+        },
+        "71656b70-8afa-48d6-93c2-6ad44c1442bb": {
+          "displayMode": "auto",
+          "fallbackColor": "#ffffff",
+          "showAxis": false,
+          "axisScale": 1,
+          "showOutlines": true,
+          "opacity": 1,
+          "visible": true,
+          "frameLocked": true,
+          "instanceId": "71656b70-8afa-48d6-93c2-6ad44c1442bb",
+          "label": "URDF",
+          "layerId": "foxglove.Urdf",
+          "sourceType": "topic",
+          "url": "",
+          "filePath": "",
+          "parameter": "",
+          "topic": "/robot_description",
+          "framePrefix": "",
+          "order": 1
+        }
+      },
+      "foxglovePanelTitle": "三维",
+      "fixedFrame": "map",
+      "cameraState": {
+        "perspective": true,
+        "distance": 19.99999999996871,
+        "phi": 34.85631513637342,
+        "thetaOffset": -3.1108598032924393,
+        "targetOffset": [
+          -0.5173103108147157,
+          0.912466240267345,
+          4.415519718104532e-17
+        ],
+        "target": [
+          0,
+          0,
+          0
+        ],
+        "targetOrientation": [
+          0,
+          0,
+          0,
+          1
+        ],
+        "fovy": 45,
+        "near": 0.5,
+        "far": 5000
+      },
+      "transforms": {
+        "frame:odom": {
+          "visible": true
+        },
+        "frame:base_link": {
+          "visible": false
+        },
+        "frame:link1": {
+          "visible": false
+        },
+        "frame:link2": {
+          "visible": false
+        },
+        "frame:link3": {
+          "visible": false
+        },
+        "frame:link4": {
+          "visible": false
+        },
+        "frame:link5": {
+          "visible": false
+        },
+        "frame:link6": {
+          "visible": true
+        },
+        "frame:gripper_finger_link1": {
+          "visible": false
+        },
+        "frame:gripper_finger_link2": {
+          "visible": false
+        },
+        "frame:back_caster_link": {
+          "visible": false
+        },
+        "frame:camera_link": {
+          "visible": false
+        },
+        "frame:laser_link": {
+          "visible": false
+        },
+        "frame:left_wheel_link": {
+          "visible": false
+        },
+        "frame:right_wheel_link": {
+          "visible": false
+        },
+        "frame:arm_base_link": {
+          "visible": false
+        },
+        "frame:camera_rgbd_link": {
+          "visible": false
+        },
+        "frame:camera_rgbd_frame_optical": {
+          "visible": false
+        },
+        "frame:grasping_frame": {
+          "visible": false
+        }
+      },
+      "scene": {
+        "transforms": {
+          "editable": false,
+          "showLabel": false
+        }
+      },
+      "publish": {
+        "type": "pose",
+        "poseTopic": "/move_base_simple/goal",
+        "pointTopic": "/clicked_point",
+        "poseEstimateTopic": "/initialpose",
+        "poseEstimateXDeviation": 0.5,
+        "poseEstimateYDeviation": 0.5,
+        "poseEstimateThetaDeviation": 0.26179939
+      },
+      "imageMode": {}
+    },
+    "Publish!start": {
+      "foxglovePanelTitle": "开始按钮",
+      "messageType": "std_msgs/msg/Bool",
+      "topicName": "/competition/start",
+      "value": "{\"data\": true}",
+      "buttonText": "开始任务",
+      "buttonTooltip": "发布 /competition/start = true，解除 WAITING_FOR_START 等待",
+      "buttonColor": "#2e7d32",
+      "editingMode": false
+    },
+    "RawMessages!rules": {
+      "topicPath": "/competition/dashboard/rules",
+      "foxglovePanelTitle": "映射规则"
     }
-   ],
-   "foxglovePanelTitle": "红色数量"
   },
-  "Indicator!blue_count": {
-   "path": "/competition/dashboard/blue_count.data",
-   "style": "background",
-   "fontSize": 36,
-   "fallbackColor": "#4b8fe3",
-   "fallbackLabel": "-",
-   "rules": [
-    {
-     "operator": "=",
-     "rawValue": "0",
-     "color": "#4b8fe3",
-     "label": "0"
-    },
-    {
-     "operator": "=",
-     "rawValue": "1",
-     "color": "#4b8fe3",
-     "label": "1"
-    },
-    {
-     "operator": "=",
-     "rawValue": "2",
-     "color": "#4b8fe3",
-     "label": "2"
-    },
-    {
-     "operator": "=",
-     "rawValue": "3",
-     "color": "#4b8fe3",
-     "label": "3"
-    },
-    {
-     "operator": "=",
-     "rawValue": "4",
-     "color": "#4b8fe3",
-     "label": "4"
-    },
-    {
-     "operator": "=",
-     "rawValue": "5",
-     "color": "#4b8fe3",
-     "label": "5"
-    }
-   ],
-   "foxglovePanelTitle": "蓝色数量"
+  "globalVariables": {},
+  "userNodes": {},
+  "playbackConfig": {
+    "speed": 1
   },
-  "Indicator!blue_zone": {
-   "path": "/competition/dashboard/blue_zone.data",
-   "style": "background",
-   "fontSize": 36,
-   "fallbackColor": "#4b8fe3",
-   "fallbackLabel": "等待任务",
-   "rules": [
-    {
-     "operator": "=",
-     "rawValue": "蓝色到A区",
-     "color": "#6eebdd",
-     "label": "蓝色到A区"
+  "layout": {
+    "first": {
+      "first": "RawMessages!problem",
+      "second": "RawMessages!rules",
+      "direction": "row",
+      "splitPercentage": 55
     },
-    {
-     "operator": "=",
-     "rawValue": "蓝色到B区",
-     "color": "#6eebdd",
-     "label": "蓝色到B区"
+    "second": {
+      "first": {
+        "first": {
+          "first": {
+            "first": "Indicator!red_count",
+            "second": "Indicator!blue_count",
+            "direction": "row",
+            "splitPercentage": 50
+          },
+          "second": {
+            "first": "Indicator!blue_zone",
+            "second": "Indicator!red_zone",
+            "direction": "row",
+            "splitPercentage": 50
+          },
+          "direction": "row",
+          "splitPercentage": 50
+        },
+        "second": {
+          "first": {
+            "first": "Image!camera",
+            "second": "Image!debug",
+            "direction": "row",
+            "splitPercentage": 50
+          },
+          "second": "3D!scene",
+          "direction": "column",
+          "splitPercentage": 46
+        },
+        "direction": "column",
+        "splitPercentage": 15
+      },
+      "second": {
+        "first": "Indicator!progress",
+        "second": {
+          "first": "Indicator!work_state",
+          "second": {
+            "first": "Indicator!gripper_state",
+            "second": "Publish!start",
+            "direction": "column",
+            "splitPercentage": 50
+          },
+          "direction": "column",
+          "splitPercentage": 50
+        },
+        "direction": "column",
+        "splitPercentage": 26
+      },
+      "direction": "row",
+      "splitPercentage": 72
     },
-    {
-     "operator": "=",
-     "rawValue": "蓝色到C区",
-     "color": "#6eebdd",
-     "label": "蓝色到C区"
-    }
-   ],
-   "foxglovePanelTitle": "蓝色"
-  },
-  "Indicator!red_zone": {
-   "path": "/competition/dashboard/red_zone.data",
-   "style": "background",
-   "fontSize": 36,
-   "fallbackColor": "#e35e4b",
-   "fallbackLabel": "等待任务",
-   "rules": [
-    {
-     "operator": "=",
-     "rawValue": "红色到A区",
-     "color": "#f0a58f",
-     "label": "红色到A区"
-    },
-    {
-     "operator": "=",
-     "rawValue": "红色到B区",
-     "color": "#f0a58f",
-     "label": "红色到B区"
-    },
-    {
-     "operator": "=",
-     "rawValue": "红色到C区",
-     "color": "#f0a58f",
-     "label": "红色到C区"
-    }
-   ],
-   "foxglovePanelTitle": "红色"
-  },
-  "Indicator!progress": {
-   "path": "/competition/dashboard/grab_index.data",
-   "style": "background",
-   "fontSize": 36,
-   "fallbackColor": "#d6f2cf",
-   "fallbackLabel": "待命",
-   "rules": [
-    {
-     "operator": "=",
-     "rawValue": "1",
-     "color": "#68e24a",
-     "label": "第1个"
-    },
-    {
-     "operator": "=",
-     "rawValue": "2",
-     "color": "#68e24a",
-     "label": "第2个"
-    },
-    {
-     "operator": "=",
-     "rawValue": "3",
-     "color": "#68e24a",
-     "label": "第3个"
-    },
-    {
-     "operator": "=",
-     "rawValue": "4",
-     "color": "#68e24a",
-     "label": "第4个"
-    },
-    {
-     "operator": "=",
-     "rawValue": "5",
-     "color": "#68e24a",
-     "label": "第5个"
-    }
-   ],
-   "foxglovePanelTitle": "任务进度"
-  },
-  "Indicator!work_state": {
-   "path": "/competition/dashboard/work_state.data",
-   "style": "background",
-   "fontSize": 36,
-   "fallbackColor": "#adb2d6",
-   "fallbackLabel": "待命",
-   "rules": [
-    {
-     "operator": "=",
-     "rawValue": "待命",
-     "color": "#a0a0a0",
-     "label": "待命"
-    },
-    {
-     "operator": "=",
-     "rawValue": "解析任务",
-     "color": "#f7e07a",
-     "label": "解析任务"
-    },
-    {
-     "operator": "=",
-     "rawValue": "校验任务",
-     "color": "#f7e07a",
-     "label": "校验任务"
-    },
-    {
-     "operator": "=",
-     "rawValue": "识别资源",
-     "color": "#f7e07a",
-     "label": "识别资源"
-    },
-    {
-     "operator": "=",
-     "rawValue": "前往资源点",
-     "color": "#6eebdd",
-     "label": "前往资源点"
-    },
-    {
-     "operator": "=",
-     "rawValue": "对准资源",
-     "color": "#6eebdd",
-     "label": "对准资源"
-    },
-    {
-     "operator": "=",
-     "rawValue": "执行抓取",
-     "color": "#68e24a",
-     "label": "执行抓取"
-    },
-    {
-     "operator": "=",
-     "rawValue": "已抓取",
-     "color": "#68e24a",
-     "label": "已抓取"
-    },
-    {
-     "operator": "=",
-     "rawValue": "前往放置区",
-     "color": "#6eebdd",
-     "label": "前往放置区"
-    },
-    {
-     "operator": "=",
-     "rawValue": "执行放置",
-     "color": "#68e24a",
-     "label": "执行放置"
-    },
-    {
-     "operator": "=",
-     "rawValue": "校验放置",
-     "color": "#68e24a",
-     "label": "校验放置"
-    },
-    {
-     "operator": "=",
-     "rawValue": "下一块",
-     "color": "#6eebdd",
-     "label": "下一块"
-    },
-    {
-     "operator": "=",
-     "rawValue": "全部完成",
-     "color": "#68e24a",
-     "label": "全部完成"
-    },
-    {
-     "operator": "=",
-     "rawValue": "任务失败",
-     "color": "#c0392b",
-     "label": "任务失败"
-    }
-   ],
-   "foxglovePanelTitle": "当前任务"
-  },
-  "Indicator!gripper_state": {
-   "path": "/competition/dashboard/gripper_state.data",
-   "style": "background",
-   "fontSize": 36,
-   "fallbackColor": "#80c9d2",
-   "fallbackLabel": "未使能",
-   "rules": [
-    {
-     "operator": "=",
-     "rawValue": "未抓取",
-     "color": "#a0a0a0",
-     "label": "未抓取"
-    },
-    {
-     "operator": "=",
-     "rawValue": "对准中",
-     "color": "#f7e07a",
-     "label": "对准中"
-    },
-    {
-     "operator": "=",
-     "rawValue": "抓取中",
-     "color": "#68e24a",
-     "label": "抓取中"
-    },
-    {
-     "operator": "=",
-     "rawValue": "已抓取",
-     "color": "#68e24a",
-     "label": "已抓取"
-    },
-    {
-     "operator": "=",
-     "rawValue": "携带中",
-     "color": "#6eebdd",
-     "label": "携带中"
-    },
-    {
-     "operator": "=",
-     "rawValue": "放置中",
-     "color": "#68e24a",
-     "label": "放置中"
-    },
-    {
-     "operator": "=",
-     "rawValue": "已释放",
-     "color": "#80c9d2",
-     "label": "已释放"
-    }
-   ],
-   "foxglovePanelTitle": "状态"
-  },
-  "RawMessages!problem": {
-   "topicPath": "/competition/dashboard/problem",
-   "foxglovePanelTitle": "任务题目"
-  },
-  "Image!camera": {
-   "imageMode": {
-    "imageTopic": "/camera/image_raw"
-   },
-   "foxglovePanelTitle": "识别画面"
-  },
-  "Image!debug": {
-   "imageMode": {
-    "imageTopic": "/vision/debug_image"
-   },
-   "foxglovePanelTitle": "识别画面"
-  },
-  "3D!scene": {
-   "followMode": "follow-pose",
-   "followTf": "map",
-   "topics": {
-    "/scan": {
-     "visible": true,
-     "colorField": "range",
-     "colorMode": "gradient",
-     "colorMap": "turbo",
-     "pointSize": 4,
-     "decayTime": 0.5
-    },
-    "/plan": {
-     "visible": true
-    },
-    "/local_plan": {
-     "visible": true
-    },
-    "/amcl_pose": {
-     "visible": true
-    },
-    "/robot_description": {
-     "visible": true,
-     "displayMode": "auto",
-     "showOutlines": false,
-     "showAxis": false
-    }
-   },
-   "layers": {
-    "grid": {
-     "visible": true,
-     "frameLocked": true,
-     "label": "Grid",
-     "instanceId": "grid",
-     "layerId": "foxglove.Grid",
-     "size": 20,
-     "divisions": 20,
-     "lineWidth": 1,
-     "color": "#248eff",
-     "position": [
-      0,
-      0,
-      0
-     ],
-     "rotation": [
-      0,
-      0,
-      0
-     ],
-     "order": 1
-    }
-   },
-   "foxglovePanelTitle": "三维"
+    "direction": "column",
+    "splitPercentage": 12
   }
- },
- "globalVariables": {},
- "userNodes": {},
- "playbackConfig": {
-  "speed": 1
- },
- "layout": {
-  "first": {
-   "first": {
-    "first": {
-     "first": "Indicator!red_count",
-     "second": "Indicator!blue_count",
-     "direction": "row",
-     "splitPercentage": 50
-    },
-    "second": {
-     "first": "Indicator!blue_zone",
-     "second": "Indicator!red_zone",
-     "direction": "row",
-     "splitPercentage": 50
-    },
-    "direction": "row",
-    "splitPercentage": 50
-   },
-   "second": {
-    "first": {
-     "first": "Image!camera",
-     "second": "Image!debug",
-     "direction": "row",
-     "splitPercentage": 50
-    },
-    "second": "3D!scene",
-    "direction": "column",
-    "splitPercentage": 46
-   },
-   "direction": "column",
-   "splitPercentage": 15
-  },
-  "second": {
-   "first": "Indicator!progress",
-   "second": {
-    "first": "Indicator!work_state",
-    "second": {
-     "first": "Indicator!gripper_state",
-     "second": "RawMessages!problem",
-     "direction": "column",
-     "splitPercentage": 34
-    },
-    "direction": "column",
-    "splitPercentage": 34
-   },
-   "direction": "column",
-   "splitPercentage": 26
-  },
-  "direction": "row",
-  "splitPercentage": 72
- }
 }

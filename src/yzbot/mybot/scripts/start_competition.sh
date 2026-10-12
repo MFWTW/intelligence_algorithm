@@ -52,7 +52,9 @@ while [ $# -gt 0 ]; do
   shift
 done
 
-LEFT_OVER_PATTERN='gzserv[e]r|nav2[_]|move_grou[p]|foxglove_bridg[e]|task_state_machin[e]|task_parse[r]|fixed_joint_pick_plac[e]|ros2 launc[h]|robot_state_publishe[r]|system_health_chec[k]|rviz[2]'
+# Match Nav2 executable names, not arbitrary substrings in arguments: an
+# outdir named fixnav2_... used to match nav2_ and kill the round recorder.
+LEFT_OVER_PATTERN='gzserv[e]r|[/ ]nav2[_]|move_grou[p]|foxglove_bridg[e]|task_state_machin[e]|task_parse[r]|fixed_joint_pick_plac[e]|ros2 launc[h]|robot_state_publishe[r]|system_health_chec[k]|rviz[2]'
 
 echo "== 1/5 预检残留进程 =="
 leftover=$(pgrep -a -f "$LEFT_OVER_PATTERN" 2>/dev/null | grep -v "start_competition" || true)
@@ -61,7 +63,7 @@ if [ -n "$leftover" ]; then
   echo "$leftover" | sed 's/^/    /'
   if [ "$KILL_FIRST" = true ]; then
     echo "  --kill 已指定，正在清理..."
-    pkill -f 'nav2[_]' 2>/dev/null
+    pkill -f '[/ ]nav2[_]' 2>/dev/null
     pkill -f 'gzserv[e]r' 2>/dev/null
     pkill -f 'move_grou[p]' 2>/dev/null
     pkill -f 'foxglove_bridg[e]' 2>/dev/null
@@ -97,6 +99,18 @@ source "$WS/install/setup.bash"
 set -u
 if ! ros2 pkg prefix mybot >/dev/null 2>&1; then
   echo "环境里没有 mybot 包，检查 $WS/install 是否编译成功。" >&2
+  exit 1
+fi
+# Symlink-install preserves the source script's mode; ros2 launch silently
+# cannot find a non-executable task_parser.py (audit0, 2026-10-08).
+parser_exec="$(ros2 pkg prefix mybot)/lib/mybot/task_parser.py"
+if [ ! -x "$parser_exec" ]; then
+  echo "启动前检查失败：$parser_exec 不可执行；请 chmod +x src/yzbot/mybot/scripts/task_parser.py 并重新构建。" >&2
+  exit 1
+fi
+executor_exec="$(ros2 pkg prefix mybot)/lib/mybot/fixed_joint_pick_place.py"
+if [ ! -x "$executor_exec" ]; then
+  echo "启动前检查失败：$executor_exec 不可执行；请 chmod +x src/yzbot/mybot/scripts/fixed_joint_pick_place.py 并重新构建。" >&2
   exit 1
 fi
 

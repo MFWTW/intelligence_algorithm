@@ -10,6 +10,18 @@ or stale callback from contaminating the next object attempt.
 
 import json
 import math
+
+# Minimum baseline for the displacement-rate sanity estimate (seconds). Below
+# this the term is dominated by single-message position quantisation.
+DISPLACEMENT_BASELINE_S = 0.1
+
+
+def _sim_stamp(msg):
+    """Simulated timestamp of an odom message, or None when it carries none."""
+    stamp = msg.header.stamp
+    if getattr(stamp, 'sec', 0) or getattr(stamp, 'nanosec', 0):
+        return stamp.sec + stamp.nanosec * 1e-9
+    return None
 import os
 import re
 import signal
@@ -32,7 +44,7 @@ VALID_STATES = {
     'IDLE', 'PARSING_TASK', 'VALIDATING_TASK', 'DETECTING_OBJECT',
     'NAV_TO_OBJECT', 'PRE_GRASP', 'GRASPING', 'VERIFY_GRASP',
     'NAV_TO_ZONE', 'PLACING', 'VERIFY_PLACE', 'NEXT_OBJECT',
-    'COMPLETED', 'FAILED',
+    'WAITING_FOR_START', 'COMPLETED', 'FAILED',
 }
 
 
@@ -54,6 +66,13 @@ class TaskStateMachine(Node):
         self.declare_parameter('task_startup_grace_sec', 180.0)
         self.declare_parameter('health_loss_grace_sec', 3.0)
         self.declare_parameter('autostart', True)
+        # Opt-in manual start. The competition layout has a 「开始任务」 button,
+        # but a task normally auto-starts as soon as the system is ready, which
+        # would make that button dead. With this on, the run holds in
+        # WAITING_FOR_START until /competition/start carries true - so the judge
+        # says start, then you press it. Default off: existing rounds unchanged.
+        self.declare_parameter('require_start_button', False)
+        self.declare_parameter('start_topic', '/competition/start')
         # A finished or failed run must be repeatable: the parser republishes the
         # same JSON when the same problem is generated again.
         self.declare_parameter('allow_task_replay', True)
@@ -161,6 +180,9 @@ class TaskStateMachine(Node):
         # straddles two cubes cannot look like a teleport.
         self._odom = None
         self._odom_prev = None
+        # (reported twist, pose-derived rate). See _base_sanity_violation.
+        self._odom_channels = (0.0, None)
+        self._unconfirmed_spikes = 0
         # Resident-executor bookkeeping: _object_active mirrors "a cube is in
         # flight" independently of _process, because in resident mode _process is
         # the long-lived executor rather than a per-cube child.
@@ -169,6 +191,11 @@ class TaskStateMachine(Node):
         self._object_id = 0
         self._pending_object_id = 0
         self._timer = self.create_timer(0.2, self._tick)
+        self._start_requested = False
+        self.create_subscription(
+            Bool, str(self.get_parameter('start_topic').value),
+            self._start_button_cb, qos
+        )
         self._set_state('IDLE')
         self._publish_progress()
 
@@ -225,6 +252,16 @@ class TaskStateMachine(Node):
         message = f'{code}:{detail}'
         self._error_pub.publish(self._string(message))
         self.get_logger().error(message)
+        remaining = [f"{item['cube']}->{item['zone']}" for item in self._queue[self._index:]]
+        elapsed = (
+            round(time.monotonic() - self._task_started, 1)
+            if self._task_started is not None else 0.0
+        )
+        self.get_logger().error(
+            f'FAILED SUMMARY: completed={self._completed}/{self._total}, '
+            f'wall_since_first_object={elapsed:.1f}s, state={self._state}, '
+            f'remaining={remaining}, error={message}'
+        )
         self._terminal = True
         self._set_state('FAILED')
         self._publish_progress()
@@ -242,16 +279,40 @@ class TaskStateMachine(Node):
         position = msg.pose.pose.position
         linear = msg.twist.twist.linear
         speed = math.hypot(linear.x, linear.y)
+        sim_stamp = _sim_stamp(msg)
+        reanchor = self._odom_prev is None
+        displacement_rate = None
         if self._odom_prev is not None:
-            prev_x, prev_y, prev_t = self._odom_prev
+            prev_x, prev_y, prev_t, prev_sim = self._odom_prev
+            # Prefer the message's own stamp over callback arrival time: the
+            # stamp is the simulated interval between the samples, whereas
+            # arrival time collapses whenever odom is delivered in a burst.
             dt = now - prev_t
-            if dt > 1e-3:
-                speed = max(
-                    speed,
-                    math.hypot(position.x - prev_x, position.y - prev_y) / dt,
+            if sim_stamp is not None and prev_sim is not None and sim_stamp > prev_sim:
+                dt = sim_stamp - prev_sim
+            # A displacement rate is only meaningful over a long enough
+            # baseline; below it the term is dominated by a single odom step.
+            # 0.02 s was NOT long enough: at 2 m/s one 0.074 m step over 0.02 s
+            # reads as 3.7 m/s, which aborted a healthy round with
+            # "ROBOT_LAUNCHED: base speed 3.7 m/s exceeds 3.0" while /odom never
+            # exceeded 2.000 (run_logs/speed2_trial1_20261010-180221). So when
+            # the baseline is too short, KEEP this anchor - it has to age across
+            # messages - and judge on the twist alone for now.
+            if dt >= DISPLACEMENT_BASELINE_S:
+                displacement_rate = (
+                    math.hypot(position.x - prev_x, position.y - prev_y) / dt
                 )
-        self._odom_prev = (position.x, position.y, now)
+                reanchor = True
+        if reanchor:
+            self._odom_prev = (position.x, position.y, now, sim_stamp)
+        # Keep the two channels apart. The reported twist and the pose-derived
+        # rate disagree sometimes: a real runaway shows up in BOTH, whereas a
+        # lone spike is a simulator artifact. Measured 2026-10-10
+        # (run_logs/speed2_trial2_20261010-180704): /odom's twist read 7.051 m/s
+        # while the base moved 2.05 m in that same second, i.e. ~2 m/s - the
+        # round was aborted for a velocity the base never had.
         self._odom = (position.x, position.y, speed, now)
+        self._odom_channels = (speed, displacement_rate)
 
     def _base_sanity_violation(self, now: float):
         """Return (code, detail) once the base stops obeying physics.
@@ -268,12 +329,33 @@ class TaskStateMachine(Node):
         if now - stamp > 1.0:          # stale odom: nothing trustworthy to judge
             return None
         limit = float(self.get_parameter('max_plausible_speed_mps').value)
-        if speed > limit:
+        twist, measured = self._odom_channels
+        # The pose is ground truth: the base cannot cover 3 m in half a second
+        # without genuinely moving that fast, so a pose-derived overspeed is
+        # conclusive on its own.
+        if measured is not None and measured > limit:
             return (
                 'ROBOT_LAUNCHED',
-                f'base speed {speed:.1f} m/s exceeds {limit:.1f} m/s '
+                f'base covered ground at {measured:.1f} m/s (reported twist '
+                f'{twist:.1f} m/s), exceeding {limit:.1f} m/s '
                 '(simulation blew up; /cmd_vel was not the cause)',
             )
+        # The reported twist is NOT conclusive on its own: the simulator emits
+        # spikes that the pose contradicts. Measured 2026-10-10
+        # (run_logs/speed2_trial2_20261010-180704) /odom's twist read 7.051 m/s
+        # while the base moved 2.05 m in that second (~2 m/s), and the round was
+        # aborted for a speed the base never had. Insist it persist instead.
+        if speed > limit:
+            self._unconfirmed_spikes += 1
+            if self._unconfirmed_spikes < 5:
+                return None
+            return (
+                'ROBOT_LAUNCHED',
+                f'reported base speed {speed:.1f} m/s exceeds {limit:.1f} m/s on '
+                'five consecutive samples, with the pose unable to corroborate it '
+                '(simulation blew up; /cmd_vel was not the cause)',
+            )
+        self._unconfirmed_spikes = 0
         bounds = [float(v) for v in self.get_parameter('map_bounds').value]
         margin = float(self.get_parameter('map_bounds_margin_m').value)
         if not (
@@ -442,6 +524,9 @@ class TaskStateMachine(Node):
         # task for the Gazebo/Nav2 startup would waste real execution time.
         self._task_started = None
         self._terminal = False
+        # A fresh task needs a fresh press when the gate is enabled, so a
+        # replay of the same problem cannot ride on the previous press.
+        self._start_requested = False
         self._error_pub.publish(self._string(''))
         self._publish_progress()
         self.get_logger().info(
@@ -539,6 +624,18 @@ class TaskStateMachine(Node):
         except (OSError, subprocess.TimeoutExpired):
             try:
                 os.killpg(process.pid, signal.SIGTERM)
+                process.wait(timeout=5.0)
+            except subprocess.TimeoutExpired:
+                # Never launch a replacement while the previous resident may
+                # still own the latched goal subscription or base publisher.
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                    process.wait(timeout=5.0)
+                except (OSError, subprocess.TimeoutExpired):
+                    self.get_logger().error(
+                        'Resident did not exit; refusing to start a second one.'
+                    )
+                    self._fail('RESIDENT_TEARDOWN_UNKNOWN', 'old executor still alive')
             except OSError:
                 pass
 
@@ -578,6 +675,17 @@ class TaskStateMachine(Node):
             self._last_executor_error = str(result['error'])
             self._note_executor_error(self._last_executor_error)
         self._handle_child_exit(0 if success else 1)
+
+    def _start_button_cb(self, msg: Bool) -> None:
+        """Latch the operator's start press, including one pressed early."""
+        if bool(msg.data) and not self._start_requested:
+            self._start_requested = True
+            self.get_logger().warning('Start button pressed; releasing the gate.')
+
+    def _start_gate_closed(self) -> bool:
+        if not bool(self.get_parameter('require_start_button').value):
+            return False
+        return not self._start_requested
 
     def _start_current(self) -> None:
         if self._index >= self._total:
@@ -711,6 +819,23 @@ class TaskStateMachine(Node):
             self._fail('UNSAFE_OBJECT_STATE', detail)
             return
 
+        # A dependency timeout occurs before Starting fixed grasp (no arm/nav
+        # command or attachment).  Retrying in the same resident DDS participant
+        # cannot repair a participant that never discovered the Nav2 action:
+        # the 2026-10-09 run waited 60s twice with SYSTEM READY true.  Replace
+        # it only in the pre-motion state; all in-flight/unknown object states
+        # retain the existing fail-closed policy and are never restarted here.
+        if (self._resident_enabled()
+                and self._last_executor_error == 'DEPENDENCY_TIMEOUT'
+                and self._state == 'DETECTING_OBJECT'):
+            self.get_logger().warning(
+                'Dependency discovery failed before motion; recycling the '
+                'resident DDS participant for the bounded object retry.'
+            )
+            self._teardown_resident()
+            if self._terminal:
+                return
+
         retries = max(0, int(self.get_parameter('max_object_retries').value))
         if self._attempt <= retries:
             self._error_pub.publish(
@@ -789,6 +914,10 @@ class TaskStateMachine(Node):
             return
         if not self._system_ready:
             self._set_state('IDLE')
+            return
+        if self._start_gate_closed():
+            # Everything is ready; we are only waiting for the operator.
+            self._set_state('WAITING_FOR_START')
             return
         self._start_current()
 

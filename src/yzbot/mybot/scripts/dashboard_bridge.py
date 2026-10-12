@@ -93,12 +93,20 @@ class DashboardBridge(Node):
                 ('gripper_state', String),
                 ('current_cube', String),
                 ('problem', String),
+                # task_parser exits after parser_linger_sec and takes its latched
+                # samples with it, so a judge opening Foxglove a few minutes in
+                # sees an empty rules panel. This bridge lives as long as the
+                # stack and republishes every 2 s, so the value never goes stale.
+                ('rules', String),
             )
         }
 
         self.create_subscription(String, '/competition/task', self._task_cb, qos)
         self.create_subscription(
             String, '/competition/task_problem', self._problem_cb, qos
+        )
+        self.create_subscription(
+            String, '/competition/task_rules', self._rules_cb, qos
         )
         self.create_subscription(String, '/competition/state', self._state_cb, qos)
         self.create_subscription(
@@ -150,6 +158,11 @@ class DashboardBridge(Node):
             f'Dashboard task: {total} objects '
             f'({", ".join(str(g) for g in groups)})'
         )
+
+    def _rules_cb(self, msg: String) -> None:
+        text = msg.data.strip()
+        if text:
+            self._str('rules', text)
 
     def _problem_cb(self, msg: String) -> None:
         text = msg.data.strip()

@@ -1,0 +1,282 @@
+fixed_joint_pick_place:
+  ros__parameters:
+    cube_name: red_cube_1
+    warehouse: A
+    navigation_frame: map
+    pickup_red_cube_1_pose:
+    - -4.945
+    - -5.889
+    - -3.141593
+    pickup_red_cube_2_pose:
+    - 9.891
+    - 0.014
+    - -3.141593
+    pickup_red_cube_3_pose:
+    - -9.0
+    - -10.225
+    - 0.0
+    pickup_red_cube_4_pose:
+    - 11.498
+    - -9.761
+    - -3.141593
+    pickup_red_cube_5_pose:
+    - 5.611
+    - -9.867
+    - -3.141593
+    pickup_blue_cube_1_pose:
+    - -9.415
+    - 0.015
+    - -3.141593
+    pickup_blue_cube_2_pose:
+    - -9.58
+    - 3.0
+    - 0.0
+    pickup_blue_cube_3_pose:
+    - 8.58
+    - -6.0
+    - -3.141593
+    pickup_blue_cube_4_pose:
+    - 10.58
+    - 4.0
+    - -3.141593
+    pickup_blue_cube_5_pose:
+    - -2.988
+    - -11.583
+    - -3.141593
+    use_backup_pickup_pose: true
+    pickup_backup_offset_m: 0.15
+    enable_visual_handoff: true
+    visual_handoff_distance_m: 1.4
+    visual_handoff_min_distance_m: 0.85
+    warehouse_a_pose:
+    - 7.244
+    - -2.483
+    - -3.141593
+    warehouse_b_pose:
+    - -7.321
+    - -3.018
+    - -3.141593
+    warehouse_c_pose:
+    - 0.016
+    - -2.702
+    - -1.570796
+    use_aligned_warehouse_approach: false
+    warehouse_a_approach_pose:
+    - 10.244
+    - -2.483
+    - -3.141593
+    warehouse_b_approach_pose:
+    - -4.321
+    - -3.018
+    - -3.141593
+    warehouse_c_approach_pose:
+    - 0.016
+    - 0.298
+    - -1.570796
+    blue_cube_1_pickup_via_1:
+    - -2.3
+    - 0.0
+    - 3.141593
+    blue_cube_1_pickup_via_2:
+    - -4.2
+    - 0.0
+    - 3.141593
+    red_cube_2_pickup_via_1: []
+    blue_cube_1_warehouse_b_via_1:
+    - -7.321
+    - -3.018
+    - -3.141593
+    blue_cube_1_warehouse_b_via_2:
+    - -7.321
+    - -3.018
+    - -3.141593
+    blue_cube_1_warehouse_c_via_1:
+    - 0.016
+    - -2.702
+    - -1.570796
+    blue_cube_1_warehouse_c_via_2:
+    - 0.016
+    - -2.702
+    - -1.570796
+    red_cube_1_warehouse_c_via_1:
+    - -3.85
+    - -6.725
+    - -0.475695
+    red_cube_1_warehouse_c_via_2:
+    - 0.025
+    - -4.875
+    - 0.51095
+    blue_cube_3_warehouse_a_via_1:
+    - 12.875
+    - -3.875
+    - 0.454302
+    blue_cube_3_warehouse_a_via_2:
+    - 12.875
+    - -3.525
+    - 1.570796
+    blue_cube_3_warehouse_a_via_3:
+    - 12.7
+    - -2.8
+    - 2.422763
+    robot_model_name: six_arm
+    robot_base_link: base_footprint
+    empty_robot_radius_m: 0.32
+    empty_inflation_radius_m: 0.55
+    global_radius_margin_m: 0.0
+    loaded_robot_radius_m: 0.35
+    loaded_inflation_radius_m: 0.6
+    robot_attach_link: link6
+    cube_link: link
+    require_system_ready: true
+    ready_timeout_sec: 180.0
+    action_timeout_sec: 30.0
+    navigation_timeout_sec: 300.0
+    navigation_accept_radius_m: 0.22
+    navigation_accept_yaw_rad: 0.79
+    navigation_accept_hold_sec: 1.0
+    enable_dock_creep: true
+    dock_creep_trigger_m: 0.45
+    dock_creep_speed_mps: 0.12
+    dock_creep_forward_gain: 0.8
+    dock_creep_tolerance_m: 0.03
+    dock_creep_yaw_tolerance_rad: 0.06
+    dock_creep_timeout_sec: 26.0
+    dock_creep_accept_m: 0.22
+    dock_creep_attempts: 1
+    dock_creep_align_distance_m: 0.25
+    escape_distance_m: 0.7
+    navigation_retry_count: 2
+    action_retry_count: 2
+    service_timeout_sec: 20.0
+    link_service_attempts: 2
+    dependency_timeout_sec: 60.0
+    enable_visual_alignment: true
+    camera_topic: /camera/image_raw
+    fine_cmd_vel_topic: /cmd_vel_nav
+    visual_timeout_sec: 75.0
+    visual_detection_stale_sec: 0.5
+    visual_min_contour_area: 100.0
+    visual_relaxed_saturation_scale: 0.65
+    visual_relaxed_value_scale: 0.6
+    visual_relaxed_dominance_scale: 0.8
+    visual_red_min_saturation: 200
+    visual_red_min_value: 100
+    visual_red_dominance_ratio: 2.5
+    visual_blue_hue_min: 110
+    visual_blue_hue_max: 130
+    visual_blue_min_saturation: 170
+    visual_blue_min_value: 70
+    visual_blue_dominance_ratio: 2.0
+    visual_row_center: 360.0
+    visual_approach_row: 680.0
+    visual_row_tolerance: 18.0
+    visual_row_distance_k: 66.0
+    visual_row_distance_offset_m: 0.015
+    camera_forward_offset_m: 0.18
+    visual_expected_row_tolerance: 80.0
+    visual_target_standoff_m: 0.187
+    visual_final_creep_m: 0.0
+    visual_creep_speed: 0.05
+    visual_stable_frames: 3
+    visual_standoff_frames: 5
+    visual_stable_span_px: 8.0
+    visual_center_tolerance: 0.04
+    visual_linear_gain: 0.45
+    visual_min_linear_speed: 0.06
+    visual_angular_gain: 0.8
+    visual_max_linear_speed: 0.15
+    visual_max_angular_speed: 0.25
+    visual_search_rate: 0.35
+    visual_search_timeout_sec: 18.0
+    visual_research_after_sec: 3.0
+    require_proximity_check: true
+    proximity_timeout_sec: 5.0
+    proximity_retry_attempts: 3
+    max_attach_distance_m: 0.09
+    max_attached_distance_m: 0.12
+    verify_placement: true
+    zone_a_centre:
+    - 6.886
+    - -2.483
+    zone_b_centre:
+    - -7.679
+    - -3.018
+    zone_c_centre:
+    - 0.016
+    - -3.06
+    zone_half_length_m: 0.5
+    zone_half_width_m: 0.25
+    placement_tolerance_m: 0.015
+    placement_settle_sec: 0.5
+    stabilize_release: true
+    arm_motion_sec: 0.6
+    gripper_motion_sec: 0.5
+    settle_sec: 0.2
+    home_joints:
+    - 0.0
+    - 0.6102
+    - 1.2593
+    - 0.0
+    - -1.4931
+    - 0.0
+    pre_grasp_joints:
+    - 0.0
+    - 0.9
+    - 1.17
+    - 0.0
+    - -0.3
+    - 0.0
+    grasp_joints:
+    - 0.0
+    - 1.2
+    - 1.17
+    - 0.0
+    - -0.3
+    - 0.0
+    lift_joints:
+    - 0.0
+    - 0.9
+    - 1.17
+    - 0.0
+    - -0.3
+    - 0.0
+    transport_joints:
+    - 0.0
+    - 0.35
+    - 1.55
+    - 0.0
+    - -1.9
+    - 0.0
+    pre_place_joints:
+    - 0.0
+    - 0.9
+    - 1.17
+    - 0.0
+    - -0.3
+    - 0.0
+    place_joints:
+    - 0.0
+    - 1.035
+    - 1.295
+    - 0.0
+    - -0.3
+    - 0.0
+    gripper_open: 0.0
+    gripper_closed: 0.022
+    wedge_collision_window_sec: 20.0
+    wedge_collision_timeout_sec: 18.0
+    wedge_collision_min_messages: 5
+    wedge_collision_radius_m: 0.05
+    slow_zones:
+    - 12.78
+    - -3.7
+    - 1.4
+    - 0.5
+    - 5.3
+    - -0.4
+    - 1.2
+    - 0.5
+    - 10.8
+    - -8.1
+    - 1.1
+    - 0.5

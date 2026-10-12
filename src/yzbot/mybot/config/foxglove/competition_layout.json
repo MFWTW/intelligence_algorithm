@@ -17,6 +17,15 @@
         },
         "/odom": {
           "visible": true
+        },
+        "/map": {
+          "visible": true
+        },
+        "/global_costmap/costmap": {
+          "visible": true
+        },
+        "/local_costmap/costmap": {
+          "visible": false
         }
       },
       "layers": {
@@ -63,7 +72,8 @@
           "parameter": "",
           "framePrefix": ""
         }
-      }
+      },
+      "fixedFrame": "map"
     },
     "Image!vision": {
       "imageMode": {
