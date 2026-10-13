@@ -87,6 +87,15 @@ fixed_joint_pick_place:
     # approach poses were never validated per zone - re-enable only with a
     # per-zone validation round.
     use_aligned_warehouse_approach: false
+    # Send each delivery's detour points plus the plate as ONE
+    # NavigateThroughPoses goal. Measured 2026-10-14: with a goal per waypoint
+    # the operator watched the base "ignore the route", because every leg was
+    # cancelled and re-planned from wherever the yield hold left it (11 planned
+    # goals produced 38 goal cancellations in one round). One goal = one plan
+    # for the whole polyline, and the yield resume re-sends that same goal.
+    # Set false to go back to the per-waypoint walk.
+    use_continuous_detour: true
+    chain_switch_radius_m: 0.75
     warehouse_a_approach_pose:
     - 10.244
     - -2.483

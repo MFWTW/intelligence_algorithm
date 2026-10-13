@@ -25,7 +25,7 @@ from gazebo_msgs.msg import LinkStates
 from gazebo_msgs.srv import SetEntityState
 from geometry_msgs.msg import PoseStamped, Twist
 from linkattacher_msgs.srv import AttachLink, DetachLink
-from nav2_msgs.action import NavigateToPose
+from nav2_msgs.action import NavigateThroughPoses, NavigateToPose
 from nav2_msgs.msg import SpeedLimit
 from nav2_msgs.srv import ClearEntireCostmap
 from nav_msgs.msg import Odometry
@@ -164,6 +164,17 @@ class FixedJointPickPlace(Node):
         # yaw; all three are free space in room_from_world.pgm, as is the straight
         # run into the goal. Set false to go back to the direct route.
         self.declare_parameter('use_aligned_warehouse_approach', True)
+        # Send the whole detour (every <cube>_warehouse_<zone>_via_<n> point
+        # plus the leg's own target) as ONE NavigateThroughPoses goal instead
+        # of one NavigateToPose goal per waypoint. Nav2 then plans and follows
+        # a single path through the polyline: the base does not stop at each
+        # waypoint, the route on screen is the configured one, and the yield
+        # layer resumes one goal rather than three. Set false to go back to the
+        # per-waypoint walk (kept as the fallback and for A/B rounds).
+        self.declare_parameter('use_continuous_detour', True)
+        # How close the base must get to a detour waypoint before the next one
+        # becomes the no-progress reference (see _chain_progress_target).
+        self.declare_parameter('chain_switch_radius_m', 0.75)
         self.declare_parameter(
             'warehouse_a_approach_pose', [3.142, -11.016, 0.0]
         )
@@ -628,6 +639,17 @@ class FixedJointPickPlace(Node):
             NavigateToPose,
             '/navigate_to_pose',
         )
+        # The detour chain is sent as ONE goal here instead of one goal per
+        # waypoint. Measured 2026-10-14: with a goal per waypoint the operator
+        # watches the base "ignore the route" because every leg is cancelled and
+        # re-planned from wherever the yield hold left it (11 planned goals
+        # produced 38 goal cancellations in one round). A single
+        # NavigateThroughPoses goal keeps one plan for the whole polyline.
+        self._navigate_through_client = ActionClient(
+            self,
+            NavigateThroughPoses,
+            '/navigate_through_poses',
+        )
         self._set_state_client = self.create_client(
             SetEntityState, '/gazebo/set_entity_state'
         )
@@ -743,6 +765,9 @@ class FixedJointPickPlace(Node):
         self._yield_arc_goal = None
         self._yield_arc_used = False
         self._yield_suppress = False
+        # Index of the detour waypoint the no-progress watchdog measures
+        # against; reset per leg in _navigate_once__timed.
+        self._chain_index = 0
         # True while Nav2's goal is cancelled for a deliberate mover hold. The
         # speed limit alone stops the base but NOT its rotation (measured
         # 2026-10-13: ~1.5 rad/s while "held"), so the hold takes the goal away
@@ -1193,6 +1218,13 @@ class FixedJointPickPlace(Node):
                 'Nav2 navigate_to_pose action',
                 lambda: self._navigate_client.wait_for_server(timeout_sec=0.0),
             ),
+            (
+                'navigate_through',
+                'Nav2 navigate_through_poses action',
+                lambda: self._navigate_through_client.wait_for_server(
+                    timeout_sec=0.0
+                ),
+            ),
             ('attach', '/ATTACHLINK',
              lambda: self._attach_client.service_is_ready()),
             ('detach', '/DETACHLINK',
@@ -1244,6 +1276,11 @@ class FixedJointPickPlace(Node):
             self._navigate_client.destroy()
             self._navigate_client = ActionClient(
                 self, NavigateToPose, '/navigate_to_pose'
+            )
+        elif key == 'navigate_through':
+            self._navigate_through_client.destroy()
+            self._navigate_through_client = ActionClient(
+                self, NavigateThroughPoses, '/navigate_through_poses'
             )
         elif key == 'attach':
             self.destroy_client(self._attach_client)
@@ -2054,16 +2091,18 @@ class FixedJointPickPlace(Node):
             self._yield_pause_active = False
         return not self._yield_decision.holds
 
-    def _resume_nav_goal(self, label, goal, response_timeout):
+    def _resume_nav_goal(self, label, goal, response_timeout, client=None):
         """Re-send a leg's own goal after a yield pause.
 
         Returns ``(goal_handle, result_future)`` or None when Nav2 refuses the
         goal, in which case the caller fails the leg and the ordinary retry
-        loop takes over. The pose is identical to the original goal, so a
-        resume is the same leg continuing from where the base stands.
+        loop takes over. The goal object is the identical one the leg started
+        with - one pose for a plain leg, the whole detour chain for a
+        continuous-detour leg - so a resume is the same leg continuing.
         """
         goal_handle = self._send_goal_tolerant(
-            label, self._navigate_client, goal, response_timeout, 5.0
+            label, client if client is not None else self._navigate_client,
+            goal, response_timeout, 5.0
         )
         if goal_handle is None or not goal_handle.accepted:
             self.get_logger().error(
@@ -2075,13 +2114,7 @@ class FixedJointPickPlace(Node):
         )
         return goal_handle, goal_handle.get_result_async()
 
-    def _navigate_once__timed(
-        self,
-        label: str,
-        values: Sequence[float],
-        visual_handoff_cube: str | None = None,
-        completion_radius_m: float | None = None,
-    ) -> bool:
+    def _pose_stamped(self, values: Sequence[float]) -> PoseStamped:
         x, y, yaw = [float(value) for value in values]
         pose = PoseStamped()
         pose.header.frame_id = str(self.get_parameter('navigation_frame').value)
@@ -2090,16 +2123,91 @@ class FixedJointPickPlace(Node):
         pose.pose.position.y = y
         pose.pose.orientation.z = math.sin(yaw / 2.0)
         pose.pose.orientation.w = math.cos(yaw / 2.0)
+        return pose
+
+    def _chain_progress_target(self, chain, x: float, y: float):
+        """The point whose arrival is the next progress milestone.
+
+        Without a chain this is the leg's own goal, exactly as before. With a
+        chain it is the earliest waypoint not yet reached, so the no-progress
+        watchdog still fires on a genuinely stuck base while the bypass is
+        allowed to drive away from the final pose first.
+        """
+        if not chain:
+            return (x, y)
+        index = min(self._chain_index, len(chain) - 1)
+        while index < len(chain) - 1:
+            here = self._cached_planar_distance_to_point(
+                float(chain[index][0]), float(chain[index][1])
+            )
+            ahead = self._cached_planar_distance_to_point(
+                float(chain[index + 1][0]), float(chain[index + 1][1])
+            )
+            # Advance once the base is closer to the NEXT waypoint than to this
+            # one, i.e. it has effectively passed it. A fixed arrival radius is
+            # wrong here: Nav2's through-poses path rounds the corners and can
+            # stay >0.75 m from a waypoint the base has already driven past,
+            # which left the reference behind the robot and made the
+            # no-progress watchdog abandon a healthy attempt (measured
+            # 2026-10-14: "no progress for 45 s (still 2.12 m from the goal)",
+            # a 0.70 m back-off, and 205 s for a leg that takes 52 s otherwise).
+            if here is None or ahead is None or ahead > here:
+                break
+            index += 1
+        self._chain_index = index
+        return (float(chain[index][0]), float(chain[index][1]))
+
+    def _nav_goal(self, values: Sequence[float], chain=None):
+        """Build the Nav2 goal, and pick the client that must execute it.
+
+        No ``chain`` means the original single-pose NavigateToPose goal. With a
+        chain, it is ONE NavigateThroughPoses goal holding every detour waypoint
+        in order followed by the leg's own target, so Nav2 plans and follows the
+        configured polyline as a single path. A chain entry that repeats the
+        target is dropped: two identical consecutive poses add nothing and some
+        BT configurations stall on them.
+        """
+        if chain:
+            goal = NavigateThroughPoses.Goal()
+            poses = [
+                self._pose_stamped(waypoint)
+                for waypoint in chain
+                if math.hypot(float(waypoint[0]) - float(values[0]),
+                              float(waypoint[1]) - float(values[1])) > 1e-3
+            ]
+            poses.append(self._pose_stamped(values))
+            goal.poses = poses
+            return goal, self._navigate_through_client
         goal = NavigateToPose.Goal()
-        goal.pose = pose
+        goal.pose = self._pose_stamped(values)
+        return goal, self._navigate_client
+
+    def _navigate_once__timed(
+        self,
+        label: str,
+        values: Sequence[float],
+        visual_handoff_cube: str | None = None,
+        completion_radius_m: float | None = None,
+        chain: Sequence[Sequence[float]] | None = None,
+    ) -> bool:
+        x, y, yaw = [float(value) for value in values]
+        self._chain_index = 0
+        goal, client = self._nav_goal(values, chain)
+        route_text = ''
+        if chain:
+            route_text = ' via ' + ' -> '.join(
+                f'({float(waypoint[0]):.3f}, {float(waypoint[1]):.3f})'
+                for waypoint in chain
+            )
         self.get_logger().info(
-            f'Navigate to {label}: x={x:.3f}, y={y:.3f}, yaw={yaw:.3f}.'
+            f'Navigate to {label}: x={x:.3f}, y={y:.3f}, yaw={yaw:.3f}'
+            f'{route_text}.'
         )
         response_timeout = float(self.get_parameter('service_timeout_sec').value)
         # Nav2 can lose a goal response the same way the arm controller does;
         # re-sending the identical pose preempts the old goal and is harmless.
         goal_handle = self._send_goal_tolerant(
-            label, self._navigate_client, goal, response_timeout, 5.0
+            label, client, goal, response_timeout, 5.0
         )
         if goal_handle is None:
             self.get_logger().error(
@@ -2183,7 +2291,9 @@ class FixedJointPickPlace(Node):
                         f'{label}: mover hold budget spent; taking the yield arc.'
                     )
                     return False
-                resumed = self._resume_nav_goal(label, goal, response_timeout)
+                resumed = self._resume_nav_goal(
+                    label, goal, response_timeout, client
+                )
                 if resumed is None:
                     return False
                 goal_handle, result_future = resumed
@@ -2262,7 +2372,12 @@ class FixedJointPickPlace(Node):
             if stall_timeout > 0.0:
                 # Abandon an attempt that has stopped closing the distance, so
                 # the retry (escape + jam break) still has budget to work with.
-                live_distance = self._cached_planar_distance_to_point(x, y)
+                # With a detour chain the base legitimately drives AWAY from the
+                # final pose first (the bypass stages south before crossing), so
+                # progress is measured against the next waypoint that has not
+                # been reached yet, never against the final pose from the start.
+                target = self._chain_progress_target(chain, x, y)
+                live_distance = self._cached_planar_distance_to_point(*target)
                 if live_distance is not None:
                     now = time.monotonic()
                     if (
@@ -3325,6 +3440,7 @@ class FixedJointPickPlace(Node):
         values: Sequence[float],
         visual_handoff_cube: str | None = None,
         completion_radius_m: float | None = None,
+        chain: Sequence[Sequence[float]] | None = None,
     ) -> bool:
         attempts = max(1, int(self.get_parameter('navigation_retry_count').value) + 1)
         # A canceled goal followed by one yield waypoint must still get a
@@ -3365,7 +3481,8 @@ class FixedJointPickPlace(Node):
                         return False
                     continue
                 if self._navigate_once(
-                    label, values, visual_handoff_cube, completion_radius_m
+                    label, values, visual_handoff_cube, completion_radius_m,
+                    chain,
                 ):
                     self.get_logger().info(f'Navigation stage complete: {label}.')
                     time.sleep(float(self.get_parameter('settle_sec').value))
@@ -3480,19 +3597,23 @@ class FixedJointPickPlace(Node):
             return False
         warehouse, values = self._warehouse_goal()
         cube = str(self.get_parameter('cube_name').value).strip()
-        # Per-cube detour waypoints, declared as
-        # <cube>_warehouse_<zone>_via_<n>. Any cube may carry them; the walk
-        # stops at the first undeclared (or too short) parameter, so a cube
-        # without waypoints keeps the direct route exactly as before.
         zone = warehouse.lower()
-        for index in range(1, 5):
-            parameter = f'{cube}_warehouse_{zone}_via_{index}'
-            if not self.has_parameter(parameter):
-                break
-            raw = self.get_parameter(parameter).value
-            if raw is None or len(list(raw)) != 3:
-                break
-            waypoint = self._double_list(parameter, 3)
+        waypoints = self._detour_waypoints(cube, zone)
+        if waypoints and bool(self.get_parameter('use_continuous_detour').value):
+            # ONE goal for the whole detour: Nav2 plans a single path through
+            # every waypoint and the leg's own target, so the base follows the
+            # configured route without stopping at each point. This is also why
+            # the route on screen matches the YAML: the per-waypoint walk used
+            # to re-plan from scratch at every stop, and each yield hold
+            # cancelled and resumed a different goal.
+            if not self._navigate_to(
+                f'{cube} to {warehouse} continuous detour',
+                values,
+                chain=waypoints,
+            ):
+                return False
+            return True
+        for index, waypoint in enumerate(waypoints, start=1):
             if not self._navigate_to(
                 f'{cube} to {warehouse} detour waypoint {index}',
                 waypoint,
@@ -3520,6 +3641,24 @@ class FixedJointPickPlace(Node):
             if not self._clear_costmaps():
                 return False
         return self._navigate_to(f'warehouse {warehouse}', values)
+
+    def _detour_waypoints(self, cube: str, zone: str) -> list[list[float]]:
+        """The configured detour points for this cube's delivery to a zone.
+
+        Declared as <cube>_warehouse_<zone>_via_<n>. Any cube may carry them;
+        the walk stops at the first undeclared (or too short) parameter, so a
+        cube without waypoints keeps the direct route exactly as before.
+        """
+        waypoints = []
+        for index in range(1, 5):
+            parameter = f'{cube}_warehouse_{zone}_via_{index}'
+            if not self.has_parameter(parameter):
+                break
+            raw = self.get_parameter(parameter).value
+            if raw is None or len(list(raw)) != 3:
+                break
+            waypoints.append(self._double_list(parameter, 3))
+        return waypoints
 
     def _visual_align(self) -> bool:
         """Servo the base using the colour contour, then hand control back.

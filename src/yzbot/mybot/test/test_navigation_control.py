@@ -2674,6 +2674,158 @@ class PatrolBypassRouteTests(unittest.TestCase):
             self.assertGreaterEqual(clearance, 0.40, (x, y, clearance))
 
 
+class ContinuousDetourTests(unittest.TestCase):
+    """The detour must be ONE goal, not one goal per waypoint.
+
+    Measured 2026-10-14: 11 planned goals produced 38 Nav2 goal cancellations in
+    a single round, which is what the operator saw as the base ignoring its
+    route. One NavigateThroughPoses goal keeps a single plan for the polyline.
+    """
+
+    def node(self, *, continuous=True, waypoints=None):
+        table = {
+            'cube_name': 'blue_cube_3',
+            'warehouse': 'A',
+            'navigation_frame': 'map',
+            'use_continuous_detour': continuous,
+            'use_aligned_warehouse_approach': False,
+            'chain_switch_radius_m': 0.75,
+            'loaded_robot_radius_m': 0.35,
+            'loaded_inflation_radius_m': 0.60,
+            **(self.VIA if waypoints is None else waypoints),
+        }
+        node = SimpleNamespace(
+            _chain_index=0,
+            _navigate_client='navigate_client',
+            _navigate_through_client='through_client',
+            has_parameter=lambda name: name in table,
+            get_parameter=lambda name: SimpleNamespace(value=table.get(name)),
+            get_clock=lambda: SimpleNamespace(
+                now=lambda: SimpleNamespace(to_msg=lambda: Time(sec=1, nanosec=0))),
+            get_logger=lambda: SimpleNamespace(
+                info=lambda *a, **k: None, warning=lambda *a, **k: None,
+                error=lambda *a, **k: None),
+        )
+        bind = module.FixedJointPickPlace
+        node._double_list = bind._double_list.__get__(node)
+        node._detour_waypoints = bind._detour_waypoints.__get__(node)
+        node._nav_goal = bind._nav_goal.__get__(node)
+        node._pose_stamped = bind._pose_stamped.__get__(node)
+        node._chain_progress_target = bind._chain_progress_target.__get__(node)
+        return node
+
+    VIA = {
+        'blue_cube_3_warehouse_a_via_1': [10.8, -6.65, -0.16],
+        'blue_cube_3_warehouse_a_via_2': [13.65, -6.85, -0.07],
+        'blue_cube_3_warehouse_a_via_3': [13.65, -3.0, 1.570796],
+    }
+
+    def test_a_chain_becomes_one_through_poses_goal_in_order(self):
+        node = self.node()
+        chain = node._detour_waypoints('blue_cube_3', 'a')
+        self.assertEqual([tuple(point[:2]) for point in chain],
+                         [(10.8, -6.65), (13.65, -6.85), (13.65, -3.0)])
+        goal, client = node._nav_goal([7.244, -2.483, -3.141593], chain)
+        self.assertIs(client, 'through_client')
+        self.assertIsInstance(goal, module.NavigateThroughPoses.Goal)
+        self.assertEqual([(pose.pose.position.x, pose.pose.position.y)
+                          for pose in goal.poses],
+                         [(10.8, -6.65), (13.65, -6.85), (13.65, -3.0),
+                          (7.244, -2.483)])
+
+    def test_a_chain_that_repeats_the_target_is_not_sent_twice(self):
+        node = self.node()
+        goal, _client = node._nav_goal([10.8, -6.65, 0.0],
+                                       [[10.8, -6.65, 0.0], [13.65, -3.0, 0.0]])
+        self.assertEqual(len(goal.poses), 2)
+
+    def test_a_leg_without_a_chain_still_uses_navigate_to_pose(self):
+        node = self.node()
+        goal, client = node._nav_goal([1.0, 2.0, 0.5], None)
+        self.assertIs(client, 'navigate_client')
+        self.assertIsInstance(goal, module.NavigateToPose.Goal)
+        self.assertAlmostEqual(goal.pose.pose.position.x, 1.0)
+
+    def test_progress_is_measured_against_the_next_unreached_waypoint(self):
+        node = self.node()
+        chain = [[10.8, -6.65, 0.0], [13.65, -6.85, 0.0], [13.65, -3.0, 0.0]]
+        # Approaching the first waypoint from the start pose.
+        node._cached_planar_distance_to_point = lambda x, y: {
+            (10.8, -6.65): 2.0, (13.65, -6.85): 6.0, (13.65, -3.0): 8.0,
+        }[(x, y)]
+        self.assertEqual(node._chain_progress_target(chain, 7.0, -6.0),
+                         (10.8, -6.65))
+        # Past it: the base is now closer to the second one, so that becomes
+        # the reference - a fixed arrival radius would still be pointing back.
+        node._cached_planar_distance_to_point = lambda x, y: {
+            (10.8, -6.65): 1.9, (13.65, -6.85): 0.8, (13.65, -3.0): 5.0,
+        }[(x, y)]
+        self.assertEqual(node._chain_progress_target(chain, 12.8, -6.8),
+                         (13.65, -6.85))
+        # The last waypoint is never skipped.
+        node._cached_planar_distance_to_point = lambda x, y: {
+            (10.8, -6.65): 4.0, (13.65, -6.85): 3.0, (13.65, -3.0): 0.5,
+        }[(x, y)]
+        self.assertEqual(node._chain_progress_target(chain, 13.6, -3.4),
+                         (13.65, -3.0))
+        # A plain leg keeps measuring against its own goal.
+        node._chain_index = 0
+        self.assertEqual(node._chain_progress_target(None, 5.0, 6.0), (5.0, 6.0))
+
+    def test_the_continuous_detour_issues_one_navigation_stage(self):
+        node = self.node(waypoints=self.VIA)
+        node._set_costmap_geometry = lambda *a, **k: True
+        node._clear_costmaps = lambda: True
+        node._warehouse_goal = lambda: ('A', [7.244, -2.483, -3.141593])
+        calls = []
+
+        def navigate_to(label, values, visual_handoff_cube=None,
+                        completion_radius_m=None, chain=None):
+            calls.append((label, tuple(values), visual_handoff_cube,
+                          completion_radius_m,
+                          None if chain is None else [tuple(p) for p in chain]))
+            return True
+
+        node._navigate_to = navigate_to
+        self.assertTrue(
+            module.FixedJointPickPlace._navigate_to_warehouse(node)
+        )
+        self.assertEqual(len(calls), 1, calls)
+        label, values, _handoff, _radius, chain = calls[0]
+        self.assertIn('continuous detour', label)
+        self.assertEqual(values, (7.244, -2.483, -3.141593))
+        self.assertEqual(chain, [(10.8, -6.65, -0.16), (13.65, -6.85, -0.07),
+                                 (13.65, -3.0, 1.570796)])
+        self.assertEqual([point[:2] for point in chain],
+                         [(10.8, -6.65), (13.65, -6.85), (13.65, -3.0)])
+
+    def test_the_switch_off_keeps_the_per_waypoint_walk(self):
+        node = self.node(continuous=False, waypoints=self.VIA)
+        node._set_costmap_geometry = lambda *a, **k: True
+        node._clear_costmaps = lambda: True
+        node._warehouse_goal = lambda: ('A', [7.244, -2.483, -3.141593])
+        calls = []
+        node._navigate_to = lambda label, values, *a, **k: calls.append(
+            (label, tuple(values), k.get('chain'))) or True
+        self.assertTrue(
+            module.FixedJointPickPlace._navigate_to_warehouse(node)
+        )
+        self.assertEqual([label for label, _v, _c in calls],
+                         ['blue_cube_3 to A detour waypoint 1',
+                          'blue_cube_3 to A detour waypoint 2',
+                          'blue_cube_3 to A detour waypoint 3',
+                          'warehouse A'])
+        self.assertTrue(all(chain is None for _l, _v, chain in calls))
+
+    def test_the_competition_profile_enables_the_continuous_detour(self):
+        import yaml
+        params = yaml.safe_load(
+            (ROOT / 'config/profiles/executor_fast.yaml').read_text(
+                encoding='utf-8'))['fixed_joint_pick_place']['ros__parameters']
+        self.assertTrue(params['use_continuous_detour'])
+        self.assertGreater(float(params['chain_switch_radius_m']), 0.0)
+
+
 class SlowZoneTests(unittest.TestCase):
     """Tight-passage speed caps: inert unless configured, and always restored."""
 
@@ -2765,7 +2917,9 @@ class DependencySpecLazinessTests(unittest.TestCase):
             )
         return SimpleNamespace(
             _arm_client=client([True]), _gripper_client=client([True]),
-            _navigate_client=client([True]), _attach_client=client([True]),
+            _navigate_client=client([True]),
+            _navigate_through_client=client([True]),
+            _attach_client=client([True]),
             _detach_client=client([True]), _clear_global_client=client([True]),
             _clear_local_client=client([True]),
             _global_costmap_params_client=client([True]),
@@ -2779,7 +2933,8 @@ class DependencySpecLazinessTests(unittest.TestCase):
         ready = {key: fn for key, _desc, fn in specs}
         self.assertEqual(sorted(ready), ['arm', 'attach', 'clear_global',
                                          'clear_local', 'detach', 'gripper',
-                                         'navigate', 'params_global',
+                                         'navigate', 'navigate_through',
+                                         'params_global',
                                          'params_local', 'set_state'])
         # Swap in a fresh client object, exactly as _rebuild_dependency_client
         # does, and the old one becomes unusable (as rclpy's destroy() does).
