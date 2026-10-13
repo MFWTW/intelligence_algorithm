@@ -180,9 +180,15 @@ timeout 5 ros2 topic pub -r 2 /competition/start std_msgs/msg/Bool "{data: true}
 Windows 上的 Foxglove 选 **Foxglove WebSocket** 连 `ws://localhost:8765`，再导入布局：
 
 ```bash
-cp "$(ros2 pkg prefix mybot)/share/mybot/config/foxglove/competition_dashboard_layout.json" \
-   /mnt/c/Users/26807/Downloads/
+# Windows 的下载目录：用户名交给 Windows 自己回答，别写死成某一台机器的路径
+DL="$(wslpath "$(cmd.exe /c 'echo %USERPROFILE%' 2>/dev/null | tr -d '\r')")/Downloads"
+cp "$(ros2 pkg prefix mybot)/share/mybot/config/foxglove/competition_dashboard_layout.json" "$DL/"
 ```
+
+> 也可以不拷文件，直接让 WSL 报出可粘贴的 Windows 路径：
+> `wslpath -w "$(ros2 pkg prefix mybot)/share/mybot/config/foxglove/competition_dashboard_layout.json"`
+> （输出形如 `\\wsl.localhost\<发行版>\...`，粘进 Foxglove 的文件选择框即可。）
+> **关键是要导入仓库里这一份**——每次布局更新后都要重新导入一次。
 
 三个布局的用途：
 

@@ -78,11 +78,21 @@ python3 -m pip install -r requirements.txt
 ## 5. 编译与启动
 
 ```bash
-cd ~/dev_ws
+cd ~/dev_ws          # ← 换成你 clone 的位置，代码不要求叫 dev_ws
 colcon build --symlink-install
 source install/setup.bash
 ros2 launch mybot competition_bringup.launch.py
 ```
+
+> **换一台电脑（或换个目录 clone）时**：`build/`、`install/`、`log/` 三个目录里
+> 存的是**上一台机器的绝对路径**（`install/setup.bash`、每个包的
+> `share/.../*.yaml` 软链接都指过去），拷过去必然报错。正确做法是**只拷源码**，
+> 在新机器上重新 `colcon build --symlink-install`；已经在旧机器上建好目录的，
+> 先 `rm -rf build install log` 再编。
+> 代码本身（launch / 参数 / 脚本）已经不含任何写死的家目录路径：Nav2 的
+> 行为树 XML 由 `nav_bringup_gazebo2.launch.py` 在启动时按当前机器的安装位置
+> 解析，出题程序按工作空间根目录查找，`start_competition.sh` 也自己推导工作空间。
+> 只有 `MYBOT_WS`（可选）用来在推导不出来时手工指定工作空间根目录。
 
 - `scripts/*.py` 必须有可执行位，否则 launch 报 `executable ... not found`：
   ```bash
@@ -110,7 +120,7 @@ ros2 launch mybot competition_bringup.launch.py
 ## 6. 装完自检
 
 ```bash
-source /opt/ros/humble/setup.bash && source ~/dev_ws/install/setup.bash
+source /opt/ros/humble/setup.bash && source install/setup.bash   # 在工作空间根目录执行
 
 # a) 包和可执行文件都在
 ros2 pkg list | grep -E "^(mybot|mybot_description|bot_navigation|linkattacher_msgs|ros2_linkattacher)$"

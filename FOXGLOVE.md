@@ -16,11 +16,11 @@ Foxglove 桌面版 (Windows) ── 布局文件 competition_layout.json
 
 本机环境已经满足两个前提，不用再折腾网络：
 
-- WSL 是 **mirrored 网络模式**（`C:\Users\26807\.wslconfig` 里的
+- WSL 是 **mirrored 网络模式**（`%USERPROFILE%\.wslconfig` 里的
   `networkingMode=mirrored`），Windows 和 WSL 共用 localhost，所以 Foxglove
   直接连 `ws://localhost:8765`，**不需要**记 WSL 的 IP，也不需要端口转发。
 - Foxglove 桌面版已装在 Windows：
-  `C:\Users\26807\AppData\Local\Programs\foxglove\Foxglove.exe`。
+  `%LOCALAPPDATA%\Programs\foxglove\Foxglove.exe`。
 
 ---
 
@@ -82,12 +82,17 @@ ros2 topic list | grep competition
 布局在仓库里：`src/yzbot/mybot/config/foxglove/competition_layout.json`，
 编译后也会装到 `$(ros2 pkg prefix mybot)/share/mybot/config/foxglove/`。
 
-复制到 Windows 能选到的地方：
+复制到 Windows 能选到的地方（用户名从 Windows 自己取，不写死某台机器的路径；
+若 WSL 互操作被关掉，就手工把 `%USERPROFILE%` 换成你的实际路径）：
 
 ```bash
+DL="$(wslpath "$(cmd.exe /c 'echo %USERPROFILE%' 2>/dev/null | tr -d '\r')")/Downloads"
 cp "$(ros2 pkg prefix mybot)/share/mybot/config/foxglove/competition_layout.json" \
-   /mnt/c/Users/26807/Downloads/foxglove_competition_layout.json
+   "$DL/foxglove_competition_layout.json"
 ```
+
+或者干脆不拷：`wslpath -w "$(ros2 pkg prefix mybot)/share/mybot/config/foxglove/competition_layout.json"`
+会打印出可直接粘进 Foxglove 文件选择框的 `\\wsl.localhost\<发行版>\...` 路径。
 
 Foxglove → 右上 `Layouts` → `Import from file…` → 选上面那个文件。
 
@@ -239,15 +244,19 @@ ros2 run mybot dashboard_bridge.py     # 已默认随 competition_bringup 启动
 └───────────────────────────────────────────┘
 ```
 
-导入：Foxglove → `Layouts` → `Import from file…` → 选**仓库里那份**（路径见
-[启动流程.md](启动流程.md) 第三节）：
+导入：Foxglove → `Layouts` → `Import from file…` → 选**仓库里那份**，路径由 WSL 自己算出来
+（发行版名、用户名都对得上，换机器也不用改文档）：
 
-```
-\\wsl.localhost\Ubuntu-22.04\home\yaowei\dev_ws\src\yzbot\mybot\config\foxglove\competition_dashboard_layout.json
+```bash
+wslpath -w "$(ros2 pkg prefix mybot)/share/mybot/config/foxglove/competition_dashboard_layout.json"
+# 输出形如 \\wsl.localhost\<发行版>\home\<用户>\dev_ws\install\mybot\share\mybot\config\foxglove\competition_dashboard_layout.json
 ```
 
-> 别再导入 `Downloads\competition_dashboard_layout.json` —— 那是更早的一份
-> （11 个面板、**没有「开始任务」按钮**），照它导入会看不到开始按钮。
+> 或者照 [启动流程.md](启动流程.md) 第三节先 `cp` 到 Windows 的 Downloads，再选 Downloads 里
+> **刚拷过去的那份**。
+>
+> 无论走哪条路，都别再导入 `Downloads\competition_dashboard_layout.json` 的**旧副本** ——
+> 那是更早的一份（11 个面板、**没有「开始任务」按钮**），照它导入会看不到开始按钮。
 
 说明两点：
 
