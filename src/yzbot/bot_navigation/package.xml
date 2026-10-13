@@ -10,6 +10,9 @@
   <buildtool_depend>ament_cmake</buildtool_depend>
 
   <depend>nav2_bringup</depend>
+  <!-- nav_bringup_gazebo2.launch.py imports RewrittenYaml from nav2_common.launch
+       to inject default_nav_to_pose_bt_xml for the machine it runs on. -->
+  <depend>nav2_common</depend>
 
   <test_depend>ament_lint_auto</test_depend>
   <test_depend>ament_lint_common</test_depend>

@@ -6,7 +6,15 @@ task_state_machine:
     task_timeout_sec: 0.0
     task_timeout_per_object_sec: 420.0
     task_startup_grace_sec: 180.0
-    health_loss_grace_sec: 3.0
+    # 3.0 s was too tight for this host. Measured 2026-10-13
+    # (run_logs/full_round_repro_20261013-203330): bt_navigator missed its
+    # lifecycle bond heartbeat for 4 s under load, the manager declared it dead
+    # and deactivated the managed nodes, the health gate went false, and 3 s
+    # later the task aborted at 3/5 with the cube still in the gripper. The
+    # stack rebuilt itself ~28 s later. Give a transient host hiccup room to
+    # heal; the executor's own leg timeout (300 s) and per-object timeout still
+    # bound a genuinely dead stack.
+    health_loss_grace_sec: 45.0
     autostart: true
     allow_task_replay: true
     use_resident_executor: true

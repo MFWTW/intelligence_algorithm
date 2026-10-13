@@ -70,6 +70,8 @@ ros-humble-nav2-costmap-2d
 ros-humble-nav2-lifecycle-manager
 ros-humble-nav2-velocity-smoother
 ros-humble-nav2-collision-monitor
+# RewrittenYaml：启动时把行为树 XML 路径改成当前机器的安装路径
+ros-humble-nav2-common
 ros-humble-tf2-geometry-msgs
 # [可选] 用 nav_bringup_*.launch.py slam:=True 自己建图时
 ros-humble-slam-toolbox

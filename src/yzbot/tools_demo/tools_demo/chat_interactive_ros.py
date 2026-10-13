@@ -7,7 +7,7 @@ import json
 
 class LlamaChat(Node):
     """LlamaChat 类,
-    需要启动llama-server -m /home/sunrise/llama.cpp/qwen2.5-coder-0.5b-instruct-q4_k_m.gguf -c 2048 --threads 8 --port 8081
+    需要启动llama-server -m <你本机的 gguf 路径>/qwen2.5-coder-0.5b-instruct-q4_k_m.gguf -c 2048 --threads 8 --port 8081
     """
 
     def __init__(self, base_url="http://localhost:8081"):

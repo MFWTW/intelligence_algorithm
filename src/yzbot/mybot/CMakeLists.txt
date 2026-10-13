@@ -19,8 +19,15 @@ install(PROGRAMS
   scripts/dashboard_bridge.py
   scripts/fixed_joint_pick_place.py
   scripts/moving_obstacles.py
+  # Not a node: the predictive yield policy imported by fixed_joint_pick_place.
+  # It is installed because the executor resolves it as a sibling module, and
+  # under --symlink-install that only works if the install rule exists.
+  scripts/obstacle_yield.py
   scripts/reset_dds_cache.sh
   scripts/rtf_probe.py
+  # Re-stamps /scan with the current sim time so the Nav2 costmaps can raytrace
+  # (the Gazebo lidar's own stamp is ~10 ms ahead of odom->base_footprint).
+  scripts/scan_relay.py
   scripts/set_deepseek_key.sh
   scripts/start_competition.sh
   scripts/startup_gate.py

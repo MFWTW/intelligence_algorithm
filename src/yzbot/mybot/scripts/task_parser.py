@@ -21,6 +21,7 @@ import urllib.request
 from pathlib import Path
 
 import rclpy
+from ament_index_python.packages import get_package_share_directory
 from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
 from std_msgs.msg import String
@@ -150,16 +151,13 @@ class TaskParser(Node):
     def __init__(self) -> None:
         super().__init__('task_parser')
 
-        # 2026-10-08: default was an absolute /home/yaowei/dev_ws/... path, so a
-        # fresh clone could not find the problem generator. Resolve against the
-        # user's home instead, and expand "~"/"$HOME" in whatever the YAML or the
-        # CLI supplies so the shipped config stays machine independent. See
-        # _resolved_generator_path() for the expansion.
-        self.declare_parameter(
-            'generator_path',
-            os.path.join(os.path.expanduser('~'), 'dev_ws',
-                         'TMSCQtest_x86_x64.bin'),
-        )
+        # 2026-10-08: default was an absolute /home/<user>/dev_ws/... path, so a
+        # fresh clone could not find the problem generator. 2026-10-13: the
+        # "$HOME/dev_ws/..." replacement was still a guess about WHERE the repo
+        # was cloned, so the default is now just the file name and
+        # _generator_candidates() finds the copy that ships with the workspace on
+        # whatever machine this runs. An explicit path (YAML or CLI) still wins.
+        self.declare_parameter('generator_path', 'TMSCQtest_x86_x64.bin')
         self.declare_parameter('generator_timeout_sec', 10.0)
         # The problem generator takes an extra argument to switch into
         # competition mode (the problem then changes every 30 minutes):
@@ -276,18 +274,65 @@ class TaskParser(Node):
             self._publish(self._status_pub, self._last_status)
 
     # ------------------------------------------------------------ generate
-    def _resolved_generator_path(self) -> str:
-        """Expand ~ and $HOME in generator_path so the config stays portable.
+    def _generator_candidates(self) -> list[str]:
+        """Every place the problem generator may live, best guess first.
 
-        The shipped config uses "$HOME/dev_ws/TMSCQtest_x86_x64.bin" instead of a
-        hard-coded /home/<user>/... path (2026-10-08), because the absolute form
-        only worked on the machine it was written on and a fresh clone silently
-        failed with "Problem generator not found". ROS parameters are plain
-        strings, so the shell never expands them for us and the expansion has to
-        happen here.
+        The binary travels with the repository (it sits in the workspace root), so
+        the workspace root is DISCOVERED here rather than assumed to be ~/dev_ws:
+        that assumption held only while every machine cloned to the same place
+        (2026-10-13). Order: the configured value as given, $MYBOT_WS, the
+        workspace this package was installed from, the working directory, and
+        finally the old ~/dev_ws layout so existing setups keep working.
         """
         raw = str(self.get_parameter('generator_path').value).strip()
-        return os.path.expanduser(os.path.expandvars(raw))
+        given = os.path.expanduser(os.path.expandvars(raw))
+        name = os.path.basename(given) or 'TMSCQtest_x86_x64.bin'
+        candidates = [given] if given else []
+        roots = []
+        env_ws = os.environ.get('MYBOT_WS', '').strip()
+        if env_ws:
+            roots.append(Path(env_ws))
+        try:
+            share = Path(get_package_share_directory('mybot'))
+            # <ws>/install/mybot/share/mybot -> <ws>
+            if len(share.parents) >= 4:
+                roots.append(share.parents[3])
+        except Exception:                                  # noqa: BLE001
+            # ament index does not know this package (running from a bare source
+            # tree): the remaining roots still cover it.
+            pass
+        roots.append(Path.cwd())
+        roots.append(Path.home() / 'dev_ws')
+        for root in roots:
+            candidates.append(str(root / name))
+            if given and not os.path.isabs(given):
+                # A configured relative sub-path ("tools/gen.bin") is relative to
+                # each root as well, not only to the process CWD.
+                candidates.append(str(root / given))
+        seen, unique = set(), []
+        for candidate in candidates:
+            if candidate and candidate not in seen:
+                seen.add(candidate)
+                unique.append(candidate)
+        return unique
+
+    def _resolved_generator_path(self) -> str:
+        """First candidate that actually exists, else the best guess.
+
+        The shipped config names the generator without a directory
+        ("TMSCQtest_x86_x64.bin"); the directory is found per machine. "~" and
+        "$HOME" still expand, so an explicit absolute path in the YAML or on the
+        command line keeps working - and keeps winning, because the configured
+        value is the first candidate.
+        """
+        candidates = self._generator_candidates()
+        for candidate in candidates:
+            if os.path.isfile(candidate):
+                # A bare relative filename exists in the current directory,
+                # but subprocess.run([name]) searches PATH, not cwd. Return an
+                # absolute executable path even for that first candidate.
+                return os.path.abspath(candidate)
+        return candidates[0] if candidates else ''
 
     def _generate_problem(self) -> str | None:
         override = str(self.get_parameter('problem_override').value).strip()
@@ -298,7 +343,13 @@ class TaskParser(Node):
         path = self._resolved_generator_path()
         timeout = float(self.get_parameter('generator_timeout_sec').value)
         if not os.path.isfile(path):
-            self.get_logger().error(f'Problem generator not found: {path}')
+            tried = self._generator_candidates()
+            self.get_logger().error(
+                f'Problem generator not found: {path}'
+                + (f'  (also tried: {", ".join(tried[1:])})' if len(tried) > 1 else '')
+                + '  -- set MYBOT_WS to the workspace root, or pass'
+                  ' generator_path:=/abs/path.'
+            )
             return None
         argv = [path] + str(
             self.get_parameter('generator_args').value or ''

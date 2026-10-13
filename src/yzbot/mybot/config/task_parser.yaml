@@ -1,6 +1,11 @@
 task_parser:
   ros__parameters:
-    generator_path: $HOME/dev_ws/TMSCQtest_x86_x64.bin
+    # Bare file name on purpose: the binary ships in the workspace root, so
+    # task_parser.py searches for it against $MYBOT_WS, the workspace this
+    # package was installed from, the working directory and finally ~/dev_ws.
+    # An absolute path here works too, but it only exists on the machine that
+    # wrote it - which is exactly what broke on a fresh clone before 2026-10-13.
+    generator_path: TMSCQtest_x86_x64.bin
     generator_timeout_sec: 10.0
     problem_override: ''
     api_key_env: DEEPSEEK_API_KEY

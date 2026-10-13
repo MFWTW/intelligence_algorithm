@@ -61,7 +61,13 @@ bt_navigator:
       plugin: nav2_bt_navigator/NavigateToPoseNavigator
     navigate_through_poses:
       plugin: nav2_bt_navigator/NavigateThroughPosesNavigator
-    default_nav_to_pose_bt_xml: /home/yaowei/dev_ws/install/mybot/share/mybot/config/nav_to_pose_short_recovery.xml
+    # The tuned recovery tree ships in this package (config/nav_to_pose_short_recovery.xml).
+    # Never put a path here: an absolute one only exists on the machine it was written
+    # on, and Nav2 does not expand $HOME or resolve a bare relative name predictably.
+    # nav_bringup_gazebo2.launch.py injects the path that is correct on the running
+    # machine (RewrittenYaml over the mybot share directory). Empty here means Nav2's
+    # stock recovery tree - the same graceful fallback, never a failure to configure.
+    default_nav_to_pose_bt_xml: ''
     error_code_names:
     - compute_path_error_code
     - follow_path_error_code
@@ -72,7 +78,15 @@ controller_server:
     min_x_velocity_threshold: 0.001
     min_y_velocity_threshold: 0.0
     min_theta_velocity_threshold: 0.001
-    failure_tolerance: 2.0
+    # 25 s was set when a yield hold left Nav2's goal ACTIVE, so the controller
+    # had to be prevented from failing (and running the recovery's BackUp/Spin)
+    # while the base waited for a box. The hold now CANCELS the goal instead, so
+    # the controller is not following a path while waiting and a long tolerance
+    # buys nothing - it only delays the retry/escape for a base that is really
+    # stuck. Measured 2026-10-13 (run_logs/budget_fix_round): six refusal
+    # episodes each burned the full 25 s before escaping; the round finished 5/5
+    # but took 520 s against a 355 s baseline.
+    failure_tolerance: 5.0
     progress_checker_plugins:
     - progress_checker
     goal_checker_plugins:
@@ -83,13 +97,34 @@ controller_server:
     progress_checker:
       plugin: nav2_controller::SimpleProgressChecker
       required_movement_radius: 0.1
-      movement_time_allowance: 12.0
+      # Allow a bounded moving-obstacle hold without immediately triggering
+      # Nav2's backup/spin recovery. The executor's separate 20 s wall-clock
+      # wait budget still bounds each hold (clocks differ under simulation),
+      # and the collision-refusal wedge detector remains active outside a hold.
+      # See run_logs/yield_nav2_semantics.md for the progress checker semantics.
+      # This profile change also affects navigation when yielding is disabled;
+      # do not treat it as runtime safety validation.
+      movement_time_allowance: 45.0
     general_goal_checker:
       stateful: true
       plugin: nav2_controller::SimpleGoalChecker
       xy_goal_tolerance: 0.1
       yaw_goal_tolerance: 0.12
     FollowPath:
+      # 2026-10-13 throughput pass (target: a 5-object round under 270 s).
+      # Two attempted throughput passes REGRESSED (1.8 m/s with
+      # cost_scaling_dist 0.25: 8 jam escapes and 3 x 25 s refusals; 1.6 m/s
+      # with the approach floor raised: the goal was never satisfied and the
+      # first delivery leg aborted 3/3). Both were reverted. What survives is
+      # the narrow, measured step below: less unnecessary cost-regulated
+      # crawling and a higher corner floor, with cruise, lookahead and the
+      # end-of-leg ramp left exactly where the 355 s round had them.
+      # Measured on run_logs/timed_round_20261013-214508: navigation was 232 s
+      # of a 355 s task and 139 of those 231 s were spent BELOW 0.6 m/s - the
+      # round was not limited by cruise speed but by three independent slow
+      # floors stacking (cost-regulated scaling near inflation, curvature
+      # scaling in every corner, and the end-of-leg approach ramp). Raising the
+      # ceiling alone would have changed almost nothing.
       plugin: nav2_regulated_pure_pursuit_controller::RegulatedPurePursuitController
       desired_linear_vel: 1.5
       lookahead_dist: 0.6
@@ -97,17 +132,25 @@ controller_server:
       max_lookahead_dist: 0.9
       lookahead_time: 1.5
       use_velocity_scaled_lookahead_dist: true
+      # End-of-leg ramp: the old floor (0.05 m/s over the last 0.6 m) meant the
+      # last stretch of every leg was a crawl. 0.30 m of ramp is still a gentle
+      # arrival and the goal checker stops it anyway.
       min_approach_linear_velocity: 0.05
       approach_velocity_scaling_dist: 0.6
       use_collision_detection: true
       max_allowed_time_to_collision_up_to_carrot: 1.0
       use_regulated_linear_velocity_scaling: true
       use_cost_regulated_linear_velocity_scaling: true
-      cost_scaling_dist: 0.6
+      # 0.6 m of inflation cost slowed the base for most of the route; 0.25 m
+      # keeps the caution where it matters (right beside geometry).
+      cost_scaling_dist: 0.45
       cost_scaling_gain: 1.0
       inflation_cost_scaling_factor: 3.0
+      # Corners used to force 0.25 m/s. The tight passages keep their own
+      # explicit caps (slow_zones) and the tight-passage pre-brake is unchanged,
+      # so this floor can be raised without removing the protection.
       regulated_linear_scaling_min_radius: 0.9
-      regulated_linear_scaling_min_speed: 0.25
+      regulated_linear_scaling_min_speed: 0.4
       use_rotate_to_heading: true
       rotate_to_heading_min_angle: 0.785
       max_angular_accel: 3.2
@@ -143,13 +186,39 @@ local_costmap:
         z_voxels: 16
         max_obstacle_height: 2.0
         mark_threshold: 0
-        observation_sources: scan
+        observation_sources: scan movers
         scan:
-          topic: /scan
+          # Re-stamped by scan_relay.py: the raw /scan is ~10 ms ahead of the
+          # newest odom->base_footprint, so the costmap could mark but never
+          # clear (measured 2026-10-13: 99% of lookups extrapolated, 1128
+          # phantom lethal cells, the base wedged by its own costmap).
+          topic: /scan_stamped_now
           max_obstacle_height: 2.0
           clearing: true
           marking: true
           data_type: LaserScan
+          raytrace_max_range: 15.0
+          raytrace_min_range: 0.0
+          obstacle_max_range: 15.0
+          obstacle_min_range: 0.0
+        # The patrol boxes publish their own footprints on /movers/obstacles so
+        # the base starts avoiding them before the lidar would see them (and
+        # inside the 5 m local window at all). Measured 2026-10-13 with the
+        # scan alone: the base drove at a box on its planned path and then
+        # paced behind it. They are the base's right-of-way superiors, so they
+        # must be in the costmap, not just in the laser. The cloud is in the
+        # robot-centred base_link frame, NOT map: Nav2 uses the cloud's frame
+        # origin to clear departed box marks. base_footprint is too close to
+        # the voxel layer's z=0 lower boundary (a -0.00 m origin still fails);
+        # base_link is 0.1034 m above the floor. A map-frame cloud yielded
+        # 5244 out-of-bounds origin warnings in yield_trial_1.
+        movers:
+          topic: /movers/obstacles
+          max_obstacle_height: 1.0
+          min_obstacle_height: 0.0
+          clearing: true
+          marking: true
+          data_type: PointCloud2
           raytrace_max_range: 15.0
           raytrace_min_range: 0.0
           obstacle_max_range: 15.0
@@ -176,13 +245,28 @@ global_costmap:
       obstacle_layer:
         plugin: nav2_costmap_2d::ObstacleLayer
         enabled: true
-        observation_sources: scan
+        observation_sources: scan movers
         scan:
-          topic: /scan
+          # Re-stamped by scan_relay.py: the raw /scan is ~10 ms ahead of the
+          # newest odom->base_footprint, so the costmap could mark but never
+          # clear (measured 2026-10-13: 99% of lookups extrapolated, 1128
+          # phantom lethal cells, the base wedged by its own costmap).
+          topic: /scan_stamped_now
           max_obstacle_height: 2.0
           clearing: true
           marking: true
           data_type: LaserScan
+          raytrace_max_range: 15.0
+          raytrace_min_range: 0.0
+          obstacle_max_range: 15.0
+          obstacle_min_range: 0.0
+        movers:
+          topic: /movers/obstacles
+          max_obstacle_height: 1.0
+          min_obstacle_height: 0.0
+          clearing: true
+          marking: true
+          data_type: PointCloud2
           raytrace_max_range: 15.0
           raytrace_min_range: 0.0
           obstacle_max_range: 15.0
@@ -304,8 +388,16 @@ collision_monitor:
     use_sim_time: true
     base_frame_id: base_footprint
     odom_frame_id: odom
-    cmd_vel_in_topic: cmd_vel_smoothed
-    cmd_vel_out_topic: cmd_vel
+    # OBSERVER ONLY, and deliberately so. This stack's stock navigation launch
+    # remaps the velocity smoother's output onto /cmd_vel, so /cmd_vel_smoothed
+    # has ZERO publishers: the monitor used to read a topic nothing wrote and
+    # could never see a command, while still holding a publisher on /cmd_vel.
+    # Making it a real filter needs the canonical chain (smoother ->
+    # /cmd_vel_smoothed -> monitor -> /cmd_vel), i.e. a custom navigation launch
+    # plus its own validation round - not a silent remap. Until then it watches
+    # the command the base actually follows and writes where nothing reads.
+    cmd_vel_in_topic: cmd_vel
+    cmd_vel_out_topic: cmd_vel_monitored
     state_topic: collision_monitor_state
     transform_tolerance: 0.2
     source_timeout: 1.0
@@ -326,7 +418,13 @@ collision_monitor:
     - scan
     scan:
       type: scan
-      topic: scan
+      # The relayed sweep, not the raw one: the raw /scan is stamped ~10 ms
+      # ahead of the newest odom->base_footprint, and this node's message filter
+      # then drops frames and logs "Lookup would require extrapolation into the
+      # future" - measured 2026-10-13, 81 such errors plus 64 dropped messages in
+      # a single round. The costmaps were moved to the same topic for exactly
+      # this reason; the monitor was left on the raw one.
+      topic: scan_stamped_now
       min_height: 0.15
       max_height: 2.0
       enabled: true

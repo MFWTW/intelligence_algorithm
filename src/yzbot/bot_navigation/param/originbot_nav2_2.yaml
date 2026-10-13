@@ -80,17 +80,20 @@ bt_navigator:
     # tree keeps the same replanning pipeline and retry count but recovers in
     # ~4 simulated seconds (clear costmaps -> back up 0.15 m -> spin 0.8 rad).
     #
-    # 2026-10-08: this is an ABSOLUTE path and therefore machine specific - a fresh
-    # clone under a different $HOME will not find it and Nav2 silently falls back
-    # to the stock recovery tree, losing the tuned behaviour. A $HOME form was
-    # tried and reverted: ROS 2 launch does not expand environment variables inside
-    # a parameter file, so the literal "$HOME/..." string reached Nav2 and would
-    # have failed on this machine too. A relative/package form was not verified
-    # either, so the working absolute path stays and the portability fix is left as
-    # a documented follow-up: after cloning, either edit this line to your own
-    # install path or move nav_to_pose_short_recovery.xml into the Nav2 share tree
-    # and point at that.
-    default_nav_to_pose_bt_xml: /home/yaowei/dev_ws/install/mybot/share/mybot/config/nav_to_pose_short_recovery.xml
+    # 2026-10-08..2026-10-13: this used to be an ABSOLUTE path
+    # (/home/<user>/dev_ws/install/...), so a clone on any other machine missed
+    # the file and Nav2 silently fell back to the stock recovery tree, losing the
+    # tuned behaviour. A "$HOME/..." form cannot work either: ROS 2 does not
+    # expand environment variables inside a parameter file, so the literal string
+    # reaches Nav2. A bare relative path is just as bad - Nav2 opens it against
+    # whatever CWD the node happens to have.
+    #
+    # The value is therefore left EMPTY here and injected by
+    # nav_bringup_gazebo2.launch.py (RewrittenYaml), which resolves it from the
+    # installed mybot share directory on the machine that is actually running.
+    # Empty means "not injected": Nav2 then uses its stock recovery tree, which
+    # is the same graceful fallback as before, never a crash.
+    default_nav_to_pose_bt_xml: ''
 
     # plugin_lib_names is used to add custom BT plugins to the executor (vector of strings).
     # Built-in plugins are added automatically

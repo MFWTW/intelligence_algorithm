@@ -199,6 +199,62 @@ def generate_launch_description():
         OnProcessExit(target_action=startup_gate, on_exit=start_after_gate)
     )
 
+    # Re-stamp the laser scan with the current sim time before the costmaps see
+    # it: the Gazebo lidar's own stamp is ~10 ms ahead of the newest
+    # odom->base_footprint, so tf2 extrapolates, the costmap cannot raytrace and
+    # phantom obstacles accumulate until the base fails every goal with
+    # "collision ahead" (measured 2026-10-13). See scripts/scan_relay.py.
+    scan_relay = Node(
+        package='mybot',
+        executable='scan_relay.py',
+        name='scan_relay',
+        output='screen',
+        condition=IfCondition(start_nav2),
+        parameters=[{
+            'use_sim_time': True,
+            'input_topic': '/scan',
+            'output_topic': '/scan_stamped_now',
+        }],
+    )
+
+    # Emergency avoidance. Nav2's collision_monitor has been configured in
+    # nav_rpp15.yaml all along (FootprintApproach polygon, 1.2 s of look-ahead,
+    # /scan) but NOTHING ever launched it, so the base had no reactive layer at
+    # all: measured 2026-10-13 a patrol box crossed the base's path at 1.2 m/s
+    # closing speed, the base drove into it and was flung at 8.24 m/s (16 m in
+    # one second), after which every navigation goal failed. Round record:
+    # run_logs/moverprio_20261013-140648 (monitor.jsonl in run_logs/monitor_moverprio2).
+    #
+    # It needs its own lifecycle manager: nav2_bringup's navigation_launch.py
+    # hardcodes its node_names list and does not include collision_monitor, so
+    # the standard manager would never configure or activate it. The extra
+    # manager runs with bond_timeout 0.0 to disable the bond - the collision
+    # monitor creates a bond on activation and Nav2's manager is not its
+    # primary, so leaving bonds enabled would make the two managers fight over
+    # /bond.
+    collision_monitor = Node(
+        package='nav2_collision_monitor',
+        executable='collision_monitor',
+        name='collision_monitor',
+        output='screen',
+        condition=IfCondition(start_nav2),
+        parameters=[nav_params_file, {'use_sim_time': True}],
+        remappings=[('/tf', 'tf'), ('/tf_static', 'tf_static')],
+    )
+    collision_monitor_lifecycle = Node(
+        package='nav2_lifecycle_manager',
+        executable='lifecycle_manager',
+        name='lifecycle_manager_collision_monitor',
+        output='screen',
+        condition=IfCondition(start_nav2),
+        parameters=[{
+            'use_sim_time': True,
+            'autostart': True,
+            'bond_timeout': 0.0,
+            'node_names': ['collision_monitor'],
+        }],
+    )
+
     health_check = Node(
         package='mybot',
         executable='system_health_check.py',
@@ -431,6 +487,9 @@ def generate_launch_description():
         # actually ready; fixed delays race on slower machines.
         startup_gate,
         start_stack_when_ready,
+        scan_relay,
+        collision_monitor,
+        collision_monitor_lifecycle,
         health_check,
         task_state_machine,
         task_parser,

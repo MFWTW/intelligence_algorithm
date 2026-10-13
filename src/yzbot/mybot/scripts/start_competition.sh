@@ -26,7 +26,28 @@
 # 只有在共享内存彻底不可用时才试它，并且要盯住 "Successfully spawned entity"。
 set -uo pipefail
 
-WS="${MYBOT_WS:-$HOME/dev_ws}"
+# Where is the workspace? Do not assume ~/dev_ws (fixed 2026-10-13): the repo is
+# cloned wherever the operator likes, and MYBOT_WS is only set if they remembered.
+# This script is installed to <ws>/install/mybot/lib/mybot/ and also lives in the
+# source tree at <ws>/src/yzbot/mybot/scripts/, so four levels up is <ws> in BOTH
+# layouts. The first candidate that really holds an install/setup.bash wins;
+# ~/dev_ws and the CWD remain as fallbacks, and step 2/5 still fails loudly with
+# the path it tried if none of them is built.
+script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+WS=""
+for candidate in "${MYBOT_WS:-}" "$script_dir/../../../.." "$HOME/dev_ws" "$PWD"; do
+  [ -n "$candidate" ] || continue
+  if [ -f "$candidate/install/setup.bash" ]; then
+    WS="$(cd -- "$candidate" && pwd -P)"
+    break
+  fi
+done
+# Nothing built anywhere: keep the most likely location so the error below names
+# a real path instead of an empty string.
+if [ -z "$WS" ]; then
+  WS="$(cd -- "${MYBOT_WS:-$script_dir/../../../..}" 2>/dev/null && pwd -P)" \
+    || WS="${MYBOT_WS:-$script_dir/../../../..}"
+fi
 USE_GUI=false
 USE_RVIZ=false
 USE_UDP=false

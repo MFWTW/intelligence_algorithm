@@ -1,5 +1,25 @@
 fixed_joint_pick_place:
   ros__parameters:
+    # Every node in this Gazebo stack runs on simulation time, and the executor
+    # must too. It is spawned by task_state_machine.py, NOT by the launch file,
+    # so nothing else sets this for it. Left false, its one clock comparison
+    # (scan age) read 1.79e9 s and the whole obstacle-yield policy exited on
+    # "stale scan" every tick - silently, for a complete round (2026-10-13).
+    # It also stamps its NavigateToPose goals from this clock.
+    use_sim_time: true
+    # Predictive yielding to the patrol boxes is ON for the competition profile
+    # (decided by the operator 2026-10-13, after the layer was made to work):
+    # without it the base drives until RPP refuses, ends up 0.36 m from a
+    # kinematic box that never yields, and gets flung
+    # (ROBOT_LAUNCHED 3.7 m/s, /tmp/mybot_start_lATL.log).
+    # Verified 2026-10-13 in run_logs/yield_diag_denoised_20261013-181609:
+    # 39 decisions, 28 of them within 0.35 m of a real mover.
+    enable_obstacle_yield: true
+    # Pinned here on purpose: this profile is the deployment contract, so a
+    # change to a script default must not silently retune a scored round.
+    yield_clear_margin_sec: 0.3
+    yield_max_mover_speed_mps: 0.6
+    yield_wait_budget_sec: 20.0
     cube_name: red_cube_1
     warehouse: A
     navigation_frame: map
@@ -60,6 +80,12 @@ fixed_joint_pick_place:
     - 0.016
     - -2.702
     - -1.570796
+    # OFF. Tried ON for the 2026-10-13 throughput pass and reverted the same
+    # evening: with the aligned approach the C-zone round looped on the approach
+    # goal 47 times and failed at 0/5, and an earlier attempt at 1/5 was flung.
+    # The idea is sound (it removes the in-place rotation at the goal) but the
+    # approach poses were never validated per zone - re-enable only with a
+    # per-zone validation round.
     use_aligned_warehouse_approach: false
     warehouse_a_approach_pose:
     - 10.244
@@ -106,18 +132,28 @@ fixed_joint_pick_place:
     - 0.025
     - -4.875
     - 0.51095
+    # blue_cube_3 -> A: the old straight approach to (12.875,-3.875)
+    # crossed mover_3's (11.76,-4.53)<->(12.62,-5.87) patrol lane.
+    # In the 2026-10-14 GUI round it wedged at (11.6,-5.5), spending 105 s
+    # in NAV_TO_ZONE before failing with the cube attached. The static map has
+    # a wall at y~-3.7 ending near x=12.7, so a north-side shortcut is NOT safe.
+    # Stage outside the patrol band to the south, pass its east end, then cross
+    # to the north side east of the wall. The existing yield policy can stop at
+    # the first waypoint without parking on the moving box's path. Keep the
+    # loaded footprint unchanged; these points are a route trial, not proof of
+    # collision-free driving (Nav2 still checks live costmaps).
     blue_cube_3_warehouse_a_via_1:
-    - 12.875
-    - -3.875
-    - 0.454302
+    - 10.8
+    - -6.65
+    - -0.16
     blue_cube_3_warehouse_a_via_2:
-    - 12.875
-    - -3.525
-    - 1.570796
+    - 13.65
+    - -6.85
+    - -0.07
     blue_cube_3_warehouse_a_via_3:
-    - 12.7
-    - -2.8
-    - 2.422763
+    - 13.65
+    - -3.0
+    - 1.570796
     robot_model_name: six_arm
     robot_base_link: base_footprint
     empty_robot_radius_m: 0.32
@@ -135,8 +171,8 @@ fixed_joint_pick_place:
     navigation_accept_yaw_rad: 0.79
     navigation_accept_hold_sec: 1.0
     enable_dock_creep: true
-    dock_creep_trigger_m: 0.45
-    dock_creep_speed_mps: 0.12
+    dock_creep_trigger_m: 0.35
+    dock_creep_speed_mps: 0.15
     dock_creep_forward_gain: 0.8
     dock_creep_tolerance_m: 0.03
     dock_creep_yaw_tolerance_rad: 0.06
@@ -271,12 +307,12 @@ fixed_joint_pick_place:
     - 12.78
     - -3.7
     - 1.4
-    - 0.5
+    - 0.6
     - 5.3
     - -0.4
     - 1.2
-    - 0.5
+    - 0.6
     - 10.8
     - -8.1
     - 1.1
-    - 0.5
+    - 0.6

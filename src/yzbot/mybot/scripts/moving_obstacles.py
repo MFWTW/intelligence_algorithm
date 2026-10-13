@@ -1,19 +1,30 @@
 #!/usr/bin/env python3
 """Drive the moving-obstacle boxes so the base has to avoid them mid-task.
 
-Each box is a normal Gazebo model with libgazebo_ros_planar_move.so, so it moves
-with real physics (it is not teleported, and it can be bumped). This node only
-sends `cmd_vel` on `/<name>/cmd_vel` and watches `/<name>/odom` to know where the
-box actually is.
+Each box is a normal Gazebo model that is inserted at runtime; this node serves
+its pose every tick with /gazebo/set_entity_state, so the box cannot be shoved
+off its segment and its speed is exactly the commanded one (see
+_Patrol.advance for why a cmd_vel box could not hold either).
+
+The boxes have the highest priority (requested 2026-10-13): their motion is a
+pure function of time. They never yield, never slow, never leave their segment
+and cannot be displaced - the base has no influence on them whatsoever, and it is
+the base's job to keep out of their way. Every box is spawned KINEMATIC so base
+contact cannot shove it either.
+
+To make avoidance possible the node also publishes the boxes' footprints on
+`obstacle_cloud_topic` (PointCloud2, base_link frame, one flat square per
+box) so both Nav2 costmaps carry them as a real obstacle source and the planner
+routes around them instead of discovering them with the lidar at the last moment.
+The frame matters: a cloud in `map` makes its sensor origin (0,0), outside the
+rolling local costmap for most of the route, so clearing cannot erase old marks.
 
 Patrols are declared as one string so the parameter has no array-typing problem:
 
     patrols: "mover_1:-1.16,-0.84,-0.40,0.58,0.16; mover_2:1.30,-5.72,-0.10,-4.94,0.16"
 
 i.e. `name:x_start,y_start,x_end,y_end,speed_mps`. The box's yaw in the world is
-set to the segment direction (planar_move drives along the model's own +x), so a
-single linear.x drives the whole segment; direction is flipped when the measured
-position passes an endpoint, which self-corrects if the base shoves a box.
+set to the segment direction, so the served pose drives the whole segment.
 
 The segments themselves come from the robot's recorded trajectories and were
 clearance-checked against the static map, so a box always leaves the base room
@@ -27,6 +38,12 @@ from gazebo_msgs.srv import SetEntityState, SpawnEntity
 from gazebo_msgs.msg import LinkStates
 from nav_msgs.msg import Odometry
 from rclpy.node import Node
+from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
+from rclpy.time import Time
+from sensor_msgs.msg import PointCloud2, PointField
+from tf2_ros import Buffer, TransformException, TransformListener
+from std_msgs.msg import Header, String
+from sensor_msgs_py import point_cloud2
 
 # mover_2 is deliberately quicker than the others: a faster crossing obstacle
 # forces an actual avoidance decision instead of letting the base pace behind it.
@@ -46,20 +63,45 @@ DEFAULT_PATROLS = (
 )
 
 
-# Base radius 0.35 m + box half-diagonal ~0.16 m + margin. Shared with the
-# parameter default so a test can assert the two cannot drift apart.
-# Raised from 0.55 on 2026-10-12: the loaded robot's own safety radius is 0.40 m
-# and Nav2 inflates it to 0.60 m, so a box parked 0.55 m away already sits inside
-# the envelope the planner refuses to enter. 0.75 keeps the box clear of it.
-DEFAULT_CLEARANCE_M = 0.75
+# Footprint served to the costmaps (and the X/Y size in BOX_SDF).
+BOX_SIZE_M = 0.22
 
+
+def transform_point_xyz(point, transform):
+    """Apply a map->base_link TF to one simulated obstacle return.
+
+    Use the entire quaternion, not only yaw: the robot can pitch under load.
+    The cloud's frame must place its *origin* at the robot, or Nav2's rolling
+    local costmap cannot raytrace stale box marks as the patrol moves away.
+    """
+    x, y, z = point
+    q = transform.rotation
+    norm = math.sqrt(q.x * q.x + q.y * q.y + q.z * q.z + q.w * q.w)
+    if norm < 1e-9:
+        raise ValueError('invalid zero quaternion for moving-obstacle cloud')
+    qx, qy, qz, qw = q.x / norm, q.y / norm, q.z / norm, q.w / norm
+    tx = 2.0 * (qy * z - qz * y)
+    ty = 2.0 * (qz * x - qx * z)
+    tz = 2.0 * (qx * y - qy * x)
+    offset = transform.translation
+    return (
+        x + qw * tx + (qy * tz - qz * ty) + offset.x,
+        y + qw * ty + (qz * tx - qx * tz) + offset.y,
+        z + qw * tz + (qx * ty - qy * tx) + offset.z,
+    )
+
+
+# Reporting threshold only: a warning is logged when the base comes this close
+# to a box. It has NO effect on the box - the box never yields.
+DEFAULT_CLEARANCE_M = 0.75
 
 def parse_patrols(text):
     """Parse the patrol spec into [(name, x0, y0, x1, y1, speed, kinematic)].
 
-    An entry may end with an optional ``k`` flag marking the box kinematic:
-    a kinematic body ignores contact forces, so the base cannot shove it off its
-    segment (and it does not fight ground friction while coasting).
+    An entry may still end with a ``k`` flag (kept for compatibility with
+    existing configs). It no longer selects anything: EVERY box is inserted
+    kinematic now, because a kinematic body ignores contact forces and the base
+    must not be able to displace a highest-priority obstacle.
     """
     patrols = []
     for chunk in str(text or '').split(';'):
@@ -124,7 +166,7 @@ BOX_SDF = """<sdf version='1.7'>
 
 
 class _Patrol:
-    def __init__(self, name, x0, y0, x1, y1, speed, kinematic=False):
+    def __init__(self, name, x0, y0, x1, y1, speed, kinematic=True):
         # `s` is the commanded distance travelled along the segment. Driving the
         # pose from it (rather than commanding a velocity) is what makes the
         # speed exact and the box unshovable - see advance().
@@ -134,7 +176,9 @@ class _Patrol:
         self.length = math.hypot(self.dx, self.dy)
         self.ux, self.uy = self.dx / self.length, self.dy / self.length
         self.speed = speed
-        self.kinematic = bool(kinematic)
+        # Always true: see _spawn_boxes. Kept as an attribute so the record can
+        # still report what was asked for.
+        self.kinematic = True
         self.direction = 1.0
         self.x, self.y = x0, y0
         self.seen = True
@@ -176,11 +220,19 @@ class MovingObstacles(Node):
         super().__init__('moving_obstacles')
         self.declare_parameter('patrols', DEFAULT_PATROLS)
         self.declare_parameter('publish_rate_hz', 10.0)
-        # A served pose is authoritative and the box cannot be shoved, so if it
-        # is moved onto the base ODE resolves the overlap by flinging the base:
-        # measured 2026-10-11 "base covered ground at 4.4 m/s (reported twist
-        # 1.3 m/s)" -> ROBOT_LAUNCHED aborted the round. Hold a box while the
-        # base is close instead of driving through it.
+        # Highest priority (requested 2026-10-13): a box's motion is a pure
+        # function of time. It never yields, never slows, never leaves its
+        # segment and is never displaced - nothing the base does changes where a
+        # box is or where it goes next. Every box is served as a KINEMATIC body
+        # (see _spawn_boxes), so base contact cannot shove it off its line
+        # either. Keeping the base out of the way is the base's job.
+        #
+        # This parameter is only a diagnostic threshold: below it a warning is
+        # logged so the round record shows the base came inside the box, but the
+        # box's motion is not affected in any way. It used to gate the motion
+        # (the "yield to the base" bubble), which froze mover_2 for 110 s of a
+        # 130 s trace (run_logs/yield3_131041) and deadlocked the base in front
+        # of it.
         self.declare_parameter('robot_clearance_m', DEFAULT_CLEARANCE_M)
         self.declare_parameter('spawn_on_start', True)
         # The first box is requested while Gazebo is still inserting the robot
@@ -206,7 +258,8 @@ class MovingObstacles(Node):
             self.get_logger().warning(
                 f'{patrol.name}: patrolling ({patrol.x0:.2f},{patrol.y0:.2f})'
                 f'<->({patrol.x0 + patrol.dx:.2f},{patrol.y0 + patrol.dy:.2f}) '
-                f'at {patrol.speed:.2f} m/s')
+                f'at {patrol.speed:.2f} m/s, kinematic, highest priority (never '
+                f'yields, never displaced)')
         self._reset_client = self.create_client(
             SetEntityState, '/gazebo/set_entity_state')
         self._spawn_client = self.create_client(SpawnEntity, '/spawn_entity')
@@ -226,6 +279,90 @@ class MovingObstacles(Node):
         self.declare_parameter('report_period_sec', 5.0)
         period = max(0.5, float(self.get_parameter('report_period_sec').value))
         self.create_timer(period, self._report)
+        # Costmap source: the boxes are stamped into both Nav2 costmaps so the
+        # planner routes around them. The lidar sees them too, but only inside
+        # the local costmap's 5 m window and only once they are already on the
+        # planned path - measured 2026-10-13 the base drove straight at a box
+        # and then paced behind it.
+        self.declare_parameter('obstacle_cloud_topic', '/movers/obstacles')
+        self.declare_parameter('publish_obstacle_cloud', True)
+        self._tf_buffer = Buffer()
+        self._tf_listener = TransformListener(self._tf_buffer, self)
+        self._cloud_warn_last = -math.inf
+        cloud_qos = QoSProfile(depth=1)
+        cloud_qos.reliability = ReliabilityPolicy.RELIABLE
+        cloud_qos.durability = DurabilityPolicy.VOLATILE
+        self._cloud_pub = self.create_publisher(
+            PointCloud2, str(self.get_parameter('obstacle_cloud_topic').value),
+            cloud_qos)
+        # The centre lines themselves, latched, so a consumer joining later (the
+        # executor is spawned per task) still learns where the lanes are. Without
+        # this the yield policy cannot tell "stop beside the box" from "stop
+        # inside its lane", and a base parked in a lane is trapped there: the box
+        # comes back every few seconds (measured 2026-10-13, 18 s frozen, 30
+        # hold/resume cycles). Same spec string as the `patrols` parameter.
+        self.declare_parameter('patrols_topic', '/movers/patrols')
+        patrols_qos = QoSProfile(depth=1)
+        patrols_qos.reliability = ReliabilityPolicy.RELIABLE
+        patrols_qos.durability = DurabilityPolicy.TRANSIENT_LOCAL
+        self._patrols_pub = self.create_publisher(
+            String, str(self.get_parameter('patrols_topic').value), patrols_qos)
+        self._patrols_msg = String()
+        self._patrols_msg.data = str(self.get_parameter('patrols').value)
+        # Latched topics only deliver on publish, so send it now and on every
+        # report tick: a subscriber that starts later must still receive it.
+        self._patrols_pub.publish(self._patrols_msg)
+
+    def _publish_obstacle_cloud(self):
+        """Publish each box in the robot-centred lidar frame, never map-origin.
+
+        A PointCloud2 is interpreted as a *sensor*: Nav2 raytraces from the
+        message frame's origin. `map` gives that sensor (0,0), which is outside
+        the rolling local costmap over most of the route; 5244 raytrace warnings
+        were recorded in yield_trial_1 and old mover marks could not clear.
+        Using base_link provides a valid origin to both costmaps. The TF
+        timestamp is also used for the cloud, so points and origin correspond
+        to exactly the same pose; missing/stale TF skips publication rather than
+        lying about where an obstacle is.
+        """
+        try:
+            tf = self._tf_buffer.lookup_transform(
+                'base_link', 'map', Time())
+            stamp = tf.header.stamp
+            stamp_seconds = stamp.sec + stamp.nanosec * 1e-9
+            age = self.get_clock().now().nanoseconds * 1e-9 - stamp_seconds
+            if stamp_seconds <= 0.0 or not -0.5 <= age <= 0.5:
+                raise ValueError(f'map-to-base transform age {age:.2f} s')
+        except (TransformException, ValueError) as exc:
+            now = time.monotonic()
+            if now - self._cloud_warn_last >= 5.0:
+                self._cloud_warn_last = now
+                self.get_logger().warning(
+                    f'Mover cloud skipped until a fresh map-to-base transform '
+                    f'is available: {exc}')
+            return
+        half = BOX_SIZE_M / 2.0
+        grid = 0.05
+        cells = int(round(BOX_SIZE_M / grid))
+        offsets = [(-half + ix * grid, -half + iy * grid)
+                   for ix in range(cells + 1) for iy in range(cells + 1)]
+        points = []
+        for patrol in self.patrols:
+            cos_yaw, sin_yaw = math.cos(patrol.yaw), math.sin(patrol.yaw)
+            for dx, dy in offsets:
+                world = (patrol.x + cos_yaw * dx - sin_yaw * dy,
+                         patrol.y + sin_yaw * dx + cos_yaw * dy,
+                         BOX_SIZE_M / 2.0)
+                points.append(transform_point_xyz(world, tf.transform))
+        header = Header()
+        header.stamp = stamp
+        header.frame_id = 'base_link'
+        fields = [
+            PointField(name='x', offset=0, datatype=PointField.FLOAT32, count=1),
+            PointField(name='y', offset=4, datatype=PointField.FLOAT32, count=1),
+            PointField(name='z', offset=8, datatype=PointField.FLOAT32, count=1),
+        ]
+        self._cloud_pub.publish(point_cloud2.create_cloud(header, fields, points))
 
     def _tick(self):
         if not self._spawned:
@@ -235,11 +372,15 @@ class MovingObstacles(Node):
         self._last_tick = now
         if dt <= 0.0:
             return
-        clearance = max(0.0, float(self.get_parameter('robot_clearance_m').value))
+        self._last_dt = dt
         for patrol in self.patrols:
-            if self._robot_too_close(patrol, clearance):
-                # Yield to the base rather than materialising inside it.
-                continue
+            # The obstacle never yields, never slows and never leaves its
+            # segment: the base has to keep out of its way (requested
+            # 2026-10-13). Before this, the box held position for as long as the
+            # base stayed inside a 0.75 m bubble - measured on
+            # run_logs/yield3_131041, mover_2 sat frozen for 110 s of a 130 s
+            # trace while the base paced in front of it, and neither could get
+            # through.
             patrol.advance(dt)
             if not self._reset_client.service_is_ready():
                 continue
@@ -254,10 +395,12 @@ class MovingObstacles(Node):
             # though the pose is authoritative.
             request.state.twist.linear.x = float(patrol.speed * patrol.direction)
             self._reset_client.call_async(request)
-
-#!/usr/bin/env python3
+            self._warn_if_base_inside_box(patrol)
+        if bool(self.get_parameter('publish_obstacle_cloud').value):
+            self._publish_obstacle_cloud()
 
     def _report(self):
+        self._patrols_pub.publish(self._patrols_msg)
         for patrol in self.patrols:
             if not patrol.seen:
                 self.get_logger().warning(f'MOVER {patrol.name} no-odom')
@@ -266,16 +409,27 @@ class MovingObstacles(Node):
                 f'MOVER {patrol.name} {patrol.x:.3f} {patrol.y:.3f} '
                 f'progress={patrol.progress():.3f} dir={patrol.direction:+.0f}')
 
-    def _robot_too_close(self, patrol, clearance):
-        """True while the base is within `clearance` of where the box would go."""
-        if self._robot_xy is None or clearance <= 0.0:
-            return False
-        step = patrol.direction * patrol.speed
-        ahead = min(max(patrol.s + step * 0.2, 0.0), patrol.length)
-        bx = patrol.x0 + patrol.ux * ahead
-        by = patrol.y0 + patrol.uy * ahead
+    def _warn_if_base_inside_box(self, patrol):
+        """Diagnostic only: the base must never be inside a box.
+
+        This changes NOTHING about the box: it has already been advanced, its
+        pose is served regardless, and the warning exists so the round record
+        shows a base that drove into an obstacle instead of leaving it to be
+        inferred from a violent pose jump. The box is kinematic, so the base
+        cannot move it; the base has to keep out of its way.
+        """
+        if self._robot_xy is None:
+            return
+        limit = max(0.0, float(self.get_parameter('robot_clearance_m').value))
+        if limit <= 0.0:
+            return
         rx, ry = self._robot_xy
-        return math.hypot(bx - rx, by - ry) < clearance
+        gap = math.hypot(patrol.x - rx, patrol.y - ry)
+        if gap < limit:
+            self.get_logger().warning(
+                f'MOVER {patrol.name}: the base is {gap:.2f} m from the box '
+                f'(keep-out {limit:.2f} m); the box keeps its priority and its '
+                'motion unchanged.')
 
     def _wait_for_robot(self):
         """Block until Gazebo reports the robot's own links, or the timeout."""
@@ -329,10 +483,14 @@ class MovingObstacles(Node):
             for attempt in range(1, attempts + 1):
                 request = SpawnEntity.Request()
                 request.name = patrol.name
+                # Every box is inserted kinematic: a kinematic body ignores
+                # contact forces, so the base cannot shove it off its segment
+                # even when it drives straight into it (measured 2026-10-11 the
+                # base displaced a dynamic box ~0.7 mm per tick before this).
+                # The base is a dynamic body, so the box still pushes IT.
                 request.xml = BOX_SDF.format(
                     name=patrol.name,
-                    kinematic='    <kinematic>true</kinematic>\n'
-                    if patrol.kinematic else '')
+                    kinematic='    <kinematic>true</kinematic>\n')
                 request.robot_namespace = ''
                 request.reference_frame = 'world'
                 request.initial_pose.position.x = float(centre[0])

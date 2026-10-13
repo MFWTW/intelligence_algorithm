@@ -28,6 +28,7 @@ from linkattacher_msgs.srv import AttachLink, DetachLink
 from nav2_msgs.action import NavigateToPose
 from nav2_msgs.msg import SpeedLimit
 from nav2_msgs.srv import ClearEntireCostmap
+from nav_msgs.msg import Odometry
 from rcl_interfaces.msg import (
     Parameter,
     ParameterDescriptor,
@@ -49,11 +50,23 @@ from sensor_msgs.msg import Image, LaserScan
 from std_msgs.msg import Bool, String
 from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
 
+import obstacle_yield
+
 
 ARM_JOINTS = [
     'joint1', 'joint2', 'joint3', 'joint4', 'joint5', 'joint6'
 ]
 GRIPPER_JOINTS = ['finger_joint1']
+
+# Speed limit used to hold the base still for a moving obstacle. Deliberately
+# not 0.0: that is Nav2's "no limit" sentinel (see _tick_yield). 1 mm/s is far
+# below anything the base can track and still performs a real clamp, because RPP
+# applies the limit after its own minimum-speed floors.
+YIELD_STOP_SPEED_LIMIT = 0.001
+
+# A sweep stamp this far from the node's own clock is not staleness, it is two
+# different time bases. 10^6 s is ~11.6 days: far beyond any real pause.
+CLOCK_MISMATCH_SEC = 1.0e6
 
 
 class FixedJointPickPlace(Node):
@@ -350,6 +363,10 @@ class FixedJointPickPlace(Node):
         # A non-empty, correctly typed default is the only form that works in
         # both cases; a list shorter than one group of four means "off".
         self.declare_parameter('slow_zones', [0.0])
+        # How early the tight-passage cap engages, measured from the zone
+        # boundary. 0.8 m covers 1.5 m/s of braking distance (0.45 m) plus the
+        # sensing/control latency (0.45 m) at the profile's cruise speed.
+        self.declare_parameter('slow_zone_brake_ahead_m', 0.8)
         # Hard-wedge detector. A base wedged by the controller's own collision
         # check cannot move at all, and the only thing that frees it is this
         # executor's escape - so waiting out navigation_stall_timeout_sec (45 s)
@@ -429,6 +446,45 @@ class FixedJointPickPlace(Node):
         self.declare_parameter('camera_topic', '/camera/image_raw')
         self.declare_parameter('scan_topic', '/scan')
         self.declare_parameter('fine_cmd_vel_topic', '/cmd_vel_nav')
+
+        # Predictive yielding for moving obstacles (see obstacle_yield.py).
+        # Off by default until it has been measured over a full round: with it
+        # disabled the executor behaves exactly as it did before, which is the
+        # only way a change to the navigation loop can be judged.
+        self.declare_parameter('enable_obstacle_yield', False)
+        self.declare_parameter('odom_topic', '/odom')
+        self.declare_parameter('yield_update_period_sec', 0.1)
+        # Keep in step with obstacle_yield.YieldConfig defaults; a value that is
+        # not declared here cannot be tuned from YAML.
+        self.declare_parameter('yield_half_width_m', 0.24)
+        self.declare_parameter('yield_obstacle_half_width_m', 0.11)
+        self.declare_parameter('yield_detection_range_m', 2.5)
+        self.declare_parameter('yield_track_range_m', 4.0)
+        self.declare_parameter('yield_cap_range_m', 1.8)
+        self.declare_parameter('yield_stop_range_m', 1.2)
+        self.declare_parameter('yield_cap_speed_mps', 0.8)
+        self.declare_parameter('yield_resume_speed_mps', 0.6)
+        self.declare_parameter('yield_min_mover_speed_mps', 0.04)
+        # The other end of the mover-speed window: a track faster than this is
+        # association noise, not a patrol box (measured phantoms: 0.86-1.52 m/s
+        # against real boxes at 0.16-0.30 m/s).
+        self.declare_parameter('yield_max_mover_speed_mps', 0.6)
+        # How much time must be left between "the base is past" and "the box
+        # enters the corridor": the sensing/control latency of this stack.
+        self.declare_parameter('yield_clear_margin_sec', 0.3)
+        self.declare_parameter('yield_wait_budget_sec', 20.0)
+        self.declare_parameter('yield_arc_offset_m', 0.55)
+        self.declare_parameter('yield_arc_apex_m', 0.8)
+        self.declare_parameter('yield_arc_goal_radius_m', 0.35)
+        # The patrol boxes' centre lines, published latched by moving_obstacles.
+        # Without them the policy cannot tell "stop beside the box" from "stop
+        # inside the box's lane", and a base parked in a lane is trapped: the box
+        # returns every few seconds (measured 2026-10-13, 18 s frozen).
+        self.declare_parameter('mover_patrols_topic', '/movers/patrols')
+        # Rate limit for the yield diagnostic below; 0.0 disables it, and it is
+        # silent unless the yield feature itself is enabled. It only ever logs
+        # (no motion), so it is safe to leave on during a round.
+        self.declare_parameter('yield_diag_period_sec', 5.0)
         self.declare_parameter('visual_timeout_sec', 45.0)
         self.declare_parameter('visual_detection_stale_sec', 0.5)
         self.declare_parameter('visual_min_contour_area', 800.0)
@@ -622,6 +678,11 @@ class FixedJointPickPlace(Node):
         # reversing blindly is what drove the round32 base 0.03 m *deeper* into
         # the wall it was already trapped against.
         self._scan = None
+        # When this node last received a sweep, on the monotonic clock. Falls
+        # back to it when the node clock and the scan stamp are on different
+        # bases - see _yield_scan_points.
+        self._scan_received_at = None
+        self._clock_mismatch_reported = False
         # Nominal costmap geometry for the stage in progress, plus whether a
         # temporary dead-zone escape has shrunk it.
         self._nominal_geometry = None
@@ -629,6 +690,85 @@ class FixedJointPickPlace(Node):
         self._scan_sub = self.create_subscription(
             LaserScan, str(self.get_parameter('scan_topic').value),
             self._scan_callback, qos_profile_sensor_data
+        )
+        # Patrol centre lines, learned from the moving-obstacle node. Empty
+        # list = unknown = the pre-lane behaviour, which is the safe fallback.
+        self._patrol_segments = []
+        patrols_qos = QoSProfile(depth=1)
+        patrols_qos.reliability = ReliabilityPolicy.RELIABLE
+        patrols_qos.durability = DurabilityPolicy.TRANSIENT_LOCAL
+        self.create_subscription(
+            String, str(self.get_parameter('mover_patrols_topic').value),
+            self._patrols_callback, patrols_qos
+        )
+        # Predictive yielding. The tracker and policy live in obstacle_yield.py
+        # so the decision rule can be unit-tested without ROS; this node only
+        # supplies observations and owns the two actuators the policy has
+        # (the controller's speed limit, and a lateral arc waypoint).
+        self._yield_config = obstacle_yield.YieldConfig(
+            enabled=bool(self.get_parameter('enable_obstacle_yield').value),
+            half_width_m=float(self.get_parameter('yield_half_width_m').value),
+            obstacle_half_width_m=float(
+                self.get_parameter('yield_obstacle_half_width_m').value),
+            detection_range_m=float(
+                self.get_parameter('yield_detection_range_m').value),
+            track_range_m=float(self.get_parameter('yield_track_range_m').value),
+            cap_range_m=float(self.get_parameter('yield_cap_range_m').value),
+            stop_range_m=float(self.get_parameter('yield_stop_range_m').value),
+            cap_speed_mps=float(
+                self.get_parameter('yield_cap_speed_mps').value),
+            resume_speed_mps=float(
+                self.get_parameter('yield_resume_speed_mps').value),
+            min_mover_speed_mps=float(
+                self.get_parameter('yield_min_mover_speed_mps').value),
+            max_mover_speed_mps=float(
+                self.get_parameter('yield_max_mover_speed_mps').value),
+            clear_margin_sec=float(
+                self.get_parameter('yield_clear_margin_sec').value),
+            wait_budget_sec=float(
+                self.get_parameter('yield_wait_budget_sec').value),
+            arc_offset_m=float(self.get_parameter('yield_arc_offset_m').value),
+            arc_apex_m=float(self.get_parameter('yield_arc_apex_m').value),
+            arc_goal_radius_m=float(
+                self.get_parameter('yield_arc_goal_radius_m').value),
+        )
+        self._yield_tracker = obstacle_yield.YieldTracker(self._yield_config)
+        self._yield_decision = obstacle_yield.YieldDecision(
+            obstacle_yield.ACTION_GO, obstacle_yield.REASON_CLEAR
+        )
+        self._yield_latched = False
+        self._yield_wait_since = None
+        self._yield_clear_since = None
+        self._yield_arc_attempts = 0
+        self._yield_arc_goal = None
+        self._yield_arc_used = False
+        self._yield_suppress = False
+        # True while Nav2's goal is cancelled for a deliberate mover hold. The
+        # speed limit alone stops the base but NOT its rotation (measured
+        # 2026-10-13: ~1.5 rad/s while "held"), so the hold takes the goal away
+        # and stops both axes itself.
+        self._yield_pause_active = False
+        # One obstacle episode: started by a hold, ended only by real progress
+        # (see _update_yield_episode). The wait budget is spent against this,
+        # not against an individual hold.
+        self._yield_episode_since = None
+        self._yield_episode_anchor = None
+        self._yield_free_since = None
+        self._yield_last_update = 0.0
+        self._yield_last_log = 0.0
+        # The decision log only fires on a non-GO action, so "nothing in the log"
+        # cannot be told apart from "the tracker never produced a track". This
+        # rate-limited diagnostic closes that gap the first time it is asked.
+        self._yield_diag_last = 0.0
+        self._yield_diag_period = float(
+            self.get_parameter('yield_diag_period_sec').value)
+        # Mover positions to exclude from the room estimate: a box must not be
+        # mistaken for the wall the base would be squeezing past.
+        self._yield_excluded = []
+        self._odom = None
+        self._odom_sub = self.create_subscription(
+            Odometry, str(self.get_parameter('odom_topic').value),
+            self._odom_callback, 20
         )
         self._vision_state_pub = self.create_publisher(
             String, '/competition/vision_alignment', 10
@@ -1893,6 +2033,48 @@ class FixedJointPickPlace(Node):
             )
         self._stop_base()
 
+    def _hold_until_clear(self, label, x, y, deadline) -> bool:
+        """Stand still until the yield policy releases a mover hold.
+
+        Runs with Nav2's goal already cancelled, so the controller publishes
+        nothing and the zero Twist this loop sends to the smoother's input is
+        the only command: BOTH axes stop, which is the part a Nav2 speed limit
+        cannot do. Returns True when the corridor cleared inside the leg's own
+        deadline, False when the leg should be failed instead.
+        """
+        self._yield_pause_active = True
+        self.get_logger().warning(f'{label}: holding still for a moving obstacle.')
+        try:
+            while (rclpy.ok() and self._yield_decision.holds
+                    and time.monotonic() < deadline):
+                self._stop_base()
+                rclpy.spin_once(self, timeout_sec=0.1)
+                self._tick_yield(self._cached_planar_distance_to_point(x, y))
+        finally:
+            self._yield_pause_active = False
+        return not self._yield_decision.holds
+
+    def _resume_nav_goal(self, label, goal, response_timeout):
+        """Re-send a leg's own goal after a yield pause.
+
+        Returns ``(goal_handle, result_future)`` or None when Nav2 refuses the
+        goal, in which case the caller fails the leg and the ordinary retry
+        loop takes over. The pose is identical to the original goal, so a
+        resume is the same leg continuing from where the base stands.
+        """
+        goal_handle = self._send_goal_tolerant(
+            label, self._navigate_client, goal, response_timeout, 5.0
+        )
+        if goal_handle is None or not goal_handle.accepted:
+            self.get_logger().error(
+                f'Nav2 did not accept the resumed {label} goal; failing the leg.'
+            )
+            return None
+        self.get_logger().warning(
+            f'{label}: mover hold clear; resuming the navigation goal.'
+        )
+        return goal_handle, goal_handle.get_result_async()
+
     def _navigate_once__timed(
         self,
         label: str,
@@ -1974,7 +2156,51 @@ class FixedJointPickPlace(Node):
         motion_since = None
         while rclpy.ok() and not result_future.done() and time.monotonic() < deadline:
             rclpy.spin_once(self, timeout_sec=0.1)
-            self._apply_slow_zones()
+            # The yield policy subsumes the slow-zone cap (it merges both and
+            # publishes the lower one), so it replaces the old call here rather
+            # than following it, which would publish twice per tick.
+            self._tick_yield(self._cached_planar_distance_to_point(x, y))
+            if self._yield_decision.holds and not self._yield_suppress:
+                # A deliberate mover hold must not be driven by Nav2, and it must
+                # not end the leg either. The speed limit alone stops the base
+                # but NOT its rotation (measured 2026-10-13: ~1.5 rad/s while
+                # "held", which is what the operator saw as circling), so cancel
+                # the goal and wait it out in a nested loop - the loop below
+                # would otherwise see the cancelled future and fall straight
+                # through to the jam escape, which moved the base 0.70 m
+                # backwards on every single hold of that round.
+                self._release_nav_control(
+                    label, goal_handle, result_future,
+                    min(5.0, response_timeout),
+                )
+                if not self._hold_until_clear(label, x, y, deadline):
+                    return False
+                if self._yield_arc_goal is not None:
+                    # The episode budget can expire inside the hold loop. Nav2
+                    # is already cancelled; hand the pending arc to _navigate_to
+                    # instead of resuming a goal just to cancel it immediately.
+                    self.get_logger().warning(
+                        f'{label}: mover hold budget spent; taking the yield arc.'
+                    )
+                    return False
+                resumed = self._resume_nav_goal(label, goal, response_timeout)
+                if resumed is None:
+                    return False
+                goal_handle, result_future = resumed
+                continue
+            if self._yield_arc_goal is not None:
+                # Do not wait for the ordinary no-motion watchdog: it can run
+                # the jam/back-off recovery while a mover occupies this lane.
+                self.get_logger().warning(
+                    f'{label}: yield arc pending; releasing Nav2 without jam recovery.'
+                )
+                # A confirmed cancel resets the progress checker for the next
+                # goal; an unconfirmed one raises NAV_STATE_UNKNOWN.
+                self._release_nav_control(
+                    label, goal_handle, result_future,
+                    min(5.0, response_timeout),
+                )
+                return False
             self._log_carried_cube_state(label)
             if nomotion_timeout > 0.0:
                 # "The base has not moved at all", straight from its position -
@@ -1993,6 +2219,7 @@ class FixedJointPickPlace(Node):
                         motion_since = now
                     elif (
                         self._wedge_enabled
+                        and not self._yield_latched
                         and motion_since is not None
                         and now - motion_since > float(self.get_parameter(
                             'wedge_collision_timeout_sec').value)
@@ -2279,8 +2506,19 @@ class FixedJointPickPlace(Node):
             self.get_logger().error(f'Navigation to {label} failed; status={status}.')
         return success
 
+    def _patrols_callback(self, msg: String) -> None:
+        """Remember the boxes' lanes so a hold is never taken inside one."""
+        segments = obstacle_yield.parse_patrol_segments(msg.data)
+        if segments and segments != self._patrol_segments:
+            self._patrol_segments = segments
+            self.get_logger().warning(
+                f'Learned {len(segments)} moving-obstacle lane(s); the base will '
+                'not park inside one.'
+            )
+
     def _scan_callback(self, msg: LaserScan) -> None:
         self._scan = msg
+        self._scan_received_at = time.monotonic()
 
     def _clearer_axis(self) -> float:
         """+1.0 when the front half-plane is clearer than the rear, else -1.0.
@@ -2441,7 +2679,7 @@ class FixedJointPickPlace(Node):
         zones = []
         if len(raw) < 4:
             # Includes the [0.0] "off" sentinel and an absent parameter.
-            return []
+            raw = []
         if len(raw) % 4 != 0:
             raise RuntimeError(
                 f'slow_zones needs groups of 4 (x, y, radius_m, speed_mps); '
@@ -2455,10 +2693,14 @@ class FixedJointPickPlace(Node):
                     f'>0 and speed in (0, 1.5], got radius={radius} speed={speed}'
                 )
             zones.append((x, y, radius, speed))
-        if zones:
+        # Yield also uses this channel. Without this condition, an enabled
+        # policy with no slow zones would claim to hold while publishing NO
+        # speed-limit message at all.
+        if zones or bool(self.get_parameter('enable_obstacle_yield').value):
             self._speed_limit_pub = self.create_publisher(
                 SpeedLimit, 'speed_limit', 10
             )
+        if zones:
             self.get_logger().warning(
                 f'{len(zones)} slow zone(s) configured; the base will be capped '
                 'while inside them.'
@@ -2580,6 +2822,53 @@ class FixedJointPickPlace(Node):
                 f'TIMING {label} {time.monotonic() - started:.3f}'
             )
 
+    def _publish_speed_limit(self, limit: float, reason: str = '') -> None:
+        """Send a speed cap to the controller, publishing only on change.
+
+        Publishing only on change is not an optimisation: the controller server
+        logs every limit it receives, and a 10 Hz stream of identical caps buries
+        the round record it is supposed to explain.
+        """
+        if self._speed_limit_pub is None or limit == self._active_speed_limit:
+            return
+        message = SpeedLimit()
+        message.header.stamp = self.get_clock().now().to_msg()
+        message.percentage = False
+        message.speed_limit = limit
+        self._speed_limit_pub.publish(message)
+        previous = self._active_speed_limit
+        self._active_speed_limit = limit
+        if reason:
+            position = self._cached_base_position()
+            where = ('' if position is None
+                     else f' near ({position[0]:.2f}, {position[1]:.2f})')
+            self.get_logger().warning(
+                f'{reason}: speed limit {previous:.2f} -> {limit:.2f} m/s{where}.'
+            )
+
+    def _slow_zone_limit(self) -> float:
+        """Speed cap demanded by the configured tight passages, 0.0 for none.
+
+        The cap applies ``slow_zone_brake_ahead_m`` *before* the boundary, not
+        only inside it. Measured 2026-10-13 (run_logs/full_round_yield_20261013-195911):
+        the base entered a tight passage at the full 1.5 m/s, the cap only bit
+        1.2 s later, and the stop distance (0.45 m braking + 0.45 m of control
+        latency) was about the distance left to the wall - the base hit it and
+        was thrown at 3.3 m/s, failing the round on the first delivery.
+        """
+        if not self._slow_zones:
+            return 0.0
+        position = self._cached_base_position()
+        if position is None:
+            return 0.0
+        lookahead = float(self.get_parameter('slow_zone_brake_ahead_m').value)
+        limit = 0.0
+        for x, y, radius, speed in self._slow_zones:
+            distance = math.hypot(position[0] - x, position[1] - y) - radius
+            if distance <= lookahead:
+                limit = speed if limit == 0.0 else min(limit, speed)
+        return limit
+
     def _apply_slow_zones(self) -> None:
         """Cap the controller's speed while the base is inside a tight passage.
 
@@ -2601,31 +2890,12 @@ class FixedJointPickPlace(Node):
         inside, costing 45 s (run_logs/speed_rpp15_combined_trial5_20261010-173315).
         Slow down there and the passage costs seconds instead.
         """
-        if self._speed_limit_pub is None or not self._slow_zones:
-            return
-        position = self._cached_base_position()
-        if position is None:
-            return
-        limit = 0.0
-        for x, y, radius, speed in self._slow_zones:
-            if math.hypot(position[0] - x, position[1] - y) <= radius:
-                limit = speed if limit == 0.0 else min(limit, speed)
-        if limit == self._active_speed_limit:
-            return
-        message = SpeedLimit()
-        message.header.stamp = self.get_clock().now().to_msg()
-        message.percentage = False
-        message.speed_limit = limit
-        self._speed_limit_pub.publish(message)
-        self._active_speed_limit = limit
-        if limit > 0.0:
-            self.get_logger().warning(
-                f'Slow zone: capping the base to {limit:.2f} m/s near '
-                f'({position[0]:.2f}, {position[1]:.2f}).'
-            )
+        limit = self._slow_zone_limit()
+        self._publish_speed_limit(limit, 'Slow zone' if limit > 0.0 else '')
 
     def _clear_speed_limit(self) -> None:
         """Always hand the controller back its own speed limit."""
+        self._reset_yield_state()
         if self._speed_limit_pub is None or self._active_speed_limit == 0.0:
             return
         message = SpeedLimit()
@@ -2635,6 +2905,420 @@ class FixedJointPickPlace(Node):
         self._speed_limit_pub.publish(message)
         self._active_speed_limit = 0.0
 
+    def _odom_callback(self, msg: Odometry) -> None:
+        self._odom = msg
+
+    def _yield_base_motion(self) -> tuple[float, float, float, float, float]:
+        """(vx, vy, wz, position x, position y) in the odom frame.
+
+        Ground-truth pose is used for the base position rather than the odom
+        message for consistency with every other decision in this node, but the
+        *velocity* comes from odometry because Gazebo's link states carry no
+        twist and differencing them amplifies the link-state publish jitter.
+        """
+        pose = self._base_pose()
+        if pose is None or self._odom is None:
+            return 0.0, 0.0, 0.0, math.nan, math.nan
+        twist = self._odom.twist.twist
+        return twist.linear.x, twist.linear.y, twist.angular.z, pose[0], pose[1]
+
+    def _yield_scan_points(self, yaw: float):
+        """Latest sweep as base-frame (x, y, range), or None when unusable.
+
+        Points belonging to a tracked mover are returned separately so the room
+        estimate can ignore them: a box crossing on the left is not the wall the
+        base would be squeezing past if it took the arc.
+        """
+        scan = self._scan
+        if scan is None:
+            return None, []
+        if scan.range_max < 0.5 or scan.angle_increment == 0.0:
+            return None, []
+        now = self._clock_seconds()
+        stamp = float(scan.header.stamp.sec) + float(scan.header.stamp.nanosec) * 1e-9
+        # An unstamped sweep must not be treated as a fresh measurement.
+        age = max(0.0, now - stamp) if stamp > 0.0 else math.inf
+        if age > CLOCK_MISMATCH_SEC:
+            # The node clock and the sweep are on different bases (this node was
+            # started with use_sim_time false while the sweep carries Gazebo's
+            # simulation time, or the reverse). Measured 2026-10-13: the age read
+            # 1791884787 s, every tick took the "stale scan" exit, and the yield
+            # policy was completely inert for a whole round WITHOUT ONE LOG LINE.
+            # The question the guard below actually asks is "has this node heard
+            # a sweep recently", so answer that with the monotonic receipt time
+            # and say loudly what happened instead of failing silently.
+            if not self._clock_mismatch_reported:
+                self._clock_mismatch_reported = True
+                self.get_logger().error(
+                    f'Clock mismatch: sweep stamp {stamp:.3f} is '
+                    f'{age:.0f} s from this node\'s clock {now:.3f}; using the '
+                    'monotonic receipt age instead. Check use_sim_time on this '
+                    'node (every Nav2 node in this stack has it true).'
+                )
+            age = (math.inf if self._scan_received_at is None
+                   else max(0.0, time.monotonic() - self._scan_received_at))
+        points = []
+        for index, value in enumerate(scan.ranges):
+            if not math.isfinite(value):
+                continue
+            if value < scan.range_min or value > scan.range_max:
+                continue
+            angle = scan.angle_min + index * scan.angle_increment
+            points.append((value * math.cos(angle), value * math.sin(angle), value))
+        return age, points
+
+    def _yield_room(self, points, excluded) -> tuple[float | None, float | None]:
+        """Lateral room beside the current path, (left, right), from the scan.
+
+        Deliberately measured from the *lidar* rather than the costmap: the
+        local costmap is inflated for planning (0.36 m) and carries the movers
+        themselves, so reading it would report the box as the wall. Sectors are
+        sampled 60 deg either side of the beam, and the reported room is the
+        perpendicular component `min_range * cos(30 deg)`, i.e. how far the base
+        could move sideways before its own radius touches what is there.
+        """
+        half_width = math.radians(30.0)
+        centres = {'left': math.radians(75.0), 'right': math.radians(-75.0)}
+        room = {}
+        for name, centre in centres.items():
+            best = None
+            for x, y, rng in points:
+                angle = math.atan2(y, x)
+                if abs(angle - centre) > half_width:
+                    continue
+                if any(math.hypot(x - ex, y - ey) < self._yield_config.obstacle_half_width_m * 2.0
+                       for ex, ey in excluded):
+                    continue
+                best = rng if best is None else min(best, rng)
+            if best is None:
+                room[name] = None
+            else:
+                room[name] = max(0.0, best * math.cos(half_width) - 0.2)
+        return room['left'], room['right']
+
+    def _yield_step(self, distance_to_goal_m: float | None):
+        """One policy tick. Returns (decision, latched, arc goal in map frame)."""
+        motion_vx, motion_vy, wz, base_x, base_y = self._yield_base_motion()
+        pose = self._base_pose()
+        yaw = pose[2] if pose is not None else math.nan
+        age, points = self._yield_scan_points(yaw)
+        if (points is None or not self._yield_config.enabled
+                or age > self._yield_config.track_timeout_sec
+                or not all(math.isfinite(v) for v in (base_x, base_y, yaw))):
+            # Losing a scan during a hold must NOT publish the 0.0 'release'
+            # sentinel immediately: that would restore full cruise on no new
+            # evidence. Continue holding only within the same finite budget;
+            # once exhausted, hand control back to Nav2's collision checking.
+            elapsed = (time.monotonic() - self._yield_wait_since
+                       if self._yield_wait_since is not None else 0.0)
+            self._yield_diag(age if age is not None else -1.0,
+                             [] if points is None else points, [], [], None,
+                             obstacle_yield.YieldDecision(
+                                 obstacle_yield.ACTION_GO,
+                                 obstacle_yield.REASON_CLEAR,
+                                 detail='no fresh pose/scan'),
+                             time.monotonic())
+            if (self._yield_config.enabled and self._yield_latched
+                    and elapsed < self._yield_config.wait_budget_sec):
+                return (obstacle_yield.YieldDecision(
+                    obstacle_yield.ACTION_STOP, obstacle_yield.REASON_WAIT,
+                    wait_elapsed_sec=elapsed, detail='awaiting fresh pose/scan'
+                ), True, None)
+            return (obstacle_yield.YieldDecision(
+                obstacle_yield.ACTION_GO, obstacle_yield.REASON_CLEAR,
+                detail='no fresh pose/scan'), False, None)
+
+        # Tracking every laser return makes a wall fragment the nearest 'box'
+        # and can associate opposite ends of one obstacle across frames. Track
+        # compact connected components instead; each becomes one centroid.
+        # Only returns inside the tracking range are clustered: beyond it the
+        # lidar's 1 deg spacing exceeds the cluster gap, so a distant wall
+        # shatters into hundreds of tiny "box-like" clusters - measured
+        # 2026-10-13 as 17-41 box-like clusters per sweep in a room holding
+        # three boxes, and the noise tracks they created were what the policy
+        # then reacted to.
+        clusters = obstacle_yield.cluster_points(
+            [(math.atan2(y, x), rng) for x, y, rng in points
+             if rng <= self._yield_config.track_range_m])
+        boxes = obstacle_yield.box_like_clusters(clusters)
+        centroids = [(
+            sum(r * math.cos(a) for a, r in c) / len(c),
+            sum(r * math.sin(a) for a, r in c) / len(c),
+        ) for c in boxes]
+        now = time.monotonic()
+        self._yield_tracker.update(
+            centroids, now, (base_x, base_y, yaw, motion_vx, motion_vy, wz))
+        track = self._yield_tracker.nearest(
+            now, (base_x, base_y, yaw, motion_vx, motion_vy, wz),
+            min_world_speed=self._yield_config.min_mover_speed_mps)
+        excluded = [] if track is None else [
+            (track['base_x'], track['base_y'])]
+        left_room, right_room = self._yield_room(points, excluded)
+
+        # The budget is spent against the whole EPISODE, not against the current
+        # hold. A box whose lane the base is standing in re-enters the corridor
+        # every few seconds, so each individual hold is short and the per-hold
+        # timer never reaches the budget - measured 2026-10-13 the base sat
+        # 0.30 m from mover_3's segment for 18 s of zero motion (98 controller
+        # refusals) through 30 alternating hold/resume cycles, and the lateral
+        # escape never fired because no single hold lasted 20 s.
+        wait_elapsed = self._yield_episode_elapsed(now)
+        if track is None:
+            obs = None
+        else:
+            obs = obstacle_yield.YieldObservation(
+                box_x=track['base_x'], box_y=track['base_y'],
+                box_vx=track['rel_vx'], box_vy=track['rel_vy'],
+                vx=motion_vx, wz=wz,
+                left_room_m=left_room, right_room_m=right_room,
+                distance_to_goal_m=distance_to_goal_m,
+                scan_age_sec=age,
+                box_world_speed_mps=track['world_speed'],
+                latched=self._yield_latched,
+                lane_distance_m=obstacle_yield.distance_to_lane(
+                    base_x, base_y, self._patrol_segments),
+                # A patrol box reverses at its endpoints; its measured velocity
+                # says "leaving" right up to the turn (measured 2026-10-13).
+                lane_end_distance_m=obstacle_yield.distance_to_lane_end(
+                    track['x'], track['y'], self._patrol_segments),
+                lane_end_closing=obstacle_yield.closing_on_lane_end(
+                    track['x'], track['y'], track['vx'], track['vy'],
+                    self._patrol_segments),
+            )
+        decision = obstacle_yield.decide(
+            obs, self._yield_config,
+            wait_elapsed_sec=wait_elapsed,
+            arc_attempts=self._yield_arc_attempts,
+        )
+        self._yield_diag(age, points, clusters, boxes, track, decision, now)
+        latched = decision.action == obstacle_yield.ACTION_STOP
+        arc_goal = None
+        if decision.action == obstacle_yield.ACTION_ARC and decision.arc_x is not None:
+            static_returns = [
+                (x, y) for x, y, _ in points
+                if not any(math.hypot(x - ex, y - ey) <= 0.22
+                           for ex, ey in excluded)
+            ]
+            if obstacle_yield.arc_scan_clear(
+                static_returns, decision.arc_x, decision.arc_y,
+                radius_m=self._yield_config.base_half_width_m + 0.05,
+            ):
+                arc_goal = (
+                    base_x + math.cos(yaw) * decision.arc_x
+                    - math.sin(yaw) * decision.arc_y,
+                    base_y + math.sin(yaw) * decision.arc_x
+                    + math.cos(yaw) * decision.arc_y,
+                )
+            else:
+                decision = obstacle_yield.YieldDecision(
+                    obstacle_yield.ACTION_GO,
+                    obstacle_yield.REASON_WAIT_EXPIRED,
+                    detail='arc approach blocked or unobserved by lidar',
+                )
+        if self._yield_config.enabled and decision.action != obstacle_yield.ACTION_GO:
+            self._yield_log_decision(decision, obs)
+        return decision, latched, arc_goal
+
+    def _yield_diag(self, age, points, clusters, boxes, track, decision,
+                    now) -> None:
+        """One rate-limited line telling the tracker apart from the policy.
+
+        2026-10-13: a full round with `enable_obstacle_yield=True` logged no
+        YIELD line at all, but the decision log only fires on a non-GO action -
+        so "the policy said go" and "the tracker never produced a track" looked
+        identical. This line carries the counts that separate them: raw returns,
+        clusters, box-like clusters, and whether a track cleared the mover-speed
+        gate. Logging only; it commands nothing.
+        """
+        if (self._yield_diag_period <= 0.0
+                or not self._yield_config.enabled        # off means off, silently
+                or now - self._yield_diag_last < self._yield_diag_period):
+            return
+        self._yield_diag_last = now
+        if track is None:
+            detail = (f'scan_age={age:.2f} points={len(points)} '
+                      f'clusters={len(clusters)} box_like={len(boxes)} track=None')
+        else:
+            detail = (f'scan_age={age:.2f} points={len(points)} '
+                      f'clusters={len(clusters)} box_like={len(boxes)} '
+                      f'track=({track["base_x"]:+.2f},{track["base_y"]:+.2f}) '
+                      f'rel=({track["rel_vx"]:+.2f},{track["rel_vy"]:+.2f}) '
+                      f'world={track["world_speed"]:.2f} life={track["life"]:.1f}')
+        self.get_logger().warning(
+            f'YIELD_DIAG {detail} decision={decision.action}'
+            f'/{decision.reason}')
+
+    def _yield_log_decision(self, decision, obs) -> None:
+        """Rate-limited yield logging, in a shape the round record can grep."""
+        now = time.monotonic()
+        if now - self._yield_last_log < 1.0:
+            return
+        self._yield_last_log = now
+        box = 'n/a' if obs is None else (
+            f'({obs.box_x:+.2f},{obs.box_y:+.2f}) v=({obs.box_vx:+.2f},'
+            f'{obs.box_vy:+.2f}) world={obs.box_world_speed_mps}'
+        )
+        self.get_logger().warning(
+            f'YIELD {decision.action} ({decision.reason}) box {box} '
+            f'wait={decision.wait_elapsed_sec:.1f}s: {decision.detail}'
+        )
+
+    def _clock_seconds(self) -> float:
+        """The same clock the scan stamps use (sim time under Gazebo)."""
+        return self.get_clock().now().nanoseconds * 1e-9
+
+    def _yield_episode_elapsed(self, now: float) -> float:
+        """Seconds spent in the current yield episode (0.0 when there is none)."""
+        if self._yield_episode_since is None:
+            return 0.0
+        return max(0.0, now - self._yield_episode_since)
+
+    def _update_yield_episode(self, now: float, latched: bool) -> None:
+        """Track one obstacle episode, ended by real progress - not by a lull.
+
+        A box whose lane the base is standing in leaves the corridor and comes
+        back every few seconds, so the base alternates hold/resume indefinitely
+        while its per-hold timer keeps restarting. Measured 2026-10-13: 30 such
+        cycles, 18 s of frozen base (98 controller refusals) parked 0.30 m from
+        mover_3's patrol segment, and the lateral escape never fired because no
+        single hold ever reached the 20 s budget. The episode therefore ends
+        only when the base has actually got somewhere: ``episode_reset_progress_m``
+        of travel since the hold that started it.
+        """
+        position = self._cached_base_position()
+        if not latched:
+            if self._yield_episode_since is not None:
+                if self._yield_free_since is None:
+                    self._yield_free_since = now
+                elif now - self._yield_free_since >= self._yield_config.episode_clear_sec:
+                    self._yield_episode_since = None
+                    self._yield_episode_anchor = None
+                    self._yield_free_since = None
+        else:
+            self._yield_free_since = None
+        if (self._yield_episode_since is not None
+                and position is not None and self._yield_episode_anchor is not None):
+            moved = math.hypot(position[0] - self._yield_episode_anchor[0],
+                               position[1] - self._yield_episode_anchor[1])
+            if moved >= self._yield_config.episode_reset_progress_m:
+                self._yield_episode_since = None
+                self._yield_episode_anchor = None
+        if latched and self._yield_episode_since is None:
+            self._yield_episode_since = now
+            self._yield_episode_anchor = position
+
+    def _tick_yield(self, distance_to_goal_m: float | None = None) -> None:
+        """Run the yield policy and apply its speed decision to the controller.
+
+        Both speed sources are merged rather than fought over: the tight-passage
+        cap and the yield cap are each conservative, so the lower one wins.
+        """
+        if self._yield_suppress:
+            self._apply_slow_zones()
+            return
+        now = time.monotonic()
+        period = float(self.get_parameter('yield_update_period_sec').value)
+        if now - self._yield_last_update < period:
+            return
+        self._yield_last_update = now
+        decision, latched, arc_goal = self._yield_step(distance_to_goal_m)
+        # A single unmatched scan is not evidence that the crossing is clear.
+        # Keep the cap until it has been clear for a short, continuous window,
+        # but never extend the overall 20 s budget for a missing sensor.
+        if (self._yield_latched and decision.action == obstacle_yield.ACTION_GO
+                and decision.reason != obstacle_yield.REASON_WAIT_EXPIRED
+                and self._yield_wait_since is not None
+                and now - self._yield_wait_since < self._yield_config.wait_budget_sec):
+            if self._yield_clear_since is None:
+                self._yield_clear_since = now
+            if now - self._yield_clear_since < self._yield_config.clear_hold_sec:
+                decision = obstacle_yield.YieldDecision(
+                    obstacle_yield.ACTION_STOP, obstacle_yield.REASON_WAIT,
+                    detail='confirming clear corridor',
+                )
+                latched = True
+        else:
+            self._yield_clear_since = None
+        self._yield_decision = decision
+        self._update_yield_episode(now, latched)
+        if latched:
+            if self._yield_wait_since is None:
+                self._yield_wait_since = now
+        elif decision.action == obstacle_yield.ACTION_ARC:
+            self._yield_wait_since = None
+            # One outstanding arc at a time, and a hard ceiling per leg: the
+            # arc is consumed by the retry loop, and this flag is what keeps the
+            # loop from consuming a fresh one before the previous has been driven.
+            if (arc_goal is not None and self._yield_arc_goal is None
+                    and not self._yield_arc_used
+                    and self._yield_arc_attempts < self._yield_config.max_arc_attempts):
+                self._yield_arc_goal = arc_goal
+        else:
+            self._yield_wait_since = None
+        self._yield_latched = latched
+
+        limit = self._slow_zone_limit()
+        reason = 'Slow zone'
+        if decision.action == obstacle_yield.ACTION_CAP:
+            if limit == 0.0 or decision.speed_mps < limit:
+                limit = decision.speed_mps
+                reason = 'Yield cap'
+        elif decision.action in (
+            obstacle_yield.ACTION_STOP, obstacle_yield.ACTION_ARC
+        ):
+            # Keep the hold in force while the arc is being queued and the
+            # original Nav2 goal is being canceled. Only release it after
+            # cancellation is confirmed and the detour goal is ready.
+            # A stop must NOT be sent as 0.0. In this Nav2 version
+            # `speed_limit = 0.0` is `nav2_costmap_2d::NO_SPEED_LIMIT`, i.e.
+            # "clear the cap and restore the controller's own
+            # desired_linear_vel" - measured against the installed binary:
+            # nav2_regulated_pure_pursuit_controller 1.1.20 `setSpeedLimit`
+            # compares against 0.0 and copies `base_desired_linear_vel_` (1.5
+            # m/s here) when it matches. Sending 0.0 to hold would therefore
+            # make the base accelerate. The limit is applied as
+            # `clamp(|linear_vel|, 0, desired_linear_vel_)` *after* RPP's
+            # min-speed floors, so a small non-zero value really does bind.
+            limit = YIELD_STOP_SPEED_LIMIT
+            reason = 'Yield hold'
+        self._publish_speed_limit(limit, reason if limit > 0.0 else '')
+
+    def _pending_yield_arc(self):
+        """Take the pending yield arc waypoint, if the policy asked for one.
+
+        Consuming it here (rather than only reading it) is what makes the retry
+        loop terminate: each arc is driven once, and the per-leg ceiling in
+        ``_yield_arc_attempts`` stops a moving obstacle from being chased around
+        the map one offset at a time.
+        """
+        arc = self._yield_arc_goal
+        if arc is None:
+            return None
+        self._yield_arc_goal = None
+        self._yield_arc_attempts += 1
+        return arc
+
+    def _reset_yield_state(self) -> None:
+        """Forget the yield episode. Called when a navigation leg ends.
+
+        The policy is deliberately amnesiac across legs: a wait budget that
+        survived into the next leg would let a second obstacle inherit the first
+        one's spent patience.
+        """
+        self._yield_latched = False
+        self._yield_wait_since = None
+        self._yield_clear_since = None
+        self._yield_arc_attempts = 0
+        self._yield_arc_goal = None
+        self._yield_arc_used = False
+        self._yield_pause_active = False
+        self._yield_episode_since = None
+        self._yield_episode_anchor = None
+        self._yield_free_since = None
+        self._yield_decision = obstacle_yield.YieldDecision(
+            obstacle_yield.ACTION_GO, obstacle_yield.REASON_CLEAR
+        )
+
     def _navigate_to(
         self,
         label: str,
@@ -2643,15 +3327,55 @@ class FixedJointPickPlace(Node):
         completion_radius_m: float | None = None,
     ) -> bool:
         attempts = max(1, int(self.get_parameter('navigation_retry_count').value) + 1)
+        # A canceled goal followed by one yield waypoint must still get a
+        # chance to retry the original goal, even when retries are disabled.
+        if self._yield_config.enabled:
+            attempts += 1
         self._log_cube_positions(f'before:{label}')
         try:
             for attempt in range(1, attempts + 1):
+                # A yield arc is not a failure: the leg was abandoned because a
+                # moving obstacle owned the lane, not because the base was
+                # wedged. Drive the lateral waypoint the policy picked, then
+                # retry the same goal WITHOUT the dead-zone escape and jam break
+                # below, which would shove a perfectly healthy base backwards
+                # through the obstacle it just avoided.
+                arc = self._pending_yield_arc()
+                if arc is not None:
+                    self.get_logger().warning(
+                        f'{label}: yielding around a moving obstacle via '
+                        f'({arc[0]:.2f}, {arc[1]:.2f}) before retrying.'
+                    )
+                    self._yield_arc_used = True
+                    # The old goal has been canceled. Lift the near-zero hold
+                    # before driving the lateral goal, and do not re-enter the
+                    # same yield episode while that waypoint is active.
+                    self._yield_suppress = True
+                    try:
+                        self._apply_slow_zones()
+                        arc_ok = self._navigate_once(
+                            f'{label} yield arc',
+                            (arc[0], arc[1], values[2]), None,
+                            float(self.get_parameter(
+                                'yield_arc_goal_radius_m').value),
+                        )
+                    finally:
+                        self._yield_suppress = False
+                    if not arc_ok or not self._clear_costmaps():
+                        return False
+                    continue
                 if self._navigate_once(
                     label, values, visual_handoff_cube, completion_radius_m
                 ):
                     self.get_logger().info(f'Navigation stage complete: {label}.')
                     time.sleep(float(self.get_parameter('settle_sec').value))
                     return True
+                if self._yield_arc_goal is not None:
+                    # This leg ended deliberately for a moving-obstacle waypoint,
+                    # not because the base is wedged. The next iteration consumes
+                    # the arc; never back off through the mover or shrink the
+                    # loaded footprint on this path.
+                    continue
                 if attempt < attempts:
                     self.get_logger().warning(
                         f'Retrying {label} navigation ({attempt}/{attempts - 1}) '
@@ -2890,10 +3614,19 @@ class FixedJointPickPlace(Node):
         research_after = float(
             self.get_parameter('visual_research_after_sec').value
         )
+        # Phase timing, logging only: the alignment costs 6.5-12 s per cube
+        # (40.6 s across a 5-object round, all of it inside the navigation
+        # states) and the loop's own gates give no clue which phase owns it.
+        search_started = time.monotonic()
+        search_total = 0.0
+        align_started = 0.0
+        stable_frames_used = 0
         while rclpy.ok() and time.monotonic() < deadline:
             if not search_until_visible():
                 break
+            search_total += time.monotonic() - search_started
             self._stop_base()
+            align_started = time.monotonic()
             # Phase 2: centre and approach.
             while rclpy.ok() and time.monotonic() < deadline:
                 # Consume one CAMERA frame per iteration, not "the next callback
@@ -2926,6 +3659,7 @@ class FixedJointPickPlace(Node):
                             f'{now - lost_since:.1f} s; restarting the search.'
                         )
                         lost_since = None
+                        search_started = time.monotonic()
                         break
                     continue
                 lost_since = None
@@ -2950,6 +3684,12 @@ class FixedJointPickPlace(Node):
                         # above bounds the loop, so this cannot hang.
                         if span <= span_limit or stable >= required * 3:
                             used_row = float(np.median(stable_rows))
+                            stable_frames_used = stable
+                            self.get_logger().info(
+                                f'VISALIGN search={search_total:.1f}s '
+                                f'align={time.monotonic() - align_started:.1f}s '
+                                f'stable={stable} frames'
+                            )
                             self.get_logger().info(
                                 f'Visual alignment complete: '
                                 f'centre_error={centre_error:.3f}, '
