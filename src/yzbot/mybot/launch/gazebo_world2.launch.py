@@ -148,6 +148,15 @@ def generate_launch_description():
     #     controllers -> the startup gate times out -> MoveIt/Nav2 never start
     #     -> /competition/system_ready stays false and the task queue waits in
     #     IDLE, which looks exactly like "the robot does not move".
+    #   * --service-call-timeout was 60 s, which made ONE lost response cost a
+    #     full minute: measured 2026-10-14 15:21, the gripper spawner's
+    #     list_controllers reply was dropped ("failed to send response ...
+    #     (timeout)") and the spawner then sat until 65.9 s before retrying
+    #     successfully at 66.2 s. It is 12 s now - a normal reply arrives in
+    #     well under 1 s (joint_state_broadcaster and arm_controller configure
+    #     and activate in 0.04-1.0 s each), and the in-process retry loop still
+    #     gives four attempts, so a genuinely dead controller_manager still ends
+    #     in the same loud failure.
     # So each spawner retries INSIDE its own process (see below); the retry
     # must never be a new launch action or the chain breaks.
     def controller_spawner(controller: str) -> ExecuteProcess:
@@ -170,7 +179,7 @@ def generate_launch_description():
         spawner = (
             f'ros2 run controller_manager spawner {controller} '
             '-c /controller_manager --controller-manager-timeout 120 '
-            '--service-call-timeout 60 --switch-timeout 60'
+            '--service-call-timeout 12 --switch-timeout 60'
         )
         script = (
             f'for attempt in 1 2 3 4; do '
@@ -231,6 +240,21 @@ def generate_launch_description():
             ),
         )
     )
+    # The GUI client is deliberately NOT started next to gzserver any more.
+    # Measured 2026-10-14 over 12 rounds: gzserver advertised /spawn_entity after
+    # 5.8 s in the fast rounds and after 34.1 s in the slow ones, and that single
+    # wait accounted for the whole startup difference (READY 24-27 s vs 48-100 s)
+    # because nothing else can start before the robot exists. gzclient renders
+    # the same world on the same host and competes with the loader for CPU and
+    # GPU, so it now starts once the robot is in the world.
+    evt_gui = RegisterEventHandler(
+        event_handler=OnProcessExit(
+            target_action=spawn_entity_cmd,
+            on_exit=lambda event, context: (
+                [start_gazebo_client] if event.returncode == 0 else []
+            ),
+        )
+    )
 
     # Gazebo 差速驱动插件已经发布 /odom 和 odom -> base_footprint。
     # 这里不再重复启动 EKF，避免依赖不存在的 config/ekf.yaml，
@@ -261,12 +285,12 @@ def generate_launch_description():
         description='Whether to start the Gazebo graphical client.',
     ))
     ld.add_action(start_gazebo_server)
-    ld.add_action(start_gazebo_client)
     ld.add_action(node_robot_state_publisher)
     ld.add_action(spawn_entity_cmd)
     ld.add_action(evt1)
     ld.add_action(evt2)
     ld.add_action(evt3)
     ld.add_action(evt4)
+    ld.add_action(evt_gui)
 
     return ld

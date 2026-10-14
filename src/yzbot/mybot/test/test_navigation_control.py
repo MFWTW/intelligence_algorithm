@@ -734,6 +734,36 @@ class ControllerSpawnerChainTests(unittest.TestCase):
         src = self.source()
         self.assertIn('return [] if action is None else [action]', src)
 
+    def test_the_gui_client_waits_for_the_robot_spawn(self):
+        """gzclient renders the same world and slows the loader down.
+
+        Measured 2026-10-14 over 12 rounds: gzserver advertised /spawn_entity
+        after 5.8 s in the fast rounds and 34.1 s in the slow ones, and that one
+        wait was the whole difference in startup (READY 24-27 s vs 48-100 s),
+        because no controller, MoveIt or Nav2 step can start before the robot
+        exists.
+        """
+        src = self.source()
+        self.assertIn('evt_gui', src)
+        self.assertIn('target_action=spawn_entity_cmd,\n            on_exit=lambda event, context: (\n                [start_gazebo_client]',
+                      src)
+        # It must NOT be started unconditionally beside gzserver any more.
+        self.assertNotIn('ld.add_action(start_gazebo_client)', src)
+
+    def test_a_lost_controller_manager_reply_costs_seconds_not_a_minute(self):
+        """One dropped DDS response must not burn a 60 s service timeout.
+
+        Measured 2026-10-14 15:21: the gripper spawner's list_controllers reply
+        was dropped ("failed to send response ... (timeout)") and the spawner sat
+        until 65.9 s before retrying; the world and Nav2 were already up by then.
+        """
+        src = self.source()
+        self.assertIn('--service-call-timeout 12', src)
+        self.assertNotIn('--service-call-timeout 60', src)
+        # The bounded retry ladder and the loud failure stay.
+        self.assertIn('for attempt in 1 2 3 4; do', src)
+        self.assertIn('FAILED after 4 attempts', src)
+
 
 class PlacementCheckOrderTests(unittest.TestCase):
     """The landing must be checked right after release, not 40 s later.
