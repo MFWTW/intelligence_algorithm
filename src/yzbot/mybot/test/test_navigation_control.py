@@ -1427,6 +1427,60 @@ class Nav2ActionClientRecoveryTests(unittest.TestCase):
         self.assertIn('_nav2_client_missing_since.clear()', src)
 
 
+class UnmatchedNav2NodeRestartTests(unittest.TestCase):
+    """A lifecycle service that never matches cannot be fixed by rebuilding.
+
+    Measured 2026-10-14 17:11 (run_logs/resume_remaining_20261014-171158):
+    smoother_server's GetState service stayed undiscovered through four client
+    rebuilds (61.9 s, 79.9 s, 97.9 s, 117.9 s), Nav2 could never activate,
+    /competition/system_ready stayed false and the task sat in IDLE. Two of the
+    last fourteen launches died that way, which is indistinguishable from "the
+    robot does not move".
+    """
+
+    def setUp(self):
+        import importlib.util
+        spec = importlib.util.spec_from_file_location(
+            'health_check_under_test', ROOT / 'scripts' / 'system_health_check.py')
+        self.module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(self.module)
+
+    def test_the_targeting_matches_the_node_and_not_the_manager(self):
+        matches = self.module.nav2_node_process_matches
+        node = ('/opt/ros/humble/lib/nav2_smoother/smoother_server '
+                '--ros-args -r __node:=smoother_server')
+        self.assertTrue(matches(node, 'smoother_server'))
+        # The lifecycle manager lists the node name in node_names:=[...]; killing
+        # it instead of the node would take the whole bringup down.
+        manager = ('/opt/ros/humble/lib/nav2_lifecycle_manager/lifecycle_manager '
+                   '--ros-args -p node_names:=[smoother_server,planner_server]')
+        self.assertFalse(matches(manager, 'smoother_server'))
+        self.assertFalse(matches(node, 'planner_server'))
+        self.assertFalse(matches('bash -c sleep 1000', 'smoother_server'))
+
+    def test_a_restart_is_bounded_and_never_happens_after_ready(self):
+        src = (ROOT / 'scripts' / 'system_health_check.py').read_text(
+            encoding='utf-8')
+        self.assertIn("declare_parameter('restart_unmatched_nav2_node', True)", src)
+        self.assertIn("declare_parameter('unmatched_rebuilds_before_restart', 3)",
+                      src)
+        # Once per node, and only before the stack was ever ready.
+        self.assertIn('not self._ever_ready', src)
+        self.assertIn('name not in self._restarted_nodes', src)
+        self.assertIn('self._restarted_nodes.add(name)', src)
+        # Readiness records that the robot may now be moving a cube.
+        self.assertIn('self._ever_ready = True', src)
+        # The restart must be a real termination with a fresh participant.
+        self.assertIn('signal.SIGTERM', src)
+        self.assertIn('os.kill(victim[0], signal.SIGTERM)', src)
+
+    def test_a_missing_process_fails_loudly_instead_of_looping(self):
+        src = (ROOT / 'scripts' / 'system_health_check.py').read_text(
+            encoding='utf-8')
+        self.assertIn('no matching ', src)
+        self.assertIn('needs a manual restart', src)
+
+
 class DashboardBridgeTests(unittest.TestCase):
     """The bridge must keep the problem AND the rules alive for late viewers.
 

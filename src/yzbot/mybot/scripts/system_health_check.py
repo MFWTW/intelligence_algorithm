@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 
 import json
+import os
+import signal
 import time
 
 import rclpy
@@ -31,6 +33,22 @@ NAV2_NODES = [
 ]
 
 
+def nav2_node_process_matches(cmdline: str, name: str) -> bool:
+    """Does this process command line belong to Nav2 node ``name``?
+
+    Module level so the restart watchdog's targeting is unit testable without
+    touching /proc. The ``__node:=`` form is what Nav2's launch writes for the
+    node itself; the ``lib/nav2_*`` path is the executable. A lifecycle
+    manager's ``-p node_names:=[...]`` list mentions the name without either, and
+    matching it would kill the manager instead of the node.
+    """
+    if '--ros-args' not in cmdline:
+        return False
+    if f'__node:={name}' in cmdline:
+        return True
+    return 'lib/nav2_' in cmdline and f'/{name}' in cmdline
+
+
 class SystemHealthCheck(Node):
     """Publish a latched readiness flag after core simulation services are healthy."""
 
@@ -47,6 +65,18 @@ class SystemHealthCheck(Node):
         self.declare_parameter('recover_grace_sec', 45.0)
         self.declare_parameter('action_rebuild_grace_sec', 20.0)
         self.declare_parameter('controller_query_timeout_sec', 5.0)
+        # A node whose lifecycle services NEVER match cannot be repaired by
+        # rebuilding the client: measured 2026-10-14 17:11, smoother_server's
+        # GetState service stayed undiscovered through four rebuilds (61.9 s,
+        # 79.9 s, 97.9 s, 117.9 s) and Nav2 could never activate, so
+        # /competition/system_ready stayed false and the task sat in IDLE. Two of
+        # the last fourteen launches died exactly this way. Restarting the node's
+        # process gives it a fresh DDS participant (the Nav2 launch respawns it),
+        # and the transition repair above then walks it back to active. The
+        # restart is one attempt per node, only BEFORE the stack is ever ready,
+        # so it can never fire while the robot is running.
+        self.declare_parameter('restart_unmatched_nav2_node', True)
+        self.declare_parameter('unmatched_rebuilds_before_restart', 3)
 
         self._timeout_sec = float(self.get_parameter('timeout_sec').value)
         self._require_moveit = bool(self.get_parameter('require_moveit').value)
@@ -73,6 +103,15 @@ class SystemHealthCheck(Node):
         self._state_clients = {}
         self._activate_clients = {}
         self._state_client_created = {}
+        self._unmatched_rebuilds = {}
+        self._restarted_nodes = set()
+        self._restart_unmatched = bool(
+            self.get_parameter('restart_unmatched_nav2_node').value
+        )
+        self._rebuilds_before_restart = max(
+            1, int(self.get_parameter('unmatched_rebuilds_before_restart').value)
+        )
+        self._ever_ready = False
         if self._require_nav2:
             for name in NAV2_NODES:
                 self._state_clients[name] = self.create_client(
@@ -158,10 +197,17 @@ class SystemHealthCheck(Node):
                         GetState, f'/{name}/get_state'
                     )
                     self._state_client_created[name] = now
+                    rebuilds = self._unmatched_rebuilds.get(name, 0) + 1
+                    self._unmatched_rebuilds[name] = rebuilds
                     self.get_logger().warning(
-                        f'{name}: lifecycle service never matched; client rebuilt.'
+                        f'{name}: lifecycle service never matched; client rebuilt '
+                        f'({rebuilds}/{self._rebuilds_before_restart}).'
                     )
+                    if (rebuilds >= self._rebuilds_before_restart
+                            and self._should_restart_node(name)):
+                        self._restart_nav2_node(name)
                 continue
+            self._unmatched_rebuilds[name] = 0
             self._state_client_created[name] = now
             future = client.call_async(GetState.Request())
             future.add_done_callback(
@@ -176,6 +222,58 @@ class SystemHealthCheck(Node):
             return
         if response is not None:
             self._nav2_states[name] = response.current_state.id
+
+    def _should_restart_node(self, name: str) -> bool:
+        """May this node be restarted right now?
+
+        Only before the stack was ever ready (the robot cannot be running a task
+        then) and only once per node, so a restart loop is impossible.
+        """
+        return (self._restart_unmatched and not self._ever_ready
+                and name not in self._restarted_nodes)
+
+    def _restart_nav2_node(self, name: str) -> bool:
+        """Terminate an undiscoverable Nav2 node so the launch respawns it.
+
+        The Nav2 bringup starts every node with respawn=True, so killing the
+        process yields a fresh DDS participant - which is what fixes a discovery
+        failure that re-creating the client cannot (see the parameter comment).
+        """
+        self._restarted_nodes.add(name)
+        victim = None
+        for entry in os.listdir('/proc'):
+            if not entry.isdigit():
+                continue
+            pid = int(entry)
+            if pid in (os.getpid(), os.getppid()):
+                continue
+            try:
+                with open(f'/proc/{pid}/cmdline', 'rb') as handle:
+                    cmdline = handle.read().replace(b'\0', b' ').decode(
+                        errors='ignore')
+            except OSError:
+                continue
+            if nav2_node_process_matches(cmdline, name):
+                victim = (pid, cmdline.strip()[:120])
+                break
+        if victim is None:
+            self.get_logger().error(
+                f'{name}: lifecycle services stayed undiscovered and no matching '
+                'process was found to restart; the stack needs a manual restart.'
+            )
+            return False
+        try:
+            os.kill(victim[0], signal.SIGTERM)
+        except OSError as exc:
+            self.get_logger().error(f'{name}: could not restart pid {victim[0]}: {exc}')
+            return False
+        self.get_logger().error(
+            f'{name}: lifecycle services stayed undiscovered after '
+            f'{self._unmatched_rebuilds.get(name, 0)} client rebuilds; terminated '
+            f'pid {victim[0]} ({victim[1]}) so the launch respawns it with a '
+            'fresh DDS participant.'
+        )
+        return True
 
     def _recover_nav2(self, inactive):
         """Nudge Nav2 nodes the bringup left behind (rate limited).
@@ -317,6 +415,7 @@ class SystemHealthCheck(Node):
 
         if ready != self._last_ready:
             if ready:
+                self._ever_ready = True
                 self.get_logger().info(
                     'SYSTEM READY: Gazebo, controllers, sensors, MoveIt and Nav2 are available.'
                 )
