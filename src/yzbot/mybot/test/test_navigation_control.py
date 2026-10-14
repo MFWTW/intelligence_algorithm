@@ -1317,6 +1317,54 @@ class ZoneSlotTests(unittest.TestCase):
         self.assertEqual(goal[:2], [7.244, -2.483])
 
 
+class PrewarmResidentExecutorTests(unittest.TestCase):
+    """The 3.3 s executor start must not sit between the press and the motion.
+
+    Measured 2026-10-14 15:52 (relative to the start press): the supervisor
+    released the gate at +0.0 s, the executor process was up at +3.3 s, PRE_GRASP
+    at +5.3 s and the base moved at +6.3 s. With the parse now gated on the same
+    button, that start is the only part of the wait left to move off the press.
+    """
+
+    def source(self):
+        return (ROOT / 'scripts' / 'task_state_machine.py').read_text(
+            encoding='utf-8')
+
+    def test_the_executor_is_prewarmed_before_the_first_object(self):
+        src = self.source()
+        self.assertIn('Pre-warmed the resident executor', src)
+        self.assertIn('and not self._object_active and self._index == 0', src)
+        self.assertIn('and self._resident_process is None', src)
+        # The warming must sit where the queue does not exist yet.
+        block = src[src.index('if not self._queue:'):][:1800]
+        self.assertIn('_ensure_resident()', block)
+
+    def test_the_press_that_parses_the_task_also_starts_the_run(self):
+        """Parsing is gated on the button, so one press must do both jobs.
+
+        Measured 2026-10-14 17:40 (run_logs/parse_after_start_20261014-173956):
+        the press released the parse at t+2.1 s, the queue was accepted at
+        t+17.0 s, the machine went back to WAITING_FOR_START because accepting a
+        task cleared the latched press, and the run only left after a SECOND
+        press at t+35.2 s.
+        """
+        src = self.source()
+        self.assertIn('self._run_started_once = False', src)
+        self.assertIn('if self._run_started_once:', src)
+        clear = src[src.index('if self._run_started_once:'):]
+        self.assertIn('self._start_requested = False', clear[:200])
+        # The first object marks the run as started, before anything else.
+        start = src[src.index('def _start_current'):]
+        self.assertIn('self._run_started_once = True', start[:900])
+
+    def test_waiting_for_start_is_shown_even_without_a_parsed_task(self):
+        """The queue may legitimately be absent until the button is pressed."""
+        src = self.source()
+        block = src[src.index('if not self._queue:'):][:1800]
+        self.assertIn("self._set_state('WAITING_FOR_START')", block)
+        self.assertIn('self._system_ready and self._start_gate_closed()', block)
+
+
 class StartButtonPanelTests(unittest.TestCase):
     """The 「开始任务」 button lives in the dashboard layout, so its config is code.
 

@@ -24,7 +24,13 @@ import rclpy
 from ament_index_python.packages import get_package_share_directory
 from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
-from std_msgs.msg import String
+from std_msgs.msg import Bool, String
+
+# Sibling module, resolved the same way the executor resolves obstacle_yield:
+# `ros2 run` puts this script's own directory on sys.path. The start-button QoS
+# contract must be identical to the supervisor's, so it is imported rather than
+# copied.
+from task_state_machine import start_button_fallback_qos
 
 
 # Appended to the generator's argv to switch it into competition mode,
@@ -180,6 +186,15 @@ class TaskParser(Node):
         # On failure the hold is clamped to [FAILURE_HOLD_MIN_SEC,
         # FAILURE_HOLD_MAX_SEC] so the reason is never lost either.
         self.declare_parameter('linger_sec', 0.0)
+        # Gate the whole parse - generator AND LLM call - on the operator's start
+        # button. The rule sheet hands the problem over at the start signal, so a
+        # parse that ran at launch would answer a problem nobody has been given
+        # yet. Measured cost when the button comes first: the generator plus the
+        # LLM round trip took 6.2 s (4.6 s + 1.5 s) on 2026-10-14, and the
+        # executor is pre-warmed meanwhile, so the press releases the queue and
+        # the robot leaves almost immediately after the reply arrives.
+        self.declare_parameter('wait_for_start', False)
+        self.declare_parameter('start_topic', '/competition/start')
 
         self.declare_parameter('api_key_env', 'DEEPSEEK_API_KEY')
         # Optional explicit key file; empty falls back to DEFAULT_KEY_FILES.
@@ -256,6 +271,42 @@ class TaskParser(Node):
         self._status_pub = self.create_publisher(
             String, '/competition/task_status', result_qos
         )
+        # Latch the operator's press, including one made before this node was
+        # ready: the same two readers the supervisor uses, because the Foxglove
+        # button declares no QoS and a VOLATILE press never reaches a latched
+        # reader (see start_button_fallback_qos in task_state_machine).
+        self._start_requested = False
+        if bool(self.get_parameter('wait_for_start').value):
+            start_topic = str(self.get_parameter('start_topic').value)
+            self.create_subscription(
+                Bool, start_topic, self._on_start_button, result_qos
+            )
+            self.create_subscription(
+                Bool, start_topic, self._on_start_button,
+                start_button_fallback_qos()
+            )
+
+    # ---------------------------------------------------------------- start gate
+    def _on_start_button(self, msg: Bool) -> None:
+        if bool(msg.data) and not self._start_requested:
+            self._start_requested = True
+            self.get_logger().warning(
+                'Start button pressed; running the generator and the LLM now.'
+            )
+
+    def wait_for_start(self, poll_sec: float = 0.2) -> bool:
+        """Block until the operator starts the run, when configured to."""
+        if not bool(self.get_parameter('wait_for_start').value):
+            return True
+        self._status('WAITING_FOR_START')
+        self.get_logger().warning(
+            'Parsing is gated on '
+            f'{self.get_parameter("start_topic").value}; the problem is fetched '
+            'only after the operator starts the run.'
+        )
+        while rclpy.ok() and not self._start_requested:
+            rclpy.spin_once(self, timeout_sec=poll_sec)
+        return self._start_requested
 
     # ---------------------------------------------------------------- utils
     def _publish(self, publisher, text: str) -> None:
@@ -1041,7 +1092,10 @@ def main(args=None) -> None:
     exit_code = 1
     linger = float(node.get_parameter('linger_sec').value)
     try:
-        exit_code = 0 if node.run_once() else 1
+        if not node.wait_for_start():
+            exit_code = 1
+        else:
+            exit_code = 0 if node.run_once() else 1
     except KeyboardInterrupt:
         node.destroy_node()
         if rclpy.ok():

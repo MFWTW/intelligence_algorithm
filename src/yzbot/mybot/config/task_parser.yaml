@@ -8,6 +8,13 @@ task_parser:
     generator_path: TMSCQtest_x86_x64.bin
     generator_timeout_sec: 10.0
     problem_override: ''
+    # The rule sheet hands the problem over at the start signal, so the parse
+    # runs only after the operator presses 「开始任务」: on 2026-10-14 the
+    # generator + LLM round trip measured 6.2 s, and the supervisor pre-warms the
+    # executor during that window, so the robot leaves almost as soon as the
+    # reply arrives. Set false to parse at launch again (the problem then appears
+    # on the dashboard before the start, which is how it ran until now).
+    wait_for_start: true
     api_key_env: DEEPSEEK_API_KEY
     api_key_file: ''
     api_base_url: https://api.deepseek.com/chat/completions

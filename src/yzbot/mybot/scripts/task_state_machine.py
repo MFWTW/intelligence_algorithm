@@ -215,6 +215,9 @@ class TaskStateMachine(Node):
         self._pending_object_id = 0
         self._timer = self.create_timer(0.2, self._tick)
         self._start_requested = False
+        # True once the first object of a run has actually been launched: only a
+        # replay (a second task in the same process) clears the latched press.
+        self._run_started_once = False
         start_topic = str(self.get_parameter('start_topic').value)
         self.create_subscription(
             Bool, start_topic, self._start_button_cb, qos
@@ -553,9 +556,15 @@ class TaskStateMachine(Node):
         # task for the Gazebo/Nav2 startup would waste real execution time.
         self._task_started = None
         self._terminal = False
-        # A fresh task needs a fresh press when the gate is enabled, so a
-        # replay of the same problem cannot ride on the previous press.
-        self._start_requested = False
+        # A REPLAYED task needs a fresh press, so the same problem cannot ride
+        # on the press that started the previous run. The FIRST task must keep
+        # the press: with the parse gated on that very button (task_parser
+        # wait_for_start) the press IS what starts the parse, so clearing it here
+        # made the operator press twice - measured 2026-10-14 17:40: press at
+        # t+2.1 s, queue accepted at t+17.0 s, WAITING_FOR_START again, and the
+        # run only left after a second press at t+35.2 s.
+        if self._run_started_once:
+            self._start_requested = False
         self._error_pub.publish(self._string(''))
         self._publish_progress()
         self.get_logger().info(
@@ -725,6 +734,8 @@ class TaskStateMachine(Node):
             return
         item = self._queue[self._index]
         self._attempt += 1
+        # From here on a task arriving again is a replay and needs its own press.
+        self._run_started_once = True
         self._object_pub.publish(self._string(item['cube']))
         self._publish_progress()
         self._set_state('DETECTING_OBJECT')
@@ -940,6 +951,27 @@ class TaskStateMachine(Node):
                 self._handle_child_exit(124)
             return
         if not self._queue:
+            # The queue can legitimately be absent for the whole wait: the parse
+            # is gated on this same start button (task_parser wait_for_start), so
+            # the operator must still be told that pressing it is the next step.
+            if self._system_ready and self._start_gate_closed():
+                self._set_state('WAITING_FOR_START')
+            # Pre-warm the resident executor here. Its process start plus the
+            # dependency checks cost ~3.3 s (measured 2026-10-14 15:52: press ->
+            # executor up -> first goal = 3.3 s) and that is the part of
+            # "press -> the base moves" which can be moved off the press. It
+            # idles on /competition/executor_goal until the queue starts, and it
+            # is only started before the first object, so a failed round never
+            # restarts it in a loop.
+            if (self._system_ready and self._resident_enabled()
+                    and not self._object_active and self._index == 0
+                    and not self._terminal
+                    and self._resident_process is None):
+                if self._ensure_resident():
+                    self.get_logger().info(
+                        'Pre-warmed the resident executor; it idles until the '
+                        'start button releases the queue.'
+                    )
             return
         if not self._system_ready:
             self._set_state('IDLE')
