@@ -77,6 +77,13 @@ class SystemHealthCheck(Node):
         # so it can never fire while the robot is running.
         self.declare_parameter('restart_unmatched_nav2_node', True)
         self.declare_parameter('unmatched_rebuilds_before_restart', 3)
+        # The second way a node livelocks: its service IS discovered but its
+        # replies are not, so the health check keeps deciding from a stale state.
+        # Measured 2026-10-14 17:18 (run_logs/resume_remaining_20261014-171824):
+        # smoother_server configured fine at 1791969537, yet 18 CONFIGURE
+        # requests later it was still reported non-active and ACTIVATE was never
+        # requested. Six repair rounds is ~30 s at recover_interval_sec 5 s.
+        self.declare_parameter('stuck_repairs_before_restart', 6)
 
         self._timeout_sec = float(self.get_parameter('timeout_sec').value)
         self._require_moveit = bool(self.get_parameter('require_moveit').value)
@@ -110,6 +117,10 @@ class SystemHealthCheck(Node):
         )
         self._rebuilds_before_restart = max(
             1, int(self.get_parameter('unmatched_rebuilds_before_restart').value)
+        )
+        self._stuck_repairs = {}
+        self._stuck_repairs_before_restart = max(
+            1, int(self.get_parameter('stuck_repairs_before_restart').value)
         )
         self._ever_ready = False
         if self._require_nav2:
@@ -205,9 +216,15 @@ class SystemHealthCheck(Node):
                     )
                     if (rebuilds >= self._rebuilds_before_restart
                             and self._should_restart_node(name)):
-                        self._restart_nav2_node(name)
+                        self._restart_nav2_node(name, reason=(
+                    f'its lifecycle service stayed undiscovered after '
+                    f'{self._unmatched_rebuilds.get(name, 0)} client rebuilds'
+                    if self._unmatched_rebuilds.get(name, 0)
+                    else f'it stayed non-active through {self._stuck_repairs.get(name, 0)} '
+                         'repair attempts'))
                 continue
             self._unmatched_rebuilds[name] = 0
+            self._stuck_repairs.pop(name, None)
             self._state_client_created[name] = now
             future = client.call_async(GetState.Request())
             future.add_done_callback(
@@ -232,7 +249,7 @@ class SystemHealthCheck(Node):
         return (self._restart_unmatched and not self._ever_ready
                 and name not in self._restarted_nodes)
 
-    def _restart_nav2_node(self, name: str) -> bool:
+    def _restart_nav2_node(self, name: str, reason: str = '') -> bool:
         """Terminate an undiscoverable Nav2 node so the launch respawns it.
 
         The Nav2 bringup starts every node with respawn=True, so killing the
@@ -268,8 +285,7 @@ class SystemHealthCheck(Node):
             self.get_logger().error(f'{name}: could not restart pid {victim[0]}: {exc}')
             return False
         self.get_logger().error(
-            f'{name}: lifecycle services stayed undiscovered after '
-            f'{self._unmatched_rebuilds.get(name, 0)} client rebuilds; terminated '
+            f'{name}: {reason or "unrecoverable lifecycle state"}; terminated '
             f'pid {victim[0]} ({victim[1]}) so the launch respawns it with a '
             'fresh DDS participant.'
         )
@@ -309,10 +325,28 @@ class SystemHealthCheck(Node):
                 continue
             request = ChangeState.Request()
             request.transition.id = transition
+            attempts = self._stuck_repairs.get(name, 0) + 1
+            self._stuck_repairs[name] = attempts
             self.get_logger().warning(
-                f'{name} is stuck non-active; requesting {label}.'
+                f'{name} is stuck non-active; requesting {label} '
+                f'({attempts}/{self._stuck_repairs_before_restart}).'
             )
             client.call_async(request)
+            if (attempts >= self._stuck_repairs_before_restart
+                    and self._should_restart_node(name)):
+                # Repeating the same transition forever is a livelock when the
+                # node's own replies are the thing being dropped: measured
+                # 2026-10-14 17:18, smoother_server configured fine at 1791969537
+                # yet the health check asked it to CONFIGURE another 18 times and
+                # never reached ACTIVATE, because the state it read back stayed
+                # stale. A fresh participant breaks that loop.
+                self.get_logger().error(
+                    f'{name}: still non-active after {attempts} repair attempts; '
+                    'restarting it so the transitions can make progress again.'
+                )
+                self._restart_nav2_node(name, reason=(
+                    f'it stayed non-active through '
+                    f'{self._stuck_repairs.get(name, 0)} repair attempts'))
 
     def _check_health(self):
         now = time.monotonic()

@@ -1474,6 +1474,25 @@ class UnmatchedNav2NodeRestartTests(unittest.TestCase):
         self.assertIn('signal.SIGTERM', src)
         self.assertIn('os.kill(victim[0], signal.SIGTERM)', src)
 
+    def test_a_stale_state_read_back_also_triggers_one_restart(self):
+        """The service can be discovered while its replies are dropped.
+
+        Measured 2026-10-14 17:18 (run_logs/resume_remaining_20261014-171824):
+        smoother_server configured at 1791969537 and the health check still asked
+        it to CONFIGURE 18 more times, never reaching ACTIVATE, because the state
+        it read back stayed stale. Rebuilding the CLIENT cannot fix that; the
+        repair loop must escalate too.
+        """
+        src = (ROOT / 'scripts' / 'system_health_check.py').read_text(
+            encoding='utf-8')
+        self.assertIn("declare_parameter('stuck_repairs_before_restart', 6)", src)
+        self.assertIn('self._stuck_repairs[name] = attempts', src)
+        self.assertIn('attempts >= self._stuck_repairs_before_restart', src)
+        # A node that starts answering again clears its counter.
+        self.assertIn('self._stuck_repairs.pop(name, None)', src)
+        # Both triggers share the same bounded, pre-ready, once-per-node action.
+        self.assertIn('self._should_restart_node(name)', src)
+
     def test_a_missing_process_fails_loudly_instead_of_looping(self):
         src = (ROOT / 'scripts' / 'system_health_check.py').read_text(
             encoding='utf-8')
