@@ -1,17 +1,19 @@
 task_state_machine:
   ros__parameters:
     max_object_retries: 1
-    # Measured 2026-10-14 15:34 (run_logs/chain_forensics_20261014-153453): the
-    # base was trapped beside mover_2's patrol segment, the controller refused
-    # the path 74-144 times per attempt and the base never moved 2 cm. With
-    # skip_failed_object false the whole round ended at 1/5 while three cubes and
-    # ~1800 s of budget remained; the same queue shape delivered 5/5 when that
-    # object was not blocked. Skipping happens only AFTER the retry budget is
-    # exhausted and only when the state is safe to retry: _unsafe_to_retry (cube
-    # attached, unknown attachment) still fails the round closed, so no cube is
-    # abandoned in an unknown state. Set false to go back to "one blocked cube
-    # ends the round".
-    skip_failed_object: true
+    # Fail closed: exhausted retries on ANY object end the round.
+    #
+    # The alternative (skip_failed_object: true) was measured on 2026-10-14:
+    # the base was trapped beside mover_2's patrol segment
+    # (run_logs/chain_forensics_20261014-153453, 74-144 controller refusals per
+    # attempt, base never moved 2 cm) and the round ended at 1/5 while three
+    # cubes and ~1800 s of budget remained. Skipping would have kept going, but
+    # the operator's rule for a scored round is that a failed object stops the
+    # round and a human looks at the robot, so this stays false by decision.
+    # The skip path in task_state_machine.py remains available and still sits
+    # behind the unsafe-state gate (_unsafe_to_retry fails the round closed
+    # before any skipping); only this profile's choice is fail-closed.
+    skip_failed_object: false
     object_timeout_sec: 420.0
     task_timeout_sec: 0.0
     task_timeout_per_object_sec: 420.0

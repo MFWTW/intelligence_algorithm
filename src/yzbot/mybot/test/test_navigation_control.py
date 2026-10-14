@@ -2370,31 +2370,38 @@ class YieldWiringTests(unittest.TestCase):
                       (ROOT / 'scripts' / 'task_state_machine.py').read_text(
                           encoding='utf-8'))
 
-    def test_a_blocked_object_does_not_end_the_whole_round(self):
-        """One trapped cube must not zero the round while budget remains.
+    def test_a_failed_object_stops_the_round_by_policy(self):
+        """Fail closed: exhausted retries on any object end the round.
 
-        Measured 2026-10-14 15:34 (run_logs/chain_forensics_20261014-153453):
-        the base was trapped beside mover_2's patrol segment, the controller
-        refused the path 74-144 times per attempt and the base moved less than
-        2 cm; with skip_failed_object false the round ended at 1/5 although
-        three cubes and ~1800 s of budget were left.
+        Skipping was measured as the higher-scoring option on 2026-10-14
+        (run_logs/chain_forensics_20261014-153453: the base was trapped beside
+        mover_2's patrol segment with 74-144 controller refusals per attempt and
+        the round ended at 1/5 while three cubes and ~1800 s of budget
+        remained), but the operator's rule for a scored round is that a failed
+        object stops the round so a human can look at the robot. Both profiles
+        must therefore keep skip_failed_object false.
         """
         import yaml
         source = (ROOT / 'scripts' / 'task_state_machine.py').read_text(
             encoding='utf-8')
-        deployed = yaml.safe_load(
-            (ROOT / 'config' / 'profiles' / 'state_machine_fast.yaml').read_text(
-                encoding='utf-8'))['task_state_machine']['ros__parameters']
-        self.assertTrue(
-            deployed['skip_failed_object'],
-            'the deployment profile must keep trying the remaining cubes')
-        # The skip must stay BEHIND the unsafe-state gate: a cube-attached or
-        # unknown state still fails the round closed.
+        for name in ('task_state_machine.yaml', 'profiles/state_machine_fast.yaml'):
+            deployed = yaml.safe_load(
+                (ROOT / 'config' / name).read_text(encoding='utf-8'))[
+                    'task_state_machine']['ros__parameters']
+            self.assertIn('skip_failed_object', deployed, name)
+            self.assertFalse(
+                deployed['skip_failed_object'],
+                f'{name} must stop the round when an object fails')
+        # The retry budget is what happens BEFORE that stop, and the skip path
+        # must stay behind the unsafe-state gate if anyone flips it later.
         unsafe_at = source.index('if self._unsafe_to_retry:')
         skip_at = source.index(
             "if bool(self.get_parameter('skip_failed_object').value):")
+        fail_at = source.index("self._fail('OBJECT_FAILED'")
         self.assertLess(unsafe_at, skip_at,
                         'unsafe states must fail closed before any skipping')
+        self.assertLess(skip_at, fail_at,
+                        'the fail-closed stop stays the default branch')
 
     def test_the_escape_reverses_after_the_controller_refused_the_path(self):
         """Driving forward again re-enters the refusal that stopped the base."""
