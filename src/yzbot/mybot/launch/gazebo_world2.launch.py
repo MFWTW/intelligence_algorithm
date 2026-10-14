@@ -15,6 +15,7 @@ from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
 from launch_ros.substitutions import FindPackageShare
+from ament_index_python.packages import get_package_prefix
 import xacro
 
 def remove_comments(text):
@@ -69,6 +70,20 @@ def generate_launch_description():
         urdf_model_path,
         mappings={'camera_update_rate': os.environ.get('MYBOT_CAMERA_RATE') or '10.0'},
     ).toxml()
+    safe_drive = os.environ.get('MYBOT_YIELD_PAUSE_MODE', '').lower() in ('1', 'true')
+    if safe_drive:
+        stock_plugin = 'libgazebo_ros_diff_drive.so'
+        if robot_description.count(stock_plugin) != 1:
+            raise RuntimeError('Expected exactly one stock drive plugin for yield pause')
+        robot_description = robot_description.replace(
+            stock_plugin, 'libmybot_safe_diff_drive.so')
+        if robot_description.count('<command_topic>cmd_vel</command_topic>') != 1:
+            raise RuntimeError('Expected exactly one Gazebo drive command topic')
+        robot_description = robot_description.replace(
+            '<command_topic>cmd_vel</command_topic>',
+            '<command_timeout>0.5</command_timeout><command_topic>cmd_vel</command_topic>',
+            1,
+        )
     params = {'robot_description': remove_comments(robot_description)}
 
     # robot_state_publisher 节点
@@ -228,6 +243,14 @@ def generate_launch_description():
     # 没有 NVIDIA 显卡时 Mesa 会忽略该名字并回落到默认适配器。
     # 如需强制别的适配器，运行前自行 export 同名环境变量即可。
     ld = LaunchDescription()
+    if safe_drive:
+        plugin_dir = os.path.join(get_package_prefix('mybot'), 'lib')
+        if not os.path.isfile(os.path.join(plugin_dir, 'libmybot_safe_diff_drive.so')):
+            raise RuntimeError('Guarded drive plugin is not installed; rebuild mybot')
+        ld.add_action(SetEnvironmentVariable(
+            'GAZEBO_PLUGIN_PATH',
+            plugin_dir + os.pathsep + os.environ.get('GAZEBO_PLUGIN_PATH', ''),
+        ))
     ld.add_action(SetEnvironmentVariable(
         'MESA_D3D12_DEFAULT_ADAPTER_NAME',
         os.environ.get('MESA_D3D12_DEFAULT_ADAPTER_NAME', 'NVIDIA'),

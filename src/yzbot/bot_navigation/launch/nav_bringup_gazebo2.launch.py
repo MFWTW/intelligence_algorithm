@@ -84,8 +84,10 @@ def generate_launch_description():
     smoother_trace_udp = LaunchConfiguration('smoother_trace_udp_experiment')
     smoother_trace_file = LaunchConfiguration('smoother_trace_file')
     smoother_poll_fallback_sec = LaunchConfiguration('smoother_poll_fallback_sec')
+    yield_pause_mode = LaunchConfiguration('yield_pause_mode')
     experimental = OrSubstitution(
-        smoother_udp, OrSubstitution(smoother_trace, smoother_trace_udp))
+        smoother_udp, OrSubstitution(smoother_trace,
+            OrSubstitution(smoother_trace_udp, yield_pause_mode)))
 
     nav2 = IncludeLaunchDescription(
         PythonLaunchDescriptionSource(
@@ -118,7 +120,8 @@ def generate_launch_description():
 
         modes = [name for name, cfg in (
             ('udp', smoother_udp), ('trace', smoother_trace),
-            ('trace_udp', smoother_trace_udp)) if enabled(cfg)]
+            ('trace_udp', smoother_trace_udp),
+            ('yield_pause', yield_pause_mode)) if enabled(cfg)]
         if not modes:
             return []
         if len(modes) > 1:
@@ -181,6 +184,18 @@ def generate_launch_description():
         condition=IfCondition(smoother_trace_udp),
     )
 
+    nav2_yield_pause_navigation = IncludeLaunchDescription(
+        PythonLaunchDescriptionSource(
+            os.path.join(navigation_share, 'launch',
+                         'navigation_yield_pause.launch.py')
+        ),
+        launch_arguments={
+            'use_sim_time': use_sim_time, 'params_file': nav_params_file,
+            'use_composition': use_composition, 'use_respawn': use_respawn,
+        }.items(),
+        condition=IfCondition(yield_pause_mode),
+    )
+
     map_to_odom = Node(
         package='tf2_ros',
         executable='static_transform_publisher',
@@ -241,6 +256,10 @@ def generate_launch_description():
             description='Opt-in single-variable test: instrumented smoother AND UDP transport.',
         ),
         DeclareLaunchArgument(
+            'yield_pause_mode', default_value='false',
+            description='Opt-in guarded Nav2 motion pipeline for retained-goal yield tests.',
+        ),
+        DeclareLaunchArgument(
             'smoother_trace_file', default_value='',
             description='Absolute trace output path, required by diagnostic binary.',
         ),
@@ -257,5 +276,6 @@ def generate_launch_description():
         nav2_udp_navigation,
         nav2_trace_navigation,
         nav2_trace_udp_navigation,
+        nav2_yield_pause_navigation,
         rviz,
     ])

@@ -1,12 +1,14 @@
 import os
+import sys
 
 from ament_index_python.packages import PackageNotFoundError
-from ament_index_python.packages import get_package_share_directory
+from ament_index_python.packages import get_package_share_directory, get_package_prefix
 from launch import LaunchDescription
 from launch.actions import (
     DeclareLaunchArgument,
     IncludeLaunchDescription,
     LogInfo,
+    OpaqueFunction,
     RegisterEventHandler,
     SetEnvironmentVariable,
 )
@@ -43,6 +45,11 @@ def generate_launch_description():
         mybot_share, 'config', 'fixed_joint_pick_place.yaml'
     )
     parser_params = os.path.join(mybot_share, 'config', 'task_parser.yaml')
+    if os.environ.get('MYBOT_YIELD_PAUSE_MODE', '').lower() in ('1', 'true'):
+        sys.path.insert(0, os.path.join(get_package_prefix('mybot'), 'lib', 'mybot'))
+        from yield_nav_profile import guarded_profile, guarded_executor_profile
+        navigation_params = guarded_profile(navigation_params)
+        executor_params = guarded_executor_profile(executor_params)
 
     def _yaml_default(env_name, yaml_path, node_key, param, fallback):
         """Read a switch's default from its YAML, with an env override.
@@ -108,6 +115,17 @@ def generate_launch_description():
     start_dashboard = LaunchConfiguration('start_dashboard')
     foxglove = LaunchConfiguration('foxglove')
     foxglove_port = LaunchConfiguration('foxglove_port')
+    yield_pause_mode = LaunchConfiguration('yield_pause_mode')
+
+    def validate_pause_mode(context):
+        mode = yield_pause_mode.perform(context).lower() == 'true'
+        drive = os.environ.get('MYBOT_YIELD_PAUSE_MODE', '').lower() in ('1', 'true')
+        if mode != drive:
+            raise RuntimeError('yield_pause_mode and MYBOT_YIELD_PAUSE_MODE must agree: '
+                               'refusing an unguarded or disconnected drive chain')
+        if mode and start_nav2.perform(context).lower() != 'true':
+            raise RuntimeError('yield_pause_mode requires Nav2')
+        return []
 
     # The judging dashboard is optional infrastructure: a fresh machine that
     # has not installed ros-humble-foxglove-bridge yet must still be able to
@@ -165,8 +183,19 @@ def generate_launch_description():
             'smoother_trace_udp_experiment': smoother_trace_udp_experiment,
             'smoother_trace_file': smoother_trace_file,
             'smoother_poll_fallback_sec': smoother_poll_fallback_sec,
+            'yield_pause_mode': yield_pause_mode,
         }.items(),
         condition=IfCondition(start_nav2),
+    )
+
+    # Opt-in only: the gate is the SOLE writer of the smoother's guarded input.
+    # The guarded Nav2 launch redirects controller + recovery commands to its
+    # raw input, while Gazebo runs a drive plugin with a stale-command timeout.
+    yield_velocity_gate = Node(
+        package='mybot', executable='yield_velocity_gate.py',
+        name='yield_velocity_gate', output='screen',
+        condition=IfCondition(yield_pause_mode),
+        parameters=[{'use_sim_time': False}],
     )
 
     startup_gate = Node(
@@ -384,6 +413,13 @@ def generate_launch_description():
             description='Isolated instrumented smoother on UDP transport; never enable by default.',
         ),
         DeclareLaunchArgument(
+            'yield_pause_mode',
+            default_value='true' if os.environ.get('MYBOT_YIELD_PAUSE_MODE', '').lower()
+            in ('1', 'true') else 'false', choices=['true', 'false'],
+            description='Experimental guarded retained-goal mode; requires the matching '
+                        'Gazebo drive watchdog and an opt-in executor profile.',
+        ),
+        DeclareLaunchArgument(
             'smoother_poll_fallback_sec', default_value='',
             description='Opt-in P0 input-poll fallback; empty keeps stock behaviour.',
         ),
@@ -482,7 +518,9 @@ def generate_launch_description():
             'foxglove_port', default_value='8765',
             description='Foxglove WebSocket port.',
         ),
+        OpaqueFunction(function=validate_pause_mode),
         gazebo,
+        yield_velocity_gate,
         # Start the heavy stacks only after sensors and all controllers are
         # actually ready; fixed delays race on slower machines.
         startup_gate,

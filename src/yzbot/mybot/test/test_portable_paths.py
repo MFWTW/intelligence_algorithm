@@ -116,14 +116,14 @@ class NavBehaviorTreeResolutionTests(unittest.TestCase):
         self.assertEqual(Path(resolved).name, 'nav_to_pose_short_recovery.xml')
 
     def test_every_nav2_include_gets_the_rewritten_params_file(self):
-        # Five includes: stock bringup, experimental localization, and the three
-        # smoother experiments. bt_navigator is started by whichever one is
-        # active, so a single unrewritten one would silently run the stock tree.
+        # Six includes: stock bringup, experimental localization, three smoother
+        # experiments, and guarded yield-pause Nav2. Every mode must see the same
+        # BT path rewrite instead of silently switching to Nav2's stock tree.
         from launch import LaunchContext
         from nav2_common.launch import RewrittenYaml
         description = self.nav.generate_launch_description()
         includes = self.includes(description)
-        self.assertEqual(len(includes), 5)
+        self.assertEqual(len(includes), 6)
 
         context = LaunchContext()
         shipped = Path(self.nav.get_package_share_directory('bot_navigation')) \

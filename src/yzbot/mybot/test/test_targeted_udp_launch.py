@@ -120,26 +120,30 @@ class TargetedUdpLaunchTests(unittest.TestCase):
         desc = nav_module.generate_launch_description()
         includes = [e for e in desc.entities if isinstance(e, IncludeLaunchDescription)]
         guard = next(e for e in desc.entities if isinstance(e, OpaqueFunction))
-        for udp, trace, trace_udp, expected in [
-                ('false', 'false', 'false', [True, False, False, False, False]),
-                ('true', 'false', 'false', [False, True, True, False, False]),
-                ('false', 'true', 'false', [False, True, False, True, False]),
-                ('false', 'false', 'true', [False, True, False, False, True])]:
+        for udp, trace, trace_udp, pause, expected in [
+                ('false', 'false', 'false', 'false', [True, False, False, False, False, False]),
+                ('true', 'false', 'false', 'false', [False, True, True, False, False, False]),
+                ('false', 'true', 'false', 'false', [False, True, False, True, False, False]),
+                ('false', 'false', 'true', 'false', [False, True, False, False, True, False]),
+                ('false', 'false', 'false', 'true', [False, True, False, False, False, True])]:
             ctx = LaunchContext()
             ctx.launch_configurations.update({
                 'smoother_udp_experiment': udp, 'smoother_trace_experiment': trace,
                 'smoother_trace_udp_experiment': trace_udp,
+                'yield_pause_mode': pause,
                 'smoother_trace_file': '/tmp/trace.jsonl',
                 'use_composition': 'False', 'slam': 'False'})
             self.assertEqual([i.condition.evaluate(ctx) for i in includes], expected)
-            if 'true' in (udp, trace, trace_udp):
+            if 'true' in (udp, trace, trace_udp, pause):
                 self.assertEqual(guard.execute(ctx), [])
         for combo in [('true', 'true', 'false'), ('true', 'false', 'true'),
                       ('false', 'true', 'true')]:
+
             ctx = LaunchContext()
             ctx.launch_configurations.update({
                 'smoother_udp_experiment': combo[0], 'smoother_trace_experiment': combo[1],
                 'smoother_trace_udp_experiment': combo[2],
+                'yield_pause_mode': 'false',
                 'smoother_trace_file': '/tmp/trace.jsonl',
                 'use_composition': 'False', 'slam': 'False'})
             with self.assertRaisesRegex(RuntimeError, 'mutually exclusive'):
@@ -147,7 +151,8 @@ class TargetedUdpLaunchTests(unittest.TestCase):
         ctx = LaunchContext()
         ctx.launch_configurations.update({
             'smoother_udp_experiment': 'false', 'smoother_trace_experiment': 'false',
-            'smoother_trace_udp_experiment': 'true', 'smoother_trace_file': '  ',
+            'smoother_trace_udp_experiment': 'true', 'yield_pause_mode': 'false',
+            'smoother_trace_file': '  ',
             'use_composition': 'False', 'slam': 'False'})
         with self.assertRaisesRegex(RuntimeError, 'non-empty smoother_trace_file'):
             guard.execute(ctx)
@@ -163,6 +168,7 @@ class TargetedUdpLaunchTests(unittest.TestCase):
             ctx.launch_configurations.update({
                 'smoother_udp_experiment': 'false', 'smoother_trace_experiment': 'false',
                 'smoother_trace_udp_experiment': 'false',
+                'yield_pause_mode': 'false',
                 'smoother_trace_file': '/tmp/trace.jsonl',
                 'use_composition': 'False', 'slam': 'False'})
             ctx.launch_configurations.update(kwargs)
@@ -171,7 +177,7 @@ class TargetedUdpLaunchTests(unittest.TestCase):
         # '1' alone must still run every check, not silently skip them.
         ctx = ctx_for(smoother_trace_udp_experiment='1')
         self.assertEqual([i.condition.evaluate(ctx) for i in includes],
-                         [False, True, False, False, True])
+                         [False, True, False, False, True, False])
         self.assertEqual(guard.execute(ctx), [])
         with self.assertRaisesRegex(RuntimeError, 'mutually exclusive'):
             guard.execute(ctx_for(smoother_trace_udp_experiment='1',

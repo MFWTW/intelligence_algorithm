@@ -2187,7 +2187,7 @@ class YieldWiringTests(unittest.TestCase):
         # the result future, so handling the pause inside the leg's own wait
         # loop would fall straight through to the jam escape (measured
         # 2026-10-13: "moved 0.70 m backward" on every hold).
-        hold = source[source.index('def _hold_until_clear'):]
+        hold = source[source.index('def _hold_until_clear('):]
         hold = hold[:hold.index('\n    def ')]
         self.assertIn('self._stop_base()', hold)
         self.assertIn('self._tick_yield(', hold)

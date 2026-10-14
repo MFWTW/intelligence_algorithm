@@ -2,6 +2,29 @@ cmake_minimum_required(VERSION 3.22)
 project(mybot)
 
 find_package(ament_cmake REQUIRED)
+find_package(behaviortree_cpp_v3 REQUIRED)
+find_package(rclcpp REQUIRED)
+find_package(std_msgs REQUIRED)
+find_package(gazebo_dev REQUIRED)
+find_package(gazebo_ros REQUIRED)
+find_package(geometry_msgs REQUIRED)
+find_package(nav_msgs REQUIRED)
+find_package(tf2_ros REQUIRED)
+find_package(tf2_geometry_msgs REQUIRED)
+
+add_library(mybot_safe_diff_drive SHARED src/safe_diff_drive.cpp)
+target_compile_features(mybot_safe_diff_drive PRIVATE cxx_std_17)
+ament_target_dependencies(mybot_safe_diff_drive
+  gazebo_dev gazebo_ros geometry_msgs nav_msgs rclcpp tf2_ros tf2_geometry_msgs)
+target_link_libraries(mybot_safe_diff_drive ${GAZEBO_LIBRARIES})
+install(TARGETS mybot_safe_diff_drive LIBRARY DESTINATION lib)
+
+add_library(mybot_yield_pause_bt SHARED src/yield_pause_bt.cpp)
+# BehaviorTree.CPP exports BT_RegisterNodesFromPlugin only with this definition.
+target_compile_definitions(mybot_yield_pause_bt PRIVATE BT_PLUGIN_EXPORT)
+target_compile_features(mybot_yield_pause_bt PRIVATE cxx_std_17)
+ament_target_dependencies(mybot_yield_pause_bt behaviortree_cpp_v3 rclcpp std_msgs)
+install(TARGETS mybot_yield_pause_bt LIBRARY DESTINATION lib)
 
 ament_package()
 
@@ -34,5 +57,7 @@ install(PROGRAMS
   scripts/system_health_check.py
   scripts/task_parser.py
   scripts/task_state_machine.py
+  scripts/yield_velocity_gate.py
+  scripts/yield_nav_profile.py
   DESTINATION lib/${PROJECT_NAME}
 )

@@ -10,6 +10,7 @@ colour and corrects the final standoff before the fixed-joint grasp sequence.
 import contextlib
 import json
 import math
+import os
 import sys
 import time
 from collections import deque
@@ -17,6 +18,7 @@ from typing import Iterable, Sequence
 
 import cv2
 import numpy as np
+from ament_index_python.packages import get_package_share_directory
 import rclpy
 from cv_bridge import CvBridge
 from action_msgs.msg import GoalStatus
@@ -172,6 +174,10 @@ class FixedJointPickPlace(Node):
         # layer resumes one goal rather than three. Set false to go back to the
         # per-waypoint walk (kept as the fallback and for A/B rounds).
         self.declare_parameter('use_continuous_detour', True)
+        # Experimental: retain the top-level Nav2 action during a mover hold.
+        # Requires the guarded Nav2 launch, dual-axis gate, and drive watchdog.
+        # The production profile leaves this off until an integration round passes.
+        self.declare_parameter('retain_nav_goal_on_yield', False)
         # How close the base must get to a detour waypoint before the next one
         # becomes the no-progress reference (see _chain_progress_target).
         self.declare_parameter('chain_switch_radius_m', 0.75)
@@ -696,6 +702,17 @@ class FixedJointPickPlace(Node):
         self._fine_cmd_pub = self.create_publisher(
             Twist, str(self.get_parameter('fine_cmd_vel_topic').value), 10
         )
+        self._retain_nav_goal_on_yield = bool(
+            self.get_parameter('retain_nav_goal_on_yield').value)
+        self._yield_hold_pub = None
+        self._yield_gate_held = False
+        self._yield_gate_status_time = 0.0
+        if self._retain_nav_goal_on_yield:
+            self._yield_hold_pub = self.create_publisher(
+                Bool, '/competition/yield_hold', 10)
+            self.create_subscription(
+                Bool, '/competition/yield_gate_held',
+                self._on_yield_gate_held, 10)
         # Latest lidar sweep, used only to decide which way to escape a jam:
         # reversing blindly is what drove the round32 base 0.03 m *deeper* into
         # the wall it was already trapped against.
@@ -2070,6 +2087,112 @@ class FixedJointPickPlace(Node):
             )
         self._stop_base()
 
+    def _on_yield_gate_held(self, message: Bool) -> None:
+        self._yield_gate_held = message.data
+        self._yield_gate_status_time = time.monotonic()
+
+    def _command_yield_gate(self, held: bool, timeout: float = 0.5) -> bool:
+        """Wait for a fresh acknowledgement from the sole smoother-input gate."""
+        if self._yield_hold_pub is None:
+            return False
+        since = time.monotonic()
+        command = Bool()
+        command.data = held
+        while rclpy.ok() and time.monotonic() - since < timeout:
+            self._yield_hold_pub.publish(command)
+            rclpy.spin_once(self, timeout_sec=0.05)
+            if (self._yield_gate_status_time >= since
+                    and self._yield_gate_held == held):
+                return True
+        return False
+
+    def _ensure_yield_gate_clear(self, timeout: float = 1.5) -> bool:
+        """Bring the gate to a known released state before a leg drives.
+
+        A previous leg can leave the latch held (it failed while a hold was
+        active), so a stale True is cleared here instead of being treated as a
+        dead gate. No fresh status at all still fails closed.
+        """
+        if not getattr(self, '_retain_nav_goal_on_yield', False):
+            return True
+        fresh = time.monotonic() - self._yield_gate_status_time <= 0.5
+        if fresh and not self._yield_gate_held:
+            return True
+        if not self._command_yield_gate(False, timeout=timeout):
+            return False
+        return True
+
+    def _hold_until_clear_retained(
+        self, label, x, y, deadline, goal_handle, result_future, response_timeout,
+    ) -> bool:
+        """Keep Nav2's TOP-LEVEL goal but halt its BT and gate both velocities.
+
+        The gate is released only once the leg is finished with Nav2: either the
+        corridor is clear and the same goal continues, or the cancel has been
+        confirmed. Otherwise every abandon path would leave the base gated off
+        and the following retry could not drive at all.
+        """
+        if not self._command_yield_gate(True):
+            self.get_logger().error(f'{label}: velocity gate did not acknowledge hold.')
+            self._release_nav_control(
+                label, goal_handle, result_future, min(5.0, response_timeout))
+            self._command_yield_gate(False)
+            return False
+        self._yield_pause_active = True
+        started = time.monotonic()
+        self.get_logger().warning(
+            f'{label}: holding both velocity axes with Nav2 goal retained.')
+        try:
+            while (rclpy.ok() and self._yield_decision.holds
+                   and not result_future.done() and time.monotonic() < deadline):
+                # Re-publish the hold: a BT plugin instantiated a tick late must
+                # still observe it; the gate remains latched until explicit clear.
+                message = Bool()
+                message.data = True
+                self._yield_hold_pub.publish(message)
+                rclpy.spin_once(self, timeout_sec=0.1)
+                self._tick_yield(self._cached_planar_distance_to_point(x, y))
+            held_for = time.monotonic() - started
+            if self._yield_decision.holds or self._yield_arc_goal is not None:
+                # The loop left while the obstacle was still there: either the
+                # leg budget expired or Nav2's own goal ended. Both mean this
+                # attempt is over, so the goal must go before anything drives.
+                if self._yield_decision.holds and held_for >= deadline - started:
+                    reason = 'leg budget expired'
+                elif self._yield_arc_goal is not None:
+                    reason = 'taking the yield arc instead'
+                else:
+                    reason = 'Nav2 ended the goal during the hold'
+                if result_future.done():
+                    reason = 'Nav2 ended the goal during the hold'
+                self.get_logger().warning(
+                    f'{label}: releasing the retained goal ({reason}) after '
+                    f'{held_for:.1f} s of holding.'
+                )
+                self._release_nav_control(
+                    label, goal_handle, result_future,
+                    min(5.0, response_timeout))
+                self._command_yield_gate(False, timeout=1.0)
+                return False
+            if not self._command_yield_gate(False, timeout=1.0):
+                # Do not allow a late 'hold=False' or a dead gate to be mistaken
+                # for a confirmed release; cancel the goal while still gated.
+                self.get_logger().error(
+                    f'{label}: velocity gate did not confirm the release; '
+                    'cancelling Nav2 while still gated.'
+                )
+                message = Bool()
+                message.data = True
+                self._yield_hold_pub.publish(message)
+                self._release_nav_control(
+                    label, goal_handle, result_future,
+                    min(5.0, response_timeout))
+                self._command_yield_gate(False, timeout=1.5)
+                return False
+            return True
+        finally:
+            self._yield_pause_active = False
+
     def _hold_until_clear(self, label, x, y, deadline) -> bool:
         """Stand still until the yield policy releases a mover hold.
 
@@ -2177,9 +2300,17 @@ class FixedJointPickPlace(Node):
             ]
             poses.append(self._pose_stamped(values))
             goal.poses = poses
+            if getattr(self, '_retain_nav_goal_on_yield', False):
+                goal.behavior_tree = os.path.join(
+                    get_package_share_directory('mybot'), 'config',
+                    'nav_through_poses_yield_pause.xml')
             return goal, self._navigate_through_client
         goal = NavigateToPose.Goal()
         goal.pose = self._pose_stamped(values)
+        if getattr(self, '_retain_nav_goal_on_yield', False):
+            goal.behavior_tree = os.path.join(
+                get_package_share_directory('mybot'), 'config',
+                'nav_to_pose_yield_pause.xml')
         return goal, self._navigate_client
 
     def _navigate_once__timed(
@@ -2204,6 +2335,10 @@ class FixedJointPickPlace(Node):
             f'{route_text}.'
         )
         response_timeout = float(self.get_parameter('service_timeout_sec').value)
+        if not self._ensure_yield_gate_clear():
+            self._stop_base()
+            raise RuntimeError(
+                'YIELD_GATE_NOT_READY: guarded smoother input unavailable')
         # Nav2 can lose a goal response the same way the arm controller does;
         # re-sending the identical pose preempts the old goal and is harmless.
         goal_handle = self._send_goal_tolerant(
@@ -2277,6 +2412,17 @@ class FixedJointPickPlace(Node):
                 # would otherwise see the cancelled future and fall straight
                 # through to the jam escape, which moved the base 0.70 m
                 # backwards on every single hold of that round.
+                if getattr(self, '_retain_nav_goal_on_yield', False):
+                    if not self._hold_until_clear_retained(
+                        label, x, y, deadline, goal_handle, result_future,
+                        response_timeout,
+                    ):
+                        return False
+                    # A deliberate hold is not a jam. Resume the same top-level
+                    # action with fresh no-motion and progress watch baselines.
+                    motion_anchor = motion_since = None
+                    best_distance = stall_since = accept_since = None
+                    continue
                 self._release_nav_control(
                     label, goal_handle, result_future,
                     min(5.0, response_timeout),
