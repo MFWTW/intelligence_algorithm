@@ -134,6 +134,13 @@ if [ ! -x "$executor_exec" ]; then
   echo "启动前检查失败：$executor_exec 不可执行；请 chmod +x src/yzbot/mybot/scripts/fixed_joint_pick_place.py 并重新构建。" >&2
   exit 1
 fi
+# With --symlink-install, a lost source executable bit makes launch report the
+# misleading "executable not found" even though the symlink exists.
+mover_exec="$(ros2 pkg prefix mybot)/lib/mybot/moving_obstacles.py"
+if [ ! -x "$mover_exec" ]; then
+  echo "启动前检查失败：$mover_exec 不可执行；请 chmod +x src/yzbot/mybot/scripts/moving_obstacles.py 并重新构建。" >&2
+  exit 1
+fi
 
 echo "== 3/5 清理 Fast DDS 残留 =="
 bash "$WS/src/yzbot/mybot/scripts/reset_dds_cache.sh" || true

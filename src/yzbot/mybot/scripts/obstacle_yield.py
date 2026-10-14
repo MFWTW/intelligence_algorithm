@@ -137,15 +137,9 @@ class YieldConfig:
     # world-frame speed by removing the base's own velocity, and only obstacles
     # above this threshold are ever waited for or arced around.
     min_mover_speed_mps: float = 0.04
-    # ...and this is the other end of the same window. The patrol boxes run at
-    # 0.16-0.30 m/s; a track whose world speed is far above that is not a box,
-    # it is association noise chaining between two nearby static clusters.
-    # Measured 2026-10-13 (run_logs/yield_diag_fixed_20261013-181029): with a
-    # fixed 0.30 m association radius and single-return clusters, the nearest
-    # "mover" read 0.86-1.52 m/s and the policy capped and stopped for objects
-    # that were not moving at all. Waiting for something faster than this is
-    # pointless anyway - it is out of the corridor before the base could act -
-    # and the costmap, lidar and collision checks remain in force regardless.
+    # ...and this is the other end of the same window. The 0.08 m/s patrols
+    # are below it, while the measured 0.86-1.52 m/s false tracks from static
+    # clusters remain excluded. Costmap/lidar checks still guard collisions.
     max_mover_speed_mps: float = 0.6
     # Association radius is *motion* plus this floor, not a fixed bubble: two
     # sweeps apart a real box moves at most max_mover_speed * dt, and anything

@@ -220,31 +220,29 @@ pgrep -c -f nav2_ ; pgrep -c -f gzserver       # 都应为 0
 ros2 run mybot reset_dds_cache.sh              # 反复启停后清 Fast DDS 残留
 ```
 
-### 可选：让小车在途中避障（移动障碍）
+### 移动障碍物（默认开启）
 
-地图上放 2–3 个**巡逻方块**，逼小车在导航时避障：
+三个巡逻方块会在运行时生成；正常启动即启用：
 
 ```bash
-MYBOT_MOVING_OBSTACLES=true ros2 run mybot start_competition.sh
+ros2 run mybot start_competition.sh
+# 暂时关闭：MYBOT_MOVING_OBSTACLES=false ros2 run mybot start_competition.sh
 ```
 
-**一个开关就够**——它会自动选用 `offic_room_movers.world` 变体。
-（早先需要同时设 `MYBOT_WORLD_NAME`，只设一个会得到"开关开着、场景里却没有方块"的
-困惑状态；现在 `MYBOT_MOVING_OBSTACLES=true` 单独就生效，显式指定 world 仍优先。）
+不需要额外的 world 变体；障碍物由节点启动后插入。
 
 - **黄色** 方块，尺寸 0.22×0.22×**0.30 m**（高于雷达所在的 0.06 m，所以代价图看得见）
 - **运行时生成**，不需要配套 world 变体。**注意**：方块及其 `planar_move` 插件若写进
   `.world`，会在世界加载时**阻塞 Gazebo 的生成队列**，导致机器人自己 spawn 失败
   （`Entity pushed to spawn queue, but spawn service timed out waiting for entity to appear`）。
   节点改为启动后用 `/spawn_entity` 插入，并对失败重试。
-- 巡逻段取自小车自己的历史轨迹并做过净空校核（见 `run_logs/tools/make_movers_world.py` 注释）
-- **速度是精确的**：方块由**位姿伺服**驱动（节点按里程推算后直接设定位姿），
-  不是发 `cmd_vel`。实测设定 0.16/0.30/0.16 m/s 时真实速度为
-  0.151/0.283/0.150 m/s——用速度控制时只能达到 0.031/0.118（摩擦每个周期把方块刹停）。
-- **推不动**：位置每帧被覆盖，实测最大垂偏 0.7 mm，永远严格贴在自己的巡逻线上
-- `mover_2` 刻意调快（0.30 m/s，其余 0.16），让障碍是"横穿"而不是"同向陪跑"
-
-**默认关闭**。实测在该配置下任务仍能 5/5 完成。
+- 巡逻段沿原有路线延长：`mover_1` 1.50→1.90 m，`mover_2` 约 1.60→2.01 m，
+  `mover_3` 约 1.59→1.74 m（靠近墙面和固定绕行路线，延长幅度较小）。
+  新路线按静态地图检查过净空。
+- **速度由位姿伺服控制**（不是发 `cmd_vel`）：三个当前均设为 **0.08 m/s**。
+  避障追踪速度上限为 0.6 m/s。此速度尚未完成整轮仿真验证；障碍物通过
+  路口可能更慢，小车等待的时间不一定会缩短。
+- **推不动**：位置每帧被覆盖，障碍物始终沿自己的巡逻线运行。
 
 ### 可选：本地测量与验证（`run_logs/` 是 gitignore 的，新克隆里没有）
 

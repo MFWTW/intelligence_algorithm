@@ -18,6 +18,7 @@ fixed_joint_pick_place:
     # Pinned here on purpose: this profile is the deployment contract, so a
     # change to a script default must not silently retune a scored round.
     yield_clear_margin_sec: 0.3
+    # Detect the 0.08 m/s patrols but exclude measured 0.86+ m/s phantom tracks.
     yield_max_mover_speed_mps: 0.6
     yield_wait_budget_sec: 20.0
     cube_name: red_cube_1

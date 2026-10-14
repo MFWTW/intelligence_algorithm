@@ -395,9 +395,14 @@ class MovingObstacleTests(unittest.TestCase):
         patrols = movers.parse_patrols(movers.DEFAULT_PATROLS)
         self.assertEqual([p[0] for p in patrols],
                          ['mover_1', 'mover_2', 'mover_3'])
-        for _, x0, y0, x1, y1, speed, _kin in patrols:
-            self.assertGreater(speed, 0.0)
-            self.assertGreater(math.hypot(x1 - x0, y1 - y0), 0.2)
+        original_lengths = {'mover_1': 1.5, 'mover_2': math.hypot(1.4, 0.78),
+                            'mover_3': math.hypot(0.86, 1.34)}
+        minimum_extension = {'mover_1': 0.30, 'mover_2': 0.30,
+                             'mover_3': 0.12}
+        for name, x0, y0, x1, y1, speed, _kin in patrols:
+            self.assertEqual(speed, 0.08)
+            self.assertGreater(math.hypot(x1 - x0, y1 - y0),
+                               original_lengths[name] + minimum_extension[name])
 
     def test_direction_flips_at_both_ends(self):
         movers = self.module()
@@ -526,15 +531,21 @@ class MovingObstacleTests(unittest.TestCase):
         import xml.etree.ElementTree as ET
         ET.fromstring(xml)          # must be well formed
 
-    def test_default_patrols_give_mover_2_the_faster_speed(self):
+    def test_all_default_patrols_match_yield_tracker_speed_window(self):
+        import yaml
         movers = self.module()
-        speeds = {p[0]: p[5] for p in movers.parse_patrols(movers.DEFAULT_PATROLS)}
-        flags = {p[0]: p[6] for p in movers.parse_patrols(movers.DEFAULT_PATROLS)}
+        patrols = movers.parse_patrols(movers.DEFAULT_PATROLS)
+        flags = {p[0]: p[6] for p in patrols}
         self.assertTrue(flags['mover_3'], 'mover_3 must be kinematic')
         self.assertFalse(flags['mover_1'])
         self.assertFalse(flags['mover_2'])
-        self.assertGreater(speeds['mover_2'], speeds['mover_1'])
-        self.assertGreater(speeds['mover_2'], speeds['mover_3'])
+        profile = yaml.safe_load((ROOT / 'config/profiles/executor_fast.yaml')
+                                 .read_text(encoding='utf-8'))
+        ceiling = profile['fixed_joint_pick_place']['ros__parameters'][
+            'yield_max_mover_speed_mps']
+        from obstacle_yield import YieldConfig
+        self.assertEqual(ceiling, YieldConfig().max_mover_speed_mps)
+        self.assertTrue(all(speed < ceiling for *_, speed, _kin in patrols))
 
     def test_a_box_never_yields_and_never_moves_off_its_line(self):
         """The obstacle has the highest priority; the base has no influence.
@@ -2842,7 +2853,14 @@ class PatrolBypassRouteTests(unittest.TestCase):
         # and the plate. The nearest approach must not cut through the mover.
         route = [(7.62, -6.13), *points,
                  tuple(params['warehouse_a_pose'][:2])]
-        patrol = ((11.76, -4.53), (12.62, -5.87))
+        from importlib.util import module_from_spec, spec_from_file_location
+        spec = spec_from_file_location('patrol_for_bypass_test',
+                                       ROOT / 'scripts/moving_obstacles.py')
+        movers = module_from_spec(spec)
+        spec.loader.exec_module(movers)
+        mover_3 = next(p for p in movers.parse_patrols(movers.DEFAULT_PATROLS)
+                       if p[0] == 'mover_3')
+        patrol = (mover_3[1:3], mover_3[3:5])
 
         def segment_distance(point, line):
             a, b = line

@@ -21,7 +21,7 @@ rolling local costmap for most of the route, so clearing cannot erase old marks.
 
 Patrols are declared as one string so the parameter has no array-typing problem:
 
-    patrols: "mover_1:-1.16,-0.84,-0.40,0.58,0.16; mover_2:1.30,-5.72,-0.10,-4.94,0.16"
+    patrols: "mover_1:-12.20,-3.00,-10.30,-3.00,0.08; mover_2:1.48,-5.82,-0.28,-4.84,0.08"
 
 i.e. `name:x_start,y_start,x_end,y_end,speed_mps`. The box's yaw in the world is
 set to the segment direction, so the served pose drives the whole segment.
@@ -45,8 +45,9 @@ from tf2_ros import Buffer, TransformException, TransformListener
 from std_msgs.msg import Header, String
 from sensor_msgs_py import point_cloud2
 
-# mover_2 is deliberately quicker than the others: a faster crossing obstacle
-# forces an actual avoidance decision instead of letting the base pace behind it.
+# All three patrol boxes run at the operator-selected 0.08 m/s. Endpoints extend
+# the original centre lines; mover_3 has less room near the static walls, so its
+# extension is smaller.
 DEFAULT_PATROLS = (
     # 2026-10-12: mover_1 used to patrol (-1.16,-0.84)<->(-0.40,0.58), which
     # crosses the robot's own start pose at (0,0). With the boxes now loaded on
@@ -54,12 +55,12 @@ DEFAULT_PATROLS = (
     # ground at ... exceeding 3.0 m/s") on the very first leg. Moved to open
     # floor at x=-12, where the static map gives 0.87-1.39 m of clearance and the
     # nearest cube, zone plate or start pose is 6.3 m away.
-    'mover_1:-12.00,-3.00,-10.50,-3.00,0.16;'
-    'mover_2:1.30,-5.72,-0.10,-4.94,0.30;'
+    'mover_1:-12.20,-3.00,-10.30,-3.00,0.08;'
+    'mover_2:1.48,-5.82,-0.28,-4.84,0.08;'
     # mover_3 carries the `k` flag: measured on movers_live/stack2.log it was
     # shoved off its own segment and wedged there for 60+ s. Kinematic bodies
     # ignore contact forces, so the base cannot displace it.
-    'mover_3:11.76,-4.53,12.62,-5.87,0.16,k'
+    'mover_3:11.71,-4.45,12.65,-5.91,0.08,k'
 )
 
 

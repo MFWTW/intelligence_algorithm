@@ -482,9 +482,8 @@ class FixedJointPickPlace(Node):
         self.declare_parameter('yield_cap_speed_mps', 0.8)
         self.declare_parameter('yield_resume_speed_mps', 0.6)
         self.declare_parameter('yield_min_mover_speed_mps', 0.04)
-        # The other end of the mover-speed window: a track faster than this is
-        # association noise, not a patrol box (measured phantoms: 0.86-1.52 m/s
-        # against real boxes at 0.16-0.30 m/s).
+        # Keep static-cluster phantoms (measured 0.86-1.52 m/s) outside the
+        # tracking window while detecting the 0.08 m/s patrol boxes.
         self.declare_parameter('yield_max_mover_speed_mps', 0.6)
         # How much time must be left between "the base is past" and "the box
         # enters the corridor": the sensing/control latency of this stack.
