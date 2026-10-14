@@ -2370,6 +2370,69 @@ class YieldWiringTests(unittest.TestCase):
                       (ROOT / 'scripts' / 'task_state_machine.py').read_text(
                           encoding='utf-8'))
 
+    def test_a_blocked_object_does_not_end_the_whole_round(self):
+        """One trapped cube must not zero the round while budget remains.
+
+        Measured 2026-10-14 15:34 (run_logs/chain_forensics_20261014-153453):
+        the base was trapped beside mover_2's patrol segment, the controller
+        refused the path 74-144 times per attempt and the base moved less than
+        2 cm; with skip_failed_object false the round ended at 1/5 although
+        three cubes and ~1800 s of budget were left.
+        """
+        import yaml
+        source = (ROOT / 'scripts' / 'task_state_machine.py').read_text(
+            encoding='utf-8')
+        deployed = yaml.safe_load(
+            (ROOT / 'config' / 'profiles' / 'state_machine_fast.yaml').read_text(
+                encoding='utf-8'))['task_state_machine']['ros__parameters']
+        self.assertTrue(
+            deployed['skip_failed_object'],
+            'the deployment profile must keep trying the remaining cubes')
+        # The skip must stay BEHIND the unsafe-state gate: a cube-attached or
+        # unknown state still fails the round closed.
+        unsafe_at = source.index('if self._unsafe_to_retry:')
+        skip_at = source.index(
+            "if bool(self.get_parameter('skip_failed_object').value):")
+        self.assertLess(unsafe_at, skip_at,
+                        'unsafe states must fail closed before any skipping')
+
+    def test_the_escape_reverses_after_the_controller_refused_the_path(self):
+        """Driving forward again re-enters the refusal that stopped the base."""
+        source = (ROOT / 'scripts' / 'fixed_joint_pick_place.py').read_text(
+            encoding='utf-8')
+        self.assertIn("self._last_attempt_failure = 'wedge_refusals'", source)
+        self.assertIn('direction=(-1.0 if self._last_attempt_failure', source)
+        self.assertIn("== 'wedge_refusals' else None)", source)
+        self.assertIn('if direction is None:', source)
+        self.assertIn('direction = self._clearer_axis()', source)
+
+    def test_back_off_honours_a_forced_direction(self):
+        bind = module.FixedJointPickPlace
+        published = []
+
+        def build():
+            return SimpleNamespace(
+                _clearer_axis=lambda: 1.0,
+                _fine_cmd_pub=SimpleNamespace(publish=published.append),
+                _stop_base=lambda: None,
+                get_logger=lambda: SimpleNamespace(warning=lambda *a: None),
+            )
+
+        def run(node, **kwargs):
+            ticks = iter([0.0, 0.0, 99.0, 99.0, 99.0])
+            with patch.object(module.time, 'monotonic',
+                              side_effect=lambda: next(ticks, 99.0)), \
+                 patch.object(module.rclpy, 'ok', return_value=True), \
+                 patch.object(module.rclpy, 'spin_once', lambda *a, **k: None):
+                bind._back_off(node, 'leg', distance_m=0.7, speed=0.08, **kwargs)
+
+        run(build(), direction=-1.0)
+        self.assertTrue(published, 'the escape must command something')
+        self.assertLess(published[0].linear.x, 0.0)
+        published.clear()
+        run(build())
+        self.assertGreater(published[0].linear.x, 0.0)
+
     def test_the_collision_monitor_no_longer_reads_a_dead_topic(self):
         """It read /cmd_vel_smoothed, which this stack never publishes."""
         import yaml
@@ -2709,6 +2772,7 @@ class ContinuousDetourTests(unittest.TestCase):
         bind = module.FixedJointPickPlace
         node._double_list = bind._double_list.__get__(node)
         node._detour_waypoints = bind._detour_waypoints.__get__(node)
+        node._remaining_chain = bind._remaining_chain.__get__(node)
         node._nav_goal = bind._nav_goal.__get__(node)
         node._pose_stamped = bind._pose_stamped.__get__(node)
         node._chain_progress_target = bind._chain_progress_target.__get__(node)
@@ -2816,6 +2880,48 @@ class ContinuousDetourTests(unittest.TestCase):
                           'blue_cube_3 to A detour waypoint 3',
                           'warehouse A'])
         self.assertTrue(all(chain is None for _l, _v, chain in calls))
+
+    def test_a_resume_sends_only_the_waypoints_not_yet_passed(self):
+        """Re-sending the whole chain makes Nav2 forget what was reached.
+
+        Measured 2026-10-14 (stable_topose_ab_20261014-161832, blue_cube_3 -> A):
+        seven holds in one leg, seven resumes, and the base drove via_1 -> via_2
+        -> back to via_1 twice before it could climb to via_3, because each
+        resume re-sent the full chain and Nav2's RemovePassedGoals only knows
+        the goals inside the goal it just received.
+        """
+        node = self.node()
+        chain = node._detour_waypoints('blue_cube_3', 'a')
+        self.assertEqual(len(chain), 3)
+        node._chain_index = 0
+        self.assertEqual(node._remaining_chain(chain), list(chain))
+        node._chain_index = 2
+        remaining = node._remaining_chain(chain)
+        self.assertEqual(len(remaining), 1)
+        self.assertEqual(tuple(remaining[0][:2]), (13.65, -3.0))
+        goal, _client = node._nav_goal([7.244, -2.483, -3.141593], remaining)
+        self.assertEqual(
+            [(round(p.pose.position.x, 3), round(p.pose.position.y, 3))
+             for p in goal.poses],
+            [(13.65, -3.0), (7.244, -2.483)])
+        # Every waypoint passed: a plain single-pose goal, not an empty chain.
+        node._chain_index = len(chain)
+        self.assertIsNone(node._remaining_chain(chain))
+        self.assertIsNone(node._remaining_chain(None))
+
+    def test_chain_progress_is_reset_per_leg_not_per_attempt(self):
+        """A retry must not undo the waypoints the leg already reached."""
+        source = SCRIPT.read_text(encoding='utf-8')
+        leg = source[source.index('    def _navigate_to('):]
+        self.assertIn('self._chain_index = 0', leg[:2000],
+                      'the leg owns chain progress')
+        attempt = source[source.index('    def _navigate_once__timed('):]
+        attempt = attempt[:attempt.index('\n    def ', 10)]
+        self.assertNotIn('self._chain_index = 0', attempt,
+                         'an attempt must not reset what the leg reached')
+        resume = source[source.index('resumed = self._resume_nav_goal') - 400:]
+        self.assertIn('self._remaining_chain(chain)', resume[:400],
+                      'a resume must rebuild the goal from what is left')
 
     def test_the_competition_profile_enables_the_continuous_detour(self):
         import yaml

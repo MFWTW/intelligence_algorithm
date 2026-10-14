@@ -115,6 +115,42 @@ class NavBehaviorTreeResolutionTests(unittest.TestCase):
                         f'the resolved BT xml must exist: {resolved}')
         self.assertEqual(Path(resolved).name, 'nav_to_pose_short_recovery.xml')
 
+    def test_an_explicit_bt_tree_override_is_honoured_and_fails_closed(self):
+        """The A/B stable-path tree is selected by env var, never by editing
+        the production YAML, and a typo must abort instead of silently falling
+        back to the tuned tree (which would make the A/B meaningless)."""
+        import os
+        stable = ROOT / 'config' / 'nav_to_pose_stable_path.xml'
+        self.assertTrue(stable.is_file())
+        previous = os.environ.get('MYBOT_NAV_TO_POSE_BT_XML')
+        try:
+            os.environ['MYBOT_NAV_TO_POSE_BT_XML'] = str(stable)
+            self.assertEqual(self.nav.resolve_nav_bt_xml(), str(stable))
+            os.environ['MYBOT_NAV_TO_POSE_BT_XML'] = str(ROOT / 'config' / 'nope.xml')
+            with self.assertRaisesRegex(RuntimeError, 'missing file'):
+                self.nav.resolve_nav_bt_xml()
+        finally:
+            if previous is None:
+                os.environ.pop('MYBOT_NAV_TO_POSE_BT_XML', None)
+            else:
+                os.environ['MYBOT_NAV_TO_POSE_BT_XML'] = previous
+        self.assertEqual(Path(self.nav.resolve_nav_bt_xml()).name,
+                         'nav_to_pose_short_recovery.xml')
+
+    def test_the_stable_path_tree_keeps_a_valid_path_instead_of_replanning(self):
+        """The A/B tree must replan only when there is no valid path yet."""
+        from xml.etree import ElementTree
+        for name in ('nav_to_pose_stable_path.xml',
+                     'nav_through_poses_stable_path.xml'):
+            with self.subTest(name=name):
+                root = ElementTree.parse(ROOT / 'config' / name).getroot()
+                self.assertIsNotNone(root.find('.//IsPathValid'))
+                self.assertIsNotNone(root.find('.//GlobalUpdatedGoal'))
+                # The recovery ladder and the tuned short-recovery shape stay:
+                # a stable route must not cost the ability to recover.
+                self.assertIsNotNone(root.find('.//FollowPath'))
+                self.assertIsNotNone(root.find('.//BackUp'))
+
     def test_every_nav2_include_gets_the_rewritten_params_file(self):
         # Six includes: stock bringup, experimental localization, three smoother
         # experiments, and guarded yield-pause Nav2. Every mode must see the same

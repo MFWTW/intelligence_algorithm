@@ -16,8 +16,17 @@ def resolve_nav_bt_xml():
     """Path to mybot's tuned recovery tree as installed on THIS machine, else ''.
 
     Module level (not nested in generate_launch_description) so the portability
-    test can call it directly without building a launch graph.
+    test can call it directly without building a launch graph. An explicit
+    MYBOT_NAV_TO_POSE_BT_XML override is honoured when it names a real file, so
+    an alternative tree (the A/B stable-path variant) can be tested without
+    editing this launch or the production YAML.
     """
+    override = os.environ.get('MYBOT_NAV_TO_POSE_BT_XML', '').strip()
+    if override:
+        if not os.path.isfile(override):
+            raise RuntimeError(
+                f'MYBOT_NAV_TO_POSE_BT_XML points at a missing file: {override}')
+        return override
     try:
         share = get_package_share_directory('mybot')
     except PackageNotFoundError:

@@ -782,6 +782,12 @@ class FixedJointPickPlace(Node):
         self._yield_arc_goal = None
         self._yield_arc_used = False
         self._yield_suppress = False
+        # Why the last navigation attempt was abandoned. The retry escape uses
+        # it to pick a direction that matches the failure: driving 0.70 m
+        # FORWARD after the controller refused the path ahead re-enters the same
+        # refusal (measured 2026-10-14 15:34: eight attempts, 74-144 refusals
+        # each, base never moved 2 cm, round lost at 1/5).
+        self._last_attempt_failure = None
         # Index of the detour waypoint the no-progress watchdog measures
         # against; reset per leg in _navigate_once__timed.
         self._chain_index = 0
@@ -2313,6 +2319,22 @@ class FixedJointPickPlace(Node):
                 'nav_to_pose_yield_pause.xml')
         return goal, self._navigate_client
 
+    def _remaining_chain(self, chain):
+        """The detour waypoints the base has NOT effectively passed yet.
+
+        A re-sent goal makes Nav2 forget which waypoints were already reached:
+        its RemovePassedGoals only drops the ones the base is within 0.7 m of
+        *in that goal*, so re-sending the whole chain after every mover hold
+        sends the base back to the first waypoint again. Measured 2026-10-14
+        (run_logs/stable_topose_ab_20261014-161832, blue_cube_3 -> A): seven
+        holds, seven resumes, and the base drove from via_1 to via_2 and back to
+        via_1 twice before it could start climbing to via_3.
+        """
+        if not chain:
+            return None
+        remaining = list(chain[min(self._chain_index, len(chain)):])
+        return remaining or None
+
     def _navigate_once__timed(
         self,
         label: str,
@@ -2322,13 +2344,12 @@ class FixedJointPickPlace(Node):
         chain: Sequence[Sequence[float]] | None = None,
     ) -> bool:
         x, y, yaw = [float(value) for value in values]
-        self._chain_index = 0
-        goal, client = self._nav_goal(values, chain)
+        goal, client = self._nav_goal(values, self._remaining_chain(chain))
         route_text = ''
-        if chain:
+        if self._remaining_chain(chain):
             route_text = ' via ' + ' -> '.join(
                 f'({float(waypoint[0]):.3f}, {float(waypoint[1]):.3f})'
-                for waypoint in chain
+                for waypoint in self._remaining_chain(chain)
             )
         self.get_logger().info(
             f'Navigate to {label}: x={x:.3f}, y={y:.3f}, yaw={yaw:.3f}'
@@ -2437,6 +2458,10 @@ class FixedJointPickPlace(Node):
                         f'{label}: mover hold budget spent; taking the yield arc.'
                     )
                     return False
+                # Rebuild from the REMAINING waypoints: the base may have
+                # reached one or two of them while it was held, and re-sending
+                # the whole chain would send it back to the first one.
+                goal, client = self._nav_goal(values, self._remaining_chain(chain))
                 resumed = self._resume_nav_goal(
                     label, goal, response_timeout, client
                 )
@@ -2496,6 +2521,9 @@ class FixedJointPickPlace(Node):
                             f'{now - motion_since:.1f} s; abandoning early so the '
                             'escape can free it.'
                         )
+                        # The path AHEAD is what the controller refuses, so the
+                        # retry must retreat instead of pressing forward again.
+                        self._last_attempt_failure = 'wedge_refusals'
                         self._release_nav_control(
                             label, goal_handle, result_future,
                             min(5.0, response_timeout),
@@ -2505,6 +2533,7 @@ class FixedJointPickPlace(Node):
                         motion_since is not None
                         and now - motion_since > nomotion_timeout
                     ):
+                        self._last_attempt_failure = 'no_motion'
                         self.get_logger().error(
                             f'{label}: base has not moved more than '
                             f'{nomotion_radius:.2f} m in {nomotion_timeout:.0f} s; '
@@ -2580,6 +2609,7 @@ class FixedJointPickPlace(Node):
                         # controller. The former in-goal _back_off raced with
                         # FollowPath on /cmd_vel_nav; the outer retry will move
                         # only after this goal's cancellation is confirmed.
+                        self._last_attempt_failure = 'no_progress'
                         self.get_logger().warning(
                             f'{label}: no progress for {stall_timeout:.0f} s '
                             f'(still {live_distance:.2f} m from the goal); '
@@ -2900,7 +2930,10 @@ class FixedJointPickPlace(Node):
                 f'(robot radius {radius:.2f} m).'
             )
 
-    def _back_off(self, label: str, distance_m: float = 0.12, speed: float = 0.08) -> None:
+    def _back_off(
+        self, label: str, distance_m: float = 0.12, speed: float = 0.08,
+        direction: float | None = None,
+    ) -> None:
         """Drive briefly along the clearer axis to free a jammed base.
 
         Published to the smoother input (the same channel the visual servo and
@@ -2908,8 +2941,16 @@ class FixedJointPickPlace(Node):
         terminal result. The direction comes from the
         lidar: measured 2026-10-07 (round32), always reversing pushed the base
         0.03 m *deeper* into the wall it was already trapped against.
+
+        ``direction`` overrides the lidar choice when the failure itself says
+        which way is useless: after the controller refused the path ahead, the
+        lidar can still call the front clearer while every attempt to drive
+        forward is refused again (measured 2026-10-14 15:34).
         """
-        direction = self._clearer_axis()
+        if direction is None:
+            direction = self._clearer_axis()
+        else:
+            direction = 1.0 if direction > 0.0 else -1.0
         command = Twist()
         command.linear.x = direction * abs(speed)
         deadline = time.monotonic() + distance_m / max(abs(speed), 1e-3)
@@ -3594,8 +3635,16 @@ class FixedJointPickPlace(Node):
         if self._yield_config.enabled:
             attempts += 1
         self._log_cube_positions(f'before:{label}')
+        # Progress along the detour chain belongs to the LEG, not to one attempt:
+        # a retry after a hold must not send the base back to a waypoint it has
+        # already reached (measured 2026-10-14: seven holds in one leg, each
+        # resume re-sending the full chain).
+        self._chain_index = 0
         try:
             for attempt in range(1, attempts + 1):
+                # Each attempt gets a clean failure fingerprint: the escape after
+                # a failed attempt reads it to choose a direction.
+                self._last_attempt_failure = None
                 # A yield arc is not a failure: the leg was abandoned because a
                 # moving obstacle owned the lane, not because the base was
                 # wedged. Drive the lateral waypoint the policy picked, then
@@ -3664,6 +3713,12 @@ class FixedJointPickPlace(Node):
                         speed=float(
                             self.get_parameter('escape_speed_mps').value
                         ),
+                        # A refusal-abandoned attempt means the path ahead is what
+                        # the controller rejects. Retreat along the heading
+                        # instead of trusting a lidar front/rear comparison that
+                        # keeps calling that same path clear.
+                        direction=(-1.0 if self._last_attempt_failure
+                                   == 'wedge_refusals' else None),
                     )
                     if not self._clear_costmaps():
                         return False

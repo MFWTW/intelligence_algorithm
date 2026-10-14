@@ -1,0 +1,59 @@
+<!--
+  A/B candidate: the tuned short-recovery tree, but the global path is KEPT while
+  it stays valid instead of being recomputed every second.
+
+  Why (measured 2026-10-14, run_logs/gui_round_20261014-155217): the patrol boxes
+  are marked in the GLOBAL costmap on purpose (nav_rpp15.yaml records that with
+  the laser alone the base drove at a box and paced behind it). As a box sweeps
+  past, each 1 Hz replan can pick the opposite side, so the base turned around
+  and drove back: 71% of the observed direction reversals landed within 3 s of
+  "Passing new path to controller" (median 0.9 s), only 9% followed a yield
+  cancel, and the base spent 105 of 191 loaded-driving seconds shuttling inside
+  one corridor.
+
+  Rule: plan when there is no path yet, when the goal changes, or when the
+  current path stopped being valid - i.e. when a box actually blocks it. The
+  local costmap still sees the boxes, so RPP keeps avoiding and refusing them,
+  and the yield layer keeps holding; only the global route stops flipping.
+
+  Select it with MYBOT_NAV_TO_POSE_BT_XML=<this file>; the default resolve path
+  in nav_bringup_gazebo2.launch.py is unchanged, so a scored round keeps the
+  tuned tree unless the operator opts in.
+-->
+<root main_tree_to_execute="MainTree">
+  <BehaviorTree ID="MainTree">
+    <RecoveryNode number_of_retries="6" name="NavigateRecovery">
+      <PipelineSequence name="NavigateWithReplanning">
+        <RateController hz="1.0">
+          <Fallback>
+            <ReactiveSequence name="KeepValidPath">
+              <Inverter>
+                <GlobalUpdatedGoal/>
+              </Inverter>
+              <IsPathValid path="{path}"/>
+            </ReactiveSequence>
+            <RecoveryNode number_of_retries="1" name="ComputePathToPose">
+              <ComputePathToPose goal="{goal}" path="{path}" planner_id="GridBased"/>
+              <ClearEntireCostmap name="ClearGlobalCostmap-Context" service_name="global_costmap/clear_entirely_global_costmap"/>
+            </RecoveryNode>
+          </Fallback>
+        </RateController>
+        <RecoveryNode number_of_retries="1" name="FollowPath">
+          <FollowPath path="{path}" controller_id="FollowPath"/>
+          <ClearEntireCostmap name="ClearLocalCostmap-Context" service_name="local_costmap/clear_entirely_local_costmap"/>
+        </RecoveryNode>
+      </PipelineSequence>
+      <ReactiveFallback name="RecoveryFallback">
+        <GoalUpdated/>
+        <RoundRobin name="RecoveryActions">
+          <Sequence name="ClearingActions">
+            <ClearEntireCostmap name="ClearLocalCostmap-Subtree" service_name="local_costmap/clear_entirely_local_costmap"/>
+            <ClearEntireCostmap name="ClearGlobalCostmap-Subtree" service_name="global_costmap/clear_entirely_global_costmap"/>
+          </Sequence>
+          <BackUp backup_dist="0.5" backup_speed="0.05"/>
+          <Spin spin_dist="0.8"/>
+        </RoundRobin>
+      </ReactiveFallback>
+    </RecoveryNode>
+  </BehaviorTree>
+</root>
