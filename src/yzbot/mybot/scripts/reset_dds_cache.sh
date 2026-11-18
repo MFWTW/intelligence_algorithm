@@ -27,5 +27,17 @@ sleep 1
 
 count=$(ls /dev/shm 2>/dev/null | grep -c '^fastrtps_' || true)
 rm -f /dev/shm/fastrtps_*
-echo "Removed ${count} stale Fast DDS shared-memory segment(s)."
+# The shared-memory *segment* is only half of a Fast DDS port: each port also
+# owns a named semaphore "sem.fastrtps_port<port>_mutex". Deleting the segment
+# while leaving the semaphore behind is exactly what produces
+#   [RTPS_TRANSPORT_SHM Error] Failed init_port fastrtps_port74xx:
+#   open_and_lock_file failed
+# on the next start, which then cascades into
+#   CRITICAL FAILURE: SERVER map_server IS DOWN
+# (9-round campaign 2026-11-16/17: r5/r7/r7b/r9b failed to start with 16/8/21/15
+# such errors, while all 9 rounds that started cleanly had zero - no exception
+# in 14 launches). Remove both kinds together.
+semcount=$(ls /dev/shm 2>/dev/null | grep -c '^sem\.fastrtps_port' || true)
+rm -f /dev/shm/sem.fastrtps_port*
+echo "Removed ${count} stale Fast DDS shared-memory segment(s) and ${semcount} port semaphore(s)."
 echo "Remaining /dev/shm entries: $(ls /dev/shm 2>/dev/null | wc -l)"

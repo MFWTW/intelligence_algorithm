@@ -178,6 +178,56 @@ class OracleTwistTests(unittest.TestCase):
         self.assertIn('Both models failed validation', src)
 
 
+class SeedTopicTests(unittest.TestCase):
+    """The seed rides its own latched topic instead of riding on the problem.
+
+    Foxglove shows it as a fixed pane above the question; when it was appended
+    as a trailing ``(种子 N)`` line inside ``/competition/task_problem`` the
+    reader had to scroll past the whole problem to find it, and the dashboard
+    had no way to keep it visible on its own.
+    """
+
+    def generate(self, output_text):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            fake = Path(tmp) / 'gen.sh'
+            fake.write_text('#!/bin/sh\ncat <<\'EOF\'\n' + output_text + '\nEOF\n')
+            fake.chmod(0o755)
+            node = parser.TaskParser.__new__(parser.TaskParser)
+            values = {'problem_override': '', 'generator_path': str(fake),
+                      'generator_timeout_sec': 5.0, 'competition_mode': False,
+                      'generator_args': ''}
+            node.get_parameter = lambda name: SimpleNamespace(value=values[name])
+            node.get_logger = lambda: SimpleNamespace(
+                warning=lambda m, *a, **k: None, error=lambda m, *a, **k: None,
+                info=lambda m, *a, **k: None)
+            published = {}
+
+            class Recorder:
+                def __init__(self, key):
+                    self.key = key
+
+                def publish(self, message):
+                    published.setdefault(self.key, []).append(message.data)
+
+            node._problem_pub = Recorder('problem')
+            node._seed_pub = Recorder('seed')
+            problem = parser.TaskParser._generate_problem(node)
+        return problem, published
+
+    def test_the_seed_is_published_on_its_own_topic(self):
+        problem, published = self.generate(
+            '使用种子: 992233\n' + '-' * 20 + '\n题目: 每个文具盒有5个文具;'
+        )
+        self.assertEqual(problem, '题目: 每个文具盒有5个文具;')
+        self.assertEqual(published['seed'], ['使用种子: 992233'])
+        self.assertEqual(published['problem'], ['题目: 每个文具盒有5个文具;'])
+
+    def test_a_practice_run_publishes_no_seed(self):
+        problem, published = self.generate('题目: 每个衣柜有5件衣物;')
+        self.assertEqual(problem, '题目: 每个衣柜有5件衣物;')
+        self.assertNotIn('seed', published)
+
 class ValidationFallbackTests(unittest.TestCase):
     """A wrong answer must not end the round if a stronger model can fix it.
 

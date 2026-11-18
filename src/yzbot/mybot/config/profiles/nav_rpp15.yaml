@@ -138,7 +138,14 @@ controller_server:
       min_approach_linear_velocity: 0.05
       approach_velocity_scaling_dist: 0.6
       use_collision_detection: true
-      max_allowed_time_to_collision_up_to_carrot: 1.0
+      # 与让行层对齐：RPP 在“按当前速度沿弧前探 t 秒会撞”时拒绝出速，等于一条
+      # 1.5 × t 米的前向净空要求；让行层的 stop_range_m 是 1.2 m（cap 1.8 m，
+      # cap 速度 0.8 m/s）。原来 t=1.0 s 对巡航 1.5 m/s 就是 1.5 m —— 比让行
+      # 开始 hold 的 1.2 m 早 0.3 m，于是出现"让行说能走、控制器却不走"（r3b
+      # 41 s 零速、r1/r4 的 `74 collision refusals while the base stood still
+      # for 18.0 s`）。按 1.2 m / 1.5 m/s 取 0.8 s，两层在同一条距离上交接；
+      # 若后续把 max_velocity 降到 1.0 m/s，这里应改为 1.2 s。
+      max_allowed_time_to_collision_up_to_carrot: 0.8
       use_regulated_linear_velocity_scaling: true
       use_cost_regulated_linear_velocity_scaling: true
       # 0.6 m of inflation cost slowed the base for most of the route; 0.25 m

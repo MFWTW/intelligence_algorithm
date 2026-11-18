@@ -47,7 +47,7 @@ task_parser:
     min_count_per_color: 1
     expected_total_counts: 5
     max_cubes_per_color: 5
-    mapping_rule: 1
+    mapping_rule: 3
     red_min_count: 3
     zone_x: B
     zone_y: A

@@ -391,18 +391,58 @@ class MovingObstacleTests(unittest.TestCase):
         return module
 
     def test_default_patrols_parse(self):
+        """Pin the three lanes the operator drew on 2026-11-16.
+
+        The picture was calibrated against the 1 m floor grid and the three zone
+        plates (0.25 px residual); each drawn line was then trimmed and slid in
+        the static map until the whole run had >=0.35 m clearance from an
+        occupied cell. These numbers are that result - changing them silently
+        would move obstacles into walls.
+        """
         movers = self.module()
         patrols = movers.parse_patrols(movers.DEFAULT_PATROLS)
         self.assertEqual([p[0] for p in patrols],
-                         ['mover_1', 'mover_2', 'mover_3'])
-        original_lengths = {'mover_1': 1.5, 'mover_2': math.hypot(1.4, 0.78),
-                            'mover_3': math.hypot(0.86, 1.34)}
-        minimum_extension = {'mover_1': 0.30, 'mover_2': 0.30,
-                             'mover_3': 0.12}
+                         ['mover_1', 'mover_2', 'mover_3', 'mover_4'])
+        expected = {
+            'mover_1': (-11.60, -1.43, -12.42, -4.07),
+            'mover_2': (-2.90, -5.13, 3.19, -5.79),
+            'mover_3': (12.47, -4.00, 12.58, -7.30),
+            'mover_4': (-2.50, 0.80, 0.95, 1.00),
+        }
         for name, x0, y0, x1, y1, speed, _kin in patrols:
-            self.assertEqual(speed, 0.08)
-            self.assertGreater(math.hypot(x1 - x0, y1 - y0),
-                               original_lengths[name] + minimum_extension[name])
+            self.assertEqual(speed, 0.20, name)
+            for got, want in zip((x0, y0, x1, y1), expected[name]):
+                self.assertAlmostEqual(got, want, places=2, msg=name)
+            self.assertGreater(math.hypot(x1 - x0, y1 - y0), 2.5, name)
+
+        # The lanes must stay clear of the walls on the shipping map: a 0.22 m
+        # box is drawn inside the costmaps and must never straddle a wall.
+        import yaml
+        mapdir = ROOT.parent / 'bot_navigation/maps'
+        map_params = yaml.safe_load((mapdir / 'room_from_world.yaml')
+                                    .read_text(encoding='utf-8'))
+        with (mapdir / map_params['image']).open('rb') as stream:
+            self.assertEqual(stream.readline().strip(), b'P5')
+            header = []
+            while len(header) < 3:
+                line = stream.readline()
+                if not line.startswith(b'#'):
+                    header.extend(line.split())
+            width, height = int(header[0]), int(header[1])
+            pixels = np.frombuffer(stream.read(), dtype=np.uint8)
+        self.assertEqual(pixels.size, width * height)
+        rows, cols = np.nonzero(pixels.reshape(height, width) < 128)
+        resolution = float(map_params['resolution'])
+        origin_x, origin_y = map_params['origin'][:2]
+        obstacle_x = origin_x + (cols + 0.5) * resolution
+        obstacle_y = origin_y + (height - rows - 0.5) * resolution
+        for name, x0, y0, x1, y1, _speed, _kin in patrols:
+            for k in range(0, 61):
+                x = x0 + (x1 - x0) * k / 60
+                y = y0 + (y1 - y0) * k / 60
+                clearance = np.hypot(obstacle_x - x, obstacle_y - y).min()
+                self.assertGreaterEqual(clearance, 0.30,
+                                        (name, x, y, clearance))
 
     def test_direction_flips_at_both_ends(self):
         movers = self.module()
@@ -503,7 +543,7 @@ class MovingObstacleTests(unittest.TestCase):
         rclpy.init()
         try:
             node = movers.MovingObstacles()
-            self.assertEqual(len(node.patrols), 3)
+            self.assertEqual(len(node.patrols), 4)
             self.assertTrue(all(p.seen for p in node.patrols))
             node._tick()          # must not raise before the boxes exist
             node.destroy_node()
@@ -818,6 +858,57 @@ class PlacementCheckOrderTests(unittest.TestCase):
         steps = self.steps()
         self.assertEqual(steps.count('self._verify_placement'), 2)
 
+
+class PlacementSlotCountTests(unittest.TestCase):
+    """One cube must consume exactly one slot.
+
+    Measured 2026-11-16 (lanes_gui1, x=1 red -> A): _verify_placement runs
+    twice per delivery (early, then again after the retreat) and both calls
+    incremented _zone_deliveries. Two cubes therefore left the counter at 4,
+    the third delivery was aimed at slot 1 - on top of the cube already
+    parked there - slid 0.283 m off and failed VERIFY_PLACE.
+    """
+
+    def node(self, *, delivered=0, cube_x=6.895, cube_y=-2.519):
+        values = {
+            'verify_placement': True,
+            'warehouse': 'A',
+            'warehouse_a_pose': [7.244, -2.483, -3.141593],
+            'zone_slot_offsets': [0.0, 0.0, 0.0, 0.12, 0.0, -0.12, -0.24, 0.0],
+            'cube_name': 'red_cube_1',
+            'cube_link': 'link',
+            'zone_a_centre': [6.886, -2.483],
+            'zone_half_length_m': 0.485,
+            'zone_half_width_m': 0.235,
+            'placement_tolerance_m': 0.0,
+        }
+        pose = SimpleNamespace(position=SimpleNamespace(x=cube_x, y=cube_y, z=0.015))
+        node = SimpleNamespace(
+            _zone_deliveries={'A': delivered},
+            _stabilize_released_cube=lambda: None,
+            _link_pose=lambda *a, **k: pose,
+            get_parameter=lambda name: SimpleNamespace(value=values[name]),
+            get_logger=lambda: SimpleNamespace(
+                info=lambda *a, **k: None, error=lambda *a, **k: None),
+        )
+        for name in ('_verify_placement', '_warehouse_goal', '_double_list'):
+            setattr(node, name, getattr(module.FixedJointPickPlace, name).__get__(node))
+        return node
+
+    def test_the_post_retreat_check_does_not_consume_a_slot(self):
+        node = self.node(delivered=2)
+        self.assertTrue(node._verify_placement(count=False))
+        self.assertEqual(node._zone_deliveries['A'], 2)
+
+    def test_the_early_check_consumes_exactly_one_slot(self):
+        node = self.node(delivered=2)
+        self.assertTrue(node._verify_placement(count=True))
+        self.assertEqual(node._zone_deliveries['A'], 3)
+
+    def test_a_cube_outside_the_plate_never_consumes_a_slot(self):
+        node = self.node(delivered=0, cube_x=7.60, cube_y=-2.483)
+        self.assertFalse(node._verify_placement(count=True))
+        self.assertEqual(node._zone_deliveries['A'], 0)
 
 class SharedLinkStateRefreshTests(unittest.TestCase):
     """Exactly one place may refresh the Gazebo link states.
@@ -1266,6 +1357,120 @@ class ProfileConsistencyTests(unittest.TestCase):
         self.assertAlmostEqual(profile.get('dock_creep_align_distance_m'), 0.25)
 
 
+class DockCreepLawTests(unittest.TestCase):
+    """The creep must close a sideways residual, not park on a 0.02 m/s floor.
+
+    Measured 2026-11-16 (run_logs/competition_lanes_v02): two warehouse A docks
+    were accepted at 0.210 m. Inside the align distance the law only drove
+    forward, so a residual that was mostly lateral floored at 0.02 m/s; the
+    accept gate (0.22 m) then took the pose and the released cube landed
+    0.153 m off in y, outside the slot box.
+    """
+
+    def twist(self, **kw):
+        args = dict(
+            dx=0.0, dy=0.0, yaw=0.0, base_yaw=0.0, distance=0.0, speed=0.15,
+            forward_gain=0.8, yaw_tolerance=0.06, align_distance=0.25,
+        )
+        args.update(kw)
+        return module.dock_creep_twist(
+            args['dx'], args['dy'], args['yaw'], args['base_yaw'],
+            args['distance'], args['speed'], args['forward_gain'],
+            args['yaw_tolerance'], args['align_distance'],
+        )
+
+    def test_a_pure_sideways_residual_is_driven_at_a_usable_speed(self):
+        vx, wz = self.twist(dx=0.0, dy=0.21, distance=0.21)
+        self.assertGreaterEqual(vx, 0.05, 'sideways residual must not floor')
+        self.assertGreater(abs(wz), 0.5)
+
+    def test_the_final_centimetres_hold_the_plate_yaw(self):
+        vx, wz = self.twist(dx=0.09, dy=0.0, distance=0.09)
+        self.assertAlmostEqual(vx, 0.8 * 0.09, places=3)
+        self.assertEqual(wz, 0.0)
+        self.assertGreaterEqual(vx, 0.02)
+
+    def test_a_far_off_heading_rotates_without_translating(self):
+        # Gain 1.5 with a 0.45 rad/s clamp: at ~0.2 RTF the old 2.0/0.8 law
+        # turned ~11 deg past the target per step and hunted for the whole
+        # budget (2026-11-16, competition_lanes_v02b: 22.6 and -41.1 deg).
+        # Two stages: a large error swings at 1.0 rad/s (the base can arrive
+        # 160 deg off), while the small-error trim below stays slow so it does
+        # not hunt. 2026-11-16: competition_lanes_v02h spent 20 s unwinding
+        # 160 deg at the single 0.45 rad/s clamp.
+        vx, wz = self.twist(dx=0.20, dy=0.0, distance=0.20, yaw=math.pi)
+        self.assertEqual(vx, 0.0)
+        self.assertAlmostEqual(wz, 1.0, places=3)  # 1.2 * pi clamped at 1.0
+
+    def test_a_small_heading_error_trims_slowly(self):
+        vx, wz = self.twist(dx=0.10, dy=0.0, distance=0.10, yaw=0.25)
+        self.assertEqual(vx, 0.0)
+        self.assertAlmostEqual(wz, 1.0 * 0.25, places=3)
+
+    def test_a_small_heading_error_inside_the_deadband_does_not_turn(self):
+        vx, wz = self.twist(dx=0.30, dy=0.0, distance=0.30, yaw=0.03)
+        self.assertEqual(wz, 0.0)
+        self.assertGreater(vx, 0.0)
+
+    def test_the_far_field_points_at_the_goal(self):
+        vx, wz = self.twist(dx=0.50, dy=0.0, distance=0.50)
+        self.assertAlmostEqual(vx, 0.15, places=3)
+        self.assertAlmostEqual(wz, 0.0, places=3)
+
+    def test_acceptable_pose_stops_during_hold_before_placing(self):
+        values = {'dock_creep_speed_mps': .15, 'dock_creep_forward_gain': .8,
+                  'dock_creep_tolerance_m': .03, 'dock_creep_yaw_tolerance_rad': .06,
+                  'dock_creep_timeout_sec': 26., 'dock_creep_accept_m': .10,
+                  'navigation_accept_yaw_rad': .8, 'place_yaw_comp_limit_rad': .6,
+                  'dock_creep_attempts': 2, 'dock_creep_align_distance_m': .25}
+        events = []
+        node = SimpleNamespace(
+            get_parameter=lambda name: SimpleNamespace(value=values[name]),
+            _base_pose=lambda: (0.0, 0.0, -.3),
+            _stop_base=lambda: events.append('stop'),
+            _fine_cmd_pub=SimpleNamespace(publish=lambda msg: events.append(
+                (msg.linear.x, msg.angular.z))),
+            get_logger=lambda: SimpleNamespace(info=lambda *a: None,
+                                                warning=lambda *a: None,
+                                                error=lambda *a: None),
+        )
+        clock = iter(i * .1 for i in range(1000))
+        with patch.object(module.time, 'monotonic', side_effect=lambda: next(clock)), \
+             patch.object(module.time, 'sleep'), \
+             patch.object(module.rclpy, 'ok', return_value=True), \
+             patch.object(module.rclpy, 'spin_once'):
+            result = module.FixedJointPickPlace._creep_to_dock__timed(
+                node, 'test', .08, 0., 0.)
+        self.assertTrue(result)
+        self.assertGreater(len(events), 2)
+        self.assertTrue(all(event == 'stop' for event in events), events)
+        self.assertAlmostEqual(node._dock_yaw_error, .3)
+        self.assertAlmostEqual(node._dock_distance, .08)
+
+    def test_the_profile_refuses_a_loose_dock_acceptance(self):
+        import yaml
+        profile = yaml.safe_load(
+            (ROOT / 'config/profiles/executor_fast.yaml').read_text()
+        )['fixed_joint_pick_place']['ros__parameters']
+        self.assertLessEqual(
+            profile['dock_creep_accept_m'], 0.10,
+            'a 0.22 m acceptance let the base place from 0.21 m out',
+        )
+        self.assertGreaterEqual(profile['dock_creep_attempts'], 2)
+
+    def test_the_y_slot_plus_the_docking_budget_stays_on_the_plate(self):
+        source = (ROOT / 'scripts/fixed_joint_pick_place.py').read_text()
+        start = source.index("'zone_slot_offsets',")
+        literal = source[start:source.index(')', start)]
+        values = ast.literal_eval(
+            literal.split(',', 1)[1].rsplit(',', 1)[0].strip()
+        )
+        y_offsets = values[1::2]
+        half_width = 0.235
+        worst = max(abs(v) for v in y_offsets) + 0.03 + 0.05
+        self.assertLessEqual(worst, half_width, f'worst landing {worst:.3f} m')
+
+
 class ZoneSlotTests(unittest.TestCase):
     """Every delivery used to aim at the same spot, so cubes stacked and slid.
 
@@ -1589,6 +1794,38 @@ class DashboardBridgeTests(unittest.TestCase):
             node, SimpleNamespace(data='  规则2: x 去 B 区  '))
         bridge.DashboardBridge._rules_cb(node, SimpleNamespace(data='   '))
         self.assertEqual(published, [('rules', '规则2: x 去 B 区')])
+
+    def test_dashboard_shows_seed_first_regardless_of_arrival_order(self):
+        import importlib.util
+        spec = importlib.util.spec_from_file_location(
+            'bridge_under_test', ROOT / 'scripts' / 'dashboard_bridge.py')
+        bridge = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(bridge)
+        for seed_first in (True, False):
+            published = []
+            node = SimpleNamespace(_seed='', _problem='',
+                                   _str=lambda n, v: published.append((n, v)))
+            node._publish_problem = lambda: bridge.DashboardBridge._publish_problem(node)
+            seed = lambda: bridge.DashboardBridge._seed_cb(
+                node, SimpleNamespace(data='使用种子: 995389'))
+            problem = lambda: bridge.DashboardBridge._problem_cb(
+                node, SimpleNamespace(data='题目: 计算 x 和 y'))
+            for callback in ((seed, problem) if seed_first else (problem, seed)):
+                callback()
+            self.assertEqual(published[-1],
+                             ('problem', '使用种子: 995389\n计算 x 和 y'))
+
+    def test_dashboard_rules_exclude_non_mapping_details(self):
+        import importlib.util
+        spec = importlib.util.spec_from_file_location(
+            'bridge_under_test', ROOT / 'scripts' / 'dashboard_bridge.py')
+        bridge = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(bridge)
+        published = []
+        node = SimpleNamespace(_str=lambda n, v: published.append((n, v)))
+        bridge.DashboardBridge._rules_cb(node, SimpleNamespace(
+            data='生效映射规则: 规则2\n区域规则: 旧设置\n\n内部抽取提示'))
+        self.assertEqual(published, [('rules', '生效映射规则: 规则2')])
 
 
 class MappingRuleTests(unittest.TestCase):
@@ -2130,6 +2367,80 @@ class ObstacleYieldTests(unittest.TestCase):
         self.assertEqual(len(kept[0]), len(box))
 
 
+    def test_a_box_inside_the_swept_band_is_not_released_on_a_lull(self):
+        """The leak that made a hold flicker at ~1 Hz for 20 s.
+
+        A held base cannot know how fast it will be driving when the box
+        arrives, so the policy projects the crossing at its resume speed
+        (``yield_speed_mps`` 0.6). Release it and the very next tick judges the
+        same box at ``min_speed_mps`` 0.05, ten times slower, and the box is
+        suddenly "in the way" again. Measured 2026-11-15: "hold clear;
+        resuming" and "Yield hold" alternated every second for 20 s while the
+        base was pushed to 0.32 m from a box that never yields (run_logs/
+        competition_margin010_1608/launch.log). A box within the swept band
+        that is still closing therefore keeps the hold, even when its arrival
+        is beyond the 4 s horizon.
+        """
+        decision = self.movers.decide(
+            self.movers.YieldObservation(
+                box_x=0.9, box_y=0.45, box_vx=-0.3, box_vy=-0.02, vx=0.001,
+                right_room_m=1.2, box_world_speed_mps=0.10,
+                distance_to_goal_m=6.0, latched=True,
+            ),
+            self.cfg, wait_elapsed_sec=3.0,
+        )
+        self.assertEqual(decision.action, self.movers.ACTION_STOP)
+        self.assertIn('holding', decision.detail)
+
+    def test_a_box_clear_of_the_band_that_is_leaving_still_releases_the_hold(self):
+        """The hysteresis must not turn every hold into a 20 s wait: a box
+        outside the base's width that is moving away is out of the way."""
+        decision = self.movers.decide(
+            self.movers.YieldObservation(
+                box_x=0.9, box_y=0.60, box_vx=-0.3, box_vy=0.02, vx=0.001,
+                right_room_m=1.2, box_world_speed_mps=0.10,
+                distance_to_goal_m=6.0, latched=True,
+            ),
+            self.cfg, wait_elapsed_sec=3.0,
+        )
+        self.assertEqual(decision.action, self.movers.ACTION_GO)
+
+    def test_a_lane_hold_with_no_room_still_hands_the_leg_back(self):
+        """Waiting inside a lane is only safe if the wait can end.
+
+        Holding instead of handing back was tried on 2026-11-15 and reverted:
+        the base's own route runs along mover_1's lane, so it is in_lane for the
+        whole transit, the box oscillates inside the swept band, and the base
+        sat at (-11.89,-3.55) for three consecutive 45 s legs
+        (run_logs/competition_yieldfix3). A hold that cannot resolve is worse
+        than the refusal loop, which at least lets the executor's dead-zone
+        escape fire.
+        """
+        decision = self.movers.decide(
+            self.movers.YieldObservation(
+                box_x=0.9, box_y=0.0, box_vx=-0.3, box_vy=-0.10, vx=0.001,
+                left_room_m=0.1, right_room_m=0.1, lane_distance_m=0.30,
+                box_world_speed_mps=0.10, distance_to_goal_m=6.0, latched=True,
+            ),
+            self.cfg, wait_elapsed_sec=self.cfg.lane_escape_delay_sec + 1.0,
+        )
+        self.assertEqual(decision.action, self.movers.ACTION_GO)
+        self.assertEqual(decision.reason, self.movers.REASON_WAIT_EXPIRED)
+
+    def test_the_hold_clearance_covers_the_base_and_the_box(self):
+        """Parking the base centre 0.5 m from a lane saw a 0.22 m box pass
+        through it: 0.5 - 0.11 (box half width) - 0.35 (base half width) is
+        4 cm. The clearance is the one number that decides whether stopping
+        protects the base or leaves it in the sweep."""
+        self.assertGreaterEqual(
+            self.cfg.lane_hold_clearance_m,
+            self.cfg.base_half_width_m + self.cfg.obstacle_half_width_m + 0.10,
+            'a hold must leave real daylight between the base and the box',
+        )
+        # And the release band has to sit outside the swept width, or the
+        # hysteresis would never fire.
+        self.assertGreater(self.cfg.hold_release_margin_m, 0.0)
+
 class YieldSpeedLimitTests(unittest.TestCase):
     """The yield policy's only actuator on the base is the controller's speed
     limit, so how it is encoded decides whether the base stops or accelerates.
@@ -2208,6 +2519,80 @@ class YieldSpeedLimitTests(unittest.TestCase):
         self.assertEqual([m.speed_limit for m in pub.sent],
                          [module.YIELD_STOP_SPEED_LIMIT, 0.0])
         self.assertTrue(all(not m.percentage for m in pub.sent))
+
+    def test_a_release_keeps_the_latch_until_the_base_has_actually_moved(self):
+        """Only the latch is kept through a release, never the hold.
+
+        The latch is what makes the policy judge the corridor at
+        ``yield_speed_mps`` instead of at a stopped base's ``min_speed_mps``.
+        Dropping it on the same tick as the release is what produced the 1 Hz
+        flicker, so it survives until the base has travelled ``go_commit_m``.
+        """
+        pub = self.FakePublisher()
+        node = self.node(pub=pub)
+        node._yield_suppress = False
+        node._yield_last_update = -math.inf
+        node._yield_latched = False
+        node._yield_wait_since = None
+        node._yield_clear_since = None
+        node._yield_arc_attempts = 0
+        node._yield_arc_goal = None
+        node._yield_arc_used = False
+        node._yield_release_from = None
+        node._yield_release_since = None
+        node._update_yield_episode = lambda *a, **k: None
+        node._yield_config = SimpleNamespace(
+            max_arc_attempts=2, wait_budget_sec=20.0, clear_hold_sec=0.5,
+            go_commit_sec=0.8, go_commit_m=0.40)
+        node.get_parameter = lambda name: SimpleNamespace(value=0.0)
+        decisions = iter((
+            (module.obstacle_yield.YieldDecision('stop', 'wait'), True, None),
+            (module.obstacle_yield.YieldDecision('go', 'clear'), False, None),
+            (module.obstacle_yield.YieldDecision('go', 'clear'), False, None),
+        ))
+        node._yield_step = lambda _: next(decisions)
+        module.FixedJointPickPlace._tick_yield(node)
+        self.assertTrue(node._yield_latched, 'the first stop latches the episode')
+        node._yield_clear_since = module.time.monotonic() - 0.6
+        module.FixedJointPickPlace._tick_yield(node)
+        self.assertTrue(node._yield_latched,
+                        'a release may not drop the latch while the base sits still')
+        # Once the base has actually travelled, the episode is genuinely free.
+        node._cached_base_position = lambda: (0.5, 0.0)
+        module.FixedJointPickPlace._tick_yield(node)
+        self.assertFalse(node._yield_latched)
+
+    def test_only_a_costmap_cell_outside_the_inscribed_band_is_usable(self):
+        """The arc apex is the one goal the executor plans to itself, so it has
+        to be judged by the same grid the planner uses: 100 is lethal (254), 99
+        is inside the inscribed radius (253) and both are unpalpable goals;
+        unknown space (-1) cannot seed a plan either."""
+        grid = SimpleNamespace(
+            info=SimpleNamespace(
+                resolution=0.05, width=10, height=10,
+                origin=SimpleNamespace(position=SimpleNamespace(x=0.0, y=0.0)),
+            ),
+            data=[0] * 100,
+        )
+        node = SimpleNamespace(_global_costmap=None)
+        self.assertIsNone(
+            module.FixedJointPickPlace._costmap_clearance_at(node, 0.1, 0.1),
+            'no map yet means "no opinion", never "free"')
+
+        node._global_costmap = grid
+        # Cell (0, 0) covers [0, 0.05) in both axes; walk it up to the corner.
+        self.assertTrue(
+            module.FixedJointPickPlace._costmap_clearance_at(node, 0.01, 0.01))
+        for value, why in ((100, 'lethal'), (99, 'inscribed'), (-1, 'unknown')):
+            data = [0] * 100
+            data[0] = value
+            grid.data = data
+            self.assertFalse(
+                module.FixedJointPickPlace._costmap_clearance_at(node, 0.01, 0.01),
+                f'{why} space is not a usable arc goal')
+        self.assertIsNone(
+            module.FixedJointPickPlace._costmap_clearance_at(node, 5.0, 5.0),
+            'outside the map is "no opinion" as well')
 
     def test_the_service_used_to_clear_a_limit_is_still_zero(self):
         """0.0 stays reserved for "resume", so the two meanings cannot collide."""
@@ -2297,7 +2682,10 @@ class YieldWiringTests(unittest.TestCase):
         # The profile is the deployment contract: the values that decide how
         # close the base may come are pinned there, not left to script defaults.
         for key in ('yield_clear_margin_sec', 'yield_max_mover_speed_mps',
-                    'yield_wait_budget_sec'):
+                    'yield_wait_budget_sec', 'yield_lane_hold_clearance_m',
+                    'yield_hold_release_margin_m', 'yield_go_commit_sec',
+                    'yield_go_commit_m', 'yield_arc_costmap_check',
+                    'freeze_physics_around_link_services'):
             self.assertIn(key, params)
 
     def test_a_turning_base_does_not_open_a_new_conflict(self):
@@ -2405,15 +2793,21 @@ class YieldWiringTests(unittest.TestCase):
         (past the 20 s budget) because only the latched branch honoured it -
         29 holds in one round and a delivery leg that failed with the cube
         still attached. An unlatched conflict must escalate the same way.
+
+        The one deliberate exception is the 0.75 m keep-out band, where a hold
+        outranks the budget (see the test below); the box here therefore stands
+        at 1.04 m, outside that band and inside the 1.8 m cap range.
         """
         oy = module.obstacle_yield
         cfg = oy.YieldConfig()
-        # Straight off the log line "box (+0.43,-0.28) v=(+0.00,+0.03)": a box
-        # sitting in the corridor, i.e. a genuine conflict for a fresh tick.
+        # A box sitting in the corridor, i.e. a genuine conflict for a fresh
+        # tick, but far enough out that the keep-out rule does not own it.
         fresh = oy.YieldObservation(
-            box_x=0.43, box_y=-0.28, box_vx=0.0, box_vy=+0.03, vx=1.5,
+            box_x=1.0, box_y=-0.28, box_vx=0.0, box_vy=+0.03, vx=1.5,
             left_room_m=0.9, right_room_m=1.2, distance_to_goal_m=6.0,
             box_world_speed_mps=0.16, latched=False)
+        self.assertGreater(math.hypot(fresh.box_x, fresh.box_y),
+                           cfg.keepout_conflict_m)
         self.assertEqual(oy.decide(fresh, cfg, wait_elapsed_sec=0.0).action,
                          oy.ACTION_STOP)
         spent = oy.decide(fresh, cfg, wait_elapsed_sec=cfg.wait_budget_sec + 14.0)
@@ -2426,6 +2820,32 @@ class YieldWiringTests(unittest.TestCase):
                               arc_attempts=cfg.max_arc_attempts)
         self.assertEqual(exhausted.action, oy.ACTION_GO)
         self.assertEqual(exhausted.reason, oy.REASON_WAIT_EXPIRED)
+
+    def test_a_box_inside_the_keep_out_holds_even_on_a_spent_budget(self):
+        """Inside the 0.75 m band the hold outranks the episode budget.
+
+        Measured 2026-11-16 (r10c): a mover closed to 0.38 m from the base
+        while this layer still answered "cap 0.8 m/s" 27 times, and the base
+        was shoved for 45 s on four consecutive legs until the round failed.
+        Inside the band, capping is the one answer that is certainly wrong, and
+        a lateral exit taken from there cannot clear the box's half-width plus
+        the carried footprint either - so the hold takes precedence even when
+        the episode budget is spent. What bounds it is the caller: Nav2's own
+        progress checker and the executor's retry policy.
+        """
+        oy = module.obstacle_yield
+        cfg = oy.YieldConfig()
+        near = oy.YieldObservation(
+            box_x=0.43, box_y=-0.28, box_vx=0.0, box_vy=+0.03, vx=1.5,
+            left_room_m=0.9, right_room_m=1.2, distance_to_goal_m=6.0,
+            box_world_speed_mps=0.16, latched=False)
+        self.assertLess(math.hypot(near.box_x, near.box_y),
+                        cfg.keepout_conflict_m)
+        for wait in (0.0, cfg.wait_budget_sec + 14.0):
+            decision = oy.decide(near, cfg, wait_elapsed_sec=wait)
+            self.assertEqual(decision.action, oy.ACTION_STOP,
+                             f'wait={wait:.1f} s must still hold inside the band')
+            self.assertEqual(decision.reason, oy.REASON_KEEPOUT)
 
     def test_a_box_at_its_patrol_end_is_not_believed_when_it_leaves(self):
         """A mover reverses at the end of its segment; its velocity lies first.
@@ -2644,10 +3064,16 @@ class YieldWiringTests(unittest.TestCase):
             (ROOT / 'config' / 'profiles' / 'executor_fast.yaml').read_text(
                 encoding='utf-8'))['fixed_joint_pick_place']['ros__parameters']
         # The tight passages keep an explicit cap, and it stays far below cruise.
+        # The 2026-11 throughput pass raised these from 0.6 to 0.9 m/s and
+        # narrowed their radius to 0.8 m (they were 1.4/1.2 m wide before).
+        # The guard moves with the tuning on purpose: 0.9 is still ~60% of the
+        # 1.5 m/s cruise, and the point of this assertion is that a tight
+        # passage never loses its explicit cap, not that 0.8 is the number
+        # forever. Anything at or above cruise is what it must catch.
         caps = executor['slow_zones'][3::4]
         self.assertTrue(caps)
         for cap in caps:
-            self.assertLessEqual(cap, 0.8)
+            self.assertLessEqual(cap, 0.9)
         self.assertLessEqual(executor['dock_creep_speed_mps'], 0.2)
 
     def test_a_controller_refusal_recovers_quickly(self):
@@ -2841,6 +3267,7 @@ class YieldWiringTests(unittest.TestCase):
 class PatrolBypassRouteTests(unittest.TestCase):
     """A fixed bypass must not put a loaded robot on mover_3's patrol line."""
 
+    @unittest.skip('Fixed blue_cube_3 -> A waypoints removed at operator request')
     def test_blue_cube_3_a_route_goes_south_and_east_of_the_patrol(self):
         import yaml
 
@@ -2877,8 +3304,21 @@ class PatrolBypassRouteTests(unittest.TestCase):
             samples.extend((start[0] + (end[0] - start[0]) * k / count,
                             start[1] + (end[1] - start[1]) * k / count)
                            for k in range(count + 1))
-        self.assertGreaterEqual(min(segment_distance(p, patrol)
-                                    for p in samples), 0.85)
+        # 2026-11-16 the operator moved mover_3 onto a north-south lane at
+        # x~12.7 (drawn on a screenshot), which sits inside the eastern
+        # corridor this route has to use. The route now *crosses* that lane
+        # instead of staying 0.85 m away from it - and a crossing is safe,
+        # because the base holds at least 0.62 m short of a mover lane and the
+        # box passes; what must never happen again is the route *running along*
+        # the lane (the 2026-10-14 wedge at (11.6,-5.5) sat in it for 105 s).
+        # So: no lingering - at most 2 m of arc inside the 0.85 m band.
+        inside = [segment_distance(p, patrol) < 0.85 for p in samples]
+        longest, run = 0, 0
+        for near in inside:
+            run = run + 1 if near else 0
+            longest = max(longest, run)
+        self.assertLessEqual(longest * 0.05, 2.0,
+                             'the route runs along the patrol lane')
         self.assertGreaterEqual(segment_distance(points[0], patrol), 1.9,
                                 'the first waypoint must be a safe waiting spot')
         self.assertAlmostEqual(float(params['loaded_robot_radius_m']), 0.35)
@@ -2959,6 +3399,28 @@ class ContinuousDetourTests(unittest.TestCase):
         'blue_cube_3_warehouse_a_via_2': [13.65, -6.85, -0.07],
         'blue_cube_3_warehouse_a_via_3': [13.65, -3.0, 1.570796],
     }
+
+    def test_blue_cube_3_a_has_no_forced_waypoints_in_both_configs(self):
+        import yaml
+        for path in (ROOT / 'config/profiles/executor_fast.yaml',
+                     ROOT / 'config/fixed_joint_pick_place.yaml'):
+            params = yaml.safe_load(path.read_text(encoding='utf-8'))[
+                'fixed_joint_pick_place']['ros__parameters']
+            for i in (1, 2, 3):
+                self.assertEqual(params[f'blue_cube_3_warehouse_a_via_{i}'], [])
+            node = self.node(waypoints=params)
+            self.assertEqual(node._detour_waypoints('blue_cube_3', 'a'), [])
+
+    def test_red_cube_1_c_has_no_forced_waypoints_in_both_configs(self):
+        import yaml
+        for path in (ROOT / 'config/profiles/executor_fast.yaml',
+                     ROOT / 'config/fixed_joint_pick_place.yaml'):
+            params = yaml.safe_load(path.read_text(encoding='utf-8'))[
+                'fixed_joint_pick_place']['ros__parameters']
+            for i in (1, 2):
+                self.assertEqual(params[f'red_cube_1_warehouse_c_via_{i}'], [])
+            self.assertEqual(self.node(waypoints=params)._detour_waypoints(
+                'red_cube_1', 'c'), [])
 
     def test_a_chain_becomes_one_through_poses_goal_in_order(self):
         node = self.node()
@@ -3265,6 +3727,9 @@ class VisualAlignResearchTests(unittest.TestCase):
             'visual_detection_stale_sec': 0.5, 'visual_linear_gain': 0.5,
             'visual_angular_gain': 0.5, 'visual_max_linear_speed': 0.15,
             'visual_min_linear_speed': 0.02, 'visual_max_angular_speed': 0.25,
+            # Read by the "blob lost while searching" branch before it decides
+            # whether to open the standoff; the real node declares it too.
+            'visual_handoff_coast_min_distance_m': 0.45,
         }
         states, commands = [], []
         clock = {'t': 0.0}
@@ -3282,6 +3747,10 @@ class VisualAlignResearchTests(unittest.TestCase):
             _stop_base=lambda: None,
             _publish_vision_state=lambda state: states.append(state),
             _creep_to_grasp=lambda row: states.append(f'CREEP:{row:.0f}') or True,
+            # No measured range in these scripted runs: the standoff back-off
+            # stays out of the way and the loop just re-searches.
+            _cached_planar_distance_to_cube=lambda name: None,
+            _retreat_to_handoff_standoff=lambda *a, **k: None,
             get_logger=lambda: SimpleNamespace(
                 info=lambda *a, **k: None, warning=lambda *a, **k: None,
                 error=lambda *a, **k: None),
@@ -3329,6 +3798,39 @@ class VisualAlignResearchTests(unittest.TestCase):
         self.assertIn('SEARCHING:red', states[first_align:],
                       f'no re-search after losing the blob: {states}')
         self.assertNotIn('CREEP', ' '.join(states))
+
+    def test_a_centred_blob_leaving_the_frame_hands_over_to_creep(self):
+        """The fifth cube slides under a level camera; searching cannot help.
+
+        Measured 2026-11-17: below ~0.22 m a 5 cm cube is out of frame, so the
+        re-search only spins for the rest of the 75 s window. When the blob was
+        last seen centred and already at the acceptance row, the row is handed
+        to the creep instead. The rows here disagree by more than the span
+        limit, so the loop never accepts on its own and the loss is what ends
+        the alignment.
+        """
+        def detect(tick_t):
+            if tick_t < 6.0:
+                return None
+            if tick_t < 10.0:
+                # Centred, at the acceptance row, but oscillating across the
+                # span limit so no three frames agree.
+                row = 421.0 if int(tick_t * 4) % 2 else 439.0
+                return (320.0, 40.0, 900.0, 640, row)
+            return None
+
+        def spin(_node, timeout_sec=None):
+            node._visual_detection = detect(clock['t'])
+            node._visual_detection_time = clock['t']
+
+        node, states, commands, clock, now, _ = self.build(None, None)
+        ok = self.run_align(node, None, clock, now, spin)
+        self.assertTrue(ok, f'the centred row should have been handed over: {states}')
+        creeping = [s for s in states if s.startswith('CREEP')]
+        self.assertTrue(creeping, f'no creep hand-over: {states}')
+        # The row handed over is the last one seen, not the first: 439 is the
+        # frame the blob vanished on.
+        self.assertEqual(creeping[-1], 'CREEP:439')
 
     def test_stays_in_search_when_nothing_is_ever_seen(self):
         def spin(_node, timeout_sec=None):
@@ -3873,3 +4375,105 @@ class ProbeFreshnessTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class LinkServiceFreezeTests(unittest.TestCase):
+    """The world must be paused for the joint mutation, and only briefly.
+
+    Gazebo Classic runs the attacher's ATTACH/DETACH callbacks on a ROS thread
+    while ODE steps in the physics thread. Every recorded crash of this project
+    is `gzserver exit code -11` about half a second after DETACH, during
+    VERIFY_PLACE, faulting at the same offset inside libgazebo_ode - so the
+    mutation is now sandwiched between two physics steps, and the pause is
+    capped so a wedged service cannot leave the simulation frozen.
+    """
+
+    def node(self, frozen_ok=True, thaw=True):
+        node = SimpleNamespace(
+            log=[],
+            _link_service_frozen=False,
+            _freeze_physics=lambda: frozen_ok,
+            _thaw_physics=lambda: node.log.append('thaw'),
+            _call_link_service_unfrozen=lambda label, client, request: (
+                node.log.append(('call', label,
+                                 node._link_service_frozen)) or 'done'),
+        )
+        return node
+
+    def request(self):
+        return SimpleNamespace(model1_name='six_arm', link1_name='link6',
+                               model2_name='red_cube_1', link2_name='link')
+
+    def test_the_world_is_paused_around_the_service_call(self):
+        node = self.node()
+        result = module.FixedJointPickPlace._call_link_service(
+            node, 'DETACH', Mock(), self.request())
+        self.assertEqual(result, 'done')
+        self.assertEqual(node.log, [('call', 'DETACH', True), 'thaw'])
+        self.assertFalse(node._link_service_frozen)
+
+    def test_the_world_is_thawed_even_when_the_call_blows_up(self):
+        node = self.node()
+
+        def boom(*_a):
+            raise RuntimeError('service exploded')
+
+        node._call_link_service_unfrozen = boom
+        with self.assertRaises(RuntimeError):
+            module.FixedJointPickPlace._call_link_service(
+                node, 'DETACH', Mock(), self.request())
+        self.assertEqual(node.log, ['thaw'])
+        self.assertFalse(node._link_service_frozen)
+
+    def test_nothing_is_thawed_when_the_freeze_did_not_take(self):
+        node = self.node(frozen_ok=False)
+        module.FixedJointPickPlace._call_link_service(
+            node, 'ATTACH', Mock(), self.request())
+        self.assertEqual(node.log, [('call', 'ATTACH', False)])
+
+    def test_unpause_failure_stops_instead_of_silently_continuing(self):
+        node = self.node()
+        node._thaw_physics = lambda: False
+        with self.assertRaisesRegex(RuntimeError, 'UNPAUSE_STATE_UNKNOWN'):
+            module.FixedJointPickPlace._call_link_service(
+                node, 'DETACH', Mock(), self.request())
+
+    def test_unpause_retries_timeouts_then_succeeds(self):
+        timeout_future = Future()
+        done_future = Future()
+        done_future.set_result(object())
+        client = SimpleNamespace(call_async=Mock(side_effect=[timeout_future, done_future]))
+        node = SimpleNamespace(
+            _physics_client=lambda name: client,
+            get_parameter=lambda name: SimpleNamespace(value=.01),
+            get_logger=lambda: SimpleNamespace(warning=Mock(), error=Mock()))
+        with patch.object(module.rclpy, 'spin_until_future_complete'):
+            self.assertTrue(module.FixedJointPickPlace._thaw_physics(node))
+        self.assertEqual(client.call_async.call_count, 2)
+
+    def test_late_pause_response_requests_another_unpause(self):
+        pending = Future()
+        pause = SimpleNamespace(call_async=Mock(return_value=pending))
+        unpause = SimpleNamespace(call_async=Mock())
+        node = SimpleNamespace(
+            _link_service_freeze_enabled=lambda: True,
+            _physics_client=lambda name: pause if name == '/pause_physics' else unpause,
+            _thaw_physics=Mock(return_value=True),
+            get_parameter=lambda name: SimpleNamespace(value=.01),
+            get_logger=lambda: SimpleNamespace(info=Mock(), warning=Mock(), error=Mock()))
+        with patch.object(module.rclpy, 'spin_until_future_complete'):
+            with self.assertRaisesRegex(RuntimeError, 'PAUSE_STATE_UNKNOWN'):
+                module.FixedJointPickPlace._freeze_physics(node)
+        node._thaw_physics.assert_called_once()
+        pending.set_result(object())
+        unpause.call_async.assert_called_once()
+
+    def test_the_wait_for_a_frozen_world_is_capped_by_the_freeze_timeout(self):
+        node = SimpleNamespace(_link_service_frozen=True)
+        params = {'service_timeout_sec': 10.0, 'physics_freeze_timeout_sec': 2.0}
+        node.get_parameter = lambda name: SimpleNamespace(value=params[name])
+        self.assertEqual(
+            module.FixedJointPickPlace._link_service_timeout(node), 2.0)
+        node._link_service_frozen = False
+        self.assertEqual(
+            module.FixedJointPickPlace._link_service_timeout(node), 10.0)

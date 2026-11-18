@@ -96,11 +96,14 @@ cp "$(ros2 pkg prefix mybot)/share/mybot/config/foxglove/competition_layout.json
 
 Foxglove → 右上 `Layouts` → `Import from file…` → 选上面那个文件。
 
-导入后是九宫格式的九块面板，全部已绑定真实话题：
+导入后共十一块面板，全部已绑定真实话题。左上角第一格是**题目种子**
+（只放 `使用种子: N`，整场固定不动），它下面并列左右两块分别是**计算题目**
+与**规则题目**（映射规则），其余面板保持原来的 3D／视觉／状态／日志布局。
 
 | 面板              | 话题                        | 类型                  | 发布者               |
 | ----------------- | --------------------------- | --------------------- | -------------------- |
-| 原始题目          | `/competition/task_problem` | `std_msgs/String`     | `task_parser`        |
+| 题目种子          | `/competition/task_seed`    | `std_msgs/String`（latched，内容为 `使用种子: N`） | `task_parser` |
+| 计算题目          | `/competition/task_problem` | `std_msgs/String`     | `task_parser`        |
 | 大模型原始回复    | `/competition/task_raw_reply` | `std_msgs/String`   | `task_parser`        |
 | 结构化任务        | `/competition/task`         | `std_msgs/String`（JSON，latched） | `task_parser` |
 | 进度              | `/competition/progress`     | `std_msgs/String`（JSON，latched） | `task_state_machine` |
@@ -109,6 +112,12 @@ Foxglove → 右上 `Layouts` → `Import from file…` → 选上面那个文�
 | 3D（地图/路径/雷达/机器人） | `/map`、`/global_costmap/costmap`、`/scan`、`/plan`、`/local_plan`、`/amcl_pose`、`/odom`、`/tf`、`/joint_states`、`/robot_description` | OccupancyGrid / LaserScan / Path / Pose /
 | 视觉识别画面      | `/vision/debug_image`       | `sensor_msgs/Image`   | `fixed_joint_pick_place.py` |
 | 日志              | `/rosout`                   | `rcl_interfaces/Log`  | 全部节点             |
+
+题目文本为什么要拆成两块：竞赛模式下生成器会先打印
+`使用种子: 995389`，再打印分隔线和 `题目: …`。以前种子被拼进
+`/competition/task_problem` 的末尾（`问题文本\n(种子 N)`），面板里要滚到最下面
+才看得到，而种子是评委核对"是不是这 30 分钟那道题"的唯一凭据，所以现在单独发到
+`/competition/task_seed`（同样 latched、同样受 `parser_linger_sec` 保护）。
 
 3D 面板里已经配好两层：`foxglove.Grid` 网格，以及 `foxglove.Urdf`
 （`sourceType: topic`，取 `/robot_description`，关节跟随 `/joint_states`），

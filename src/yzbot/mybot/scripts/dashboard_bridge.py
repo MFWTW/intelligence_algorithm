@@ -101,6 +101,9 @@ class DashboardBridge(Node):
             )
         }
 
+        self._seed = ''
+        self._problem = ''
+        self.create_subscription(String, '/competition/task_seed', self._seed_cb, qos)
         self.create_subscription(String, '/competition/task', self._task_cb, qos)
         self.create_subscription(
             String, '/competition/task_problem', self._problem_cb, qos
@@ -160,9 +163,21 @@ class DashboardBridge(Node):
         )
 
     def _rules_cb(self, msg: String) -> None:
+        # The parser's first line is the actual active mapping rule; subsequent
+        # lines contain auxiliary settings and internal extraction instructions.
         text = msg.data.strip()
         if text:
-            self._str('rules', text)
+            self._str('rules', text.splitlines()[0].strip())
+
+    def _publish_problem(self) -> None:
+        if self._problem:
+            self._str('problem', '\n'.join(
+                part for part in (self._seed, self._problem) if part
+            ))
+
+    def _seed_cb(self, msg: String) -> None:
+        self._seed = msg.data.strip()
+        self._publish_problem()
 
     def _problem_cb(self, msg: String) -> None:
         text = msg.data.strip()
@@ -170,7 +185,8 @@ class DashboardBridge(Node):
         for prefix in ('题目:', '题目：'):
             if text.startswith(prefix):
                 text = text[len(prefix):].strip()
-        self._str('problem', text)
+        self._problem = text
+        self._publish_problem()
 
     def _state_cb(self, msg: String) -> None:
         state = msg.data.strip()

@@ -48,6 +48,9 @@ fixed_joint_pick_place:
     enable_visual_handoff: true
     visual_handoff_distance_m: 1.4
     visual_handoff_min_distance_m: 0.85
+    # 停稳后低于这个距离先退避：相机行先验在 ~0.45 m 内会跑出画面，
+    # 探测器会把所有轮廓拒掉，表现成 "Visual blob lost" + 75 s 超时。
+    visual_handoff_coast_min_distance_m: 0.45
     warehouse_a_pose:
     - 7.244
     - -2.483
@@ -98,31 +101,16 @@ fixed_joint_pick_place:
     - 0.016
     - -2.702
     - -1.570796
-    red_cube_1_warehouse_c_via_1:
-    - -3.85
-    - -6.725
-    - -0.475695
-    red_cube_1_warehouse_c_via_2:
-    - 0.025
-    - -4.875
-    - 0.51095
-    blue_cube_3_warehouse_a_via_1:
-    - 12.875
-    - -3.875
-    - 0.454302
-    blue_cube_3_warehouse_a_via_2:
-    - 12.875
-    - -3.525
-    - 1.570796
-    blue_cube_3_warehouse_a_via_3:
-    - 12.7
-    - -2.8
-    - 2.422763
+    red_cube_1_warehouse_c_via_1: []
+    red_cube_1_warehouse_c_via_2: []
+    blue_cube_3_warehouse_a_via_1: []
+    blue_cube_3_warehouse_a_via_2: []
+    blue_cube_3_warehouse_a_via_3: []
     robot_model_name: six_arm
     robot_base_link: base_footprint
     empty_robot_radius_m: 0.32
     empty_inflation_radius_m: 0.55
-    global_radius_margin_m: 0.0
+    global_radius_margin_m: 0.10
     loaded_robot_radius_m: 0.35
     loaded_inflation_radius_m: 0.6
     robot_attach_link: link6

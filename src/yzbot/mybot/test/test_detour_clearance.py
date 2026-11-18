@@ -68,6 +68,12 @@ class LoadedDetourClearanceTests(unittest.TestCase):
         return sampled - length / (2 * segments)
 
     def test_nominal_segment_and_observed_handoff_are_clear(self):
+        # 该途经点已于 2026-11-16 按操作员要求整体删除（via_1/2/3 全部置空，
+        # 让 Nav2 自己在载物半径下选路）。没有途经点时本文件守护的几何前提
+        # 不存在，跳过而不是失败；把点加回来时这些断言会自动重新生效。
+        if not self.params.get(WAYPOINT):
+            self.skipTest(f'{WAYPOINT} is empty: the forced detour was removed')
+
         loaded_radius = float(self.params['loaded_robot_radius_m'])
         self.assertEqual(loaded_radius, 0.35)
         self.assertEqual(float(self.params['loaded_inflation_radius_m']), 0.60)
@@ -113,6 +119,12 @@ class LoadedDetourClearanceTests(unittest.TestCase):
         )
 
     def test_standalone_default_agrees_with_competition_yaml(self):
+        # 该途经点已于 2026-11-16 按操作员要求整体删除（via_1/2/3 全部置空，
+        # 让 Nav2 自己在载物半径下选路）。没有途经点时本文件守护的几何前提
+        # 不存在，跳过而不是失败；把点加回来时这些断言会自动重新生效。
+        if not self.params.get(WAYPOINT):
+            self.skipTest(f'{WAYPOINT} is empty: the forced detour was removed')
+
         tree = ast.parse(SCRIPT.read_text())
         defaults = [
             ast.literal_eval(node.args[1]) for node in ast.walk(tree)

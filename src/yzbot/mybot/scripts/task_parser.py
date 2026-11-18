@@ -259,6 +259,13 @@ class TaskParser(Node):
         self._problem_pub = self.create_publisher(
             String, '/competition/task_problem', result_qos
         )
+        # The seed is published on its own topic so the dashboard can show it as
+        # a fixed pane above the problem: it is one number for the whole 30
+        # minute competition problem, and mixed into the problem text it pushed
+        # the actual question down out of view.
+        self._seed_pub = self.create_publisher(
+            String, '/competition/task_seed', result_qos
+        )
         self._rules_pub = self.create_publisher(
             String, '/competition/task_rules', result_qos
         )
@@ -430,7 +437,8 @@ class TaskParser(Node):
             # The seed identifies the 30-minute competition problem; record it so
             # a round can be tied back to what the judge announced.
             self.get_logger().warning(f'Generator seed: {seed}')
-            self._publish(self._problem_pub, f'{problem}\n(种子 {seed})')
+            self._publish(self._seed_pub, f'{SEED_PREFIX}: {seed}')
+            self._publish(self._problem_pub, problem)
         if problem is None:
             self.get_logger().error('Problem generator produced no output.')
             return None

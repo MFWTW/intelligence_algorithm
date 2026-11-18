@@ -21,7 +21,7 @@ rolling local costmap for most of the route, so clearing cannot erase old marks.
 
 Patrols are declared as one string so the parameter has no array-typing problem:
 
-    patrols: "mover_1:-12.20,-3.00,-10.30,-3.00,0.08; mover_2:1.48,-5.82,-0.28,-4.84,0.08"
+    patrols: "mover_1:-11.60,-1.43,-12.42,-4.07,0.20; mover_2:-2.90,-5.13,3.19,-5.79,0.20"
 
 i.e. `name:x_start,y_start,x_end,y_end,speed_mps`. The box's yaw in the world is
 set to the segment direction, so the served pose drives the whole segment.
@@ -45,7 +45,8 @@ from tf2_ros import Buffer, TransformException, TransformListener
 from std_msgs.msg import Header, String
 from sensor_msgs_py import point_cloud2
 
-# All three patrol boxes run at the operator-selected 0.08 m/s. Endpoints extend
+# All four patrol boxes run at the operator-selected 0.20 m/s (raised from
+# 0.08 on 2026-11-16 so the base has to actually avoid them, not just wait).
 # the original centre lines; mover_3 has less room near the static walls, so its
 # extension is smaller.
 DEFAULT_PATROLS = (
@@ -55,12 +56,30 @@ DEFAULT_PATROLS = (
     # ground at ... exceeding 3.0 m/s") on the very first leg. Moved to open
     # floor at x=-12, where the static map gives 0.87-1.39 m of clearance and the
     # nearest cube, zone plate or start pose is 6.3 m away.
-    'mover_1:-12.20,-3.00,-10.30,-3.00,0.08;'
-    'mover_2:1.48,-5.82,-0.28,-4.84,0.08;'
+    #
+    # 2026-11-16: the operator drew three new lanes on a Gazebo screenshot and
+    # asked for the boxes to patrol those instead. The lines were recovered from
+    # the picture by fitting the 1 m floor grid plus the three zone plates
+    # (fit residual 0.25 px) and each drawn line was then trimmed in the static
+    # map until its whole length kept >=0.30 m from an occupied cell - a 0.22 m
+    # box must not be steered into a wall. Nothing was slid sideways.
+    #   drawn (left)   (-11.52,-1.18)->(-12.42,-4.07) 3.02 m -> kept 2.79 m
+    #   drawn (middle) ( -3.10,-5.11)->(  3.94,-5.87) 7.08 m -> kept 6.17 m
+    #   drawn (right)  ( 12.47,-4.00)->( 12.59,-7.70) 3.71 m -> kept 3.33 m
+    # Only the tips were cut (the drawn lines end on or just past a wall); no
+    # lane was slid sideways, so each one still runs exactly where it was drawn.
+    # mover_1 keeps the west lane but now runs north-south inside the pen, mover_2
+    # sweeps the open middle floor, mover_3 the eastern corridor.
+    'mover_1:-11.60,-1.43,-12.42,-4.07,0.20;'
+    'mover_2:-2.90,-5.13,3.19,-5.79,0.20;'
     # mover_3 carries the `k` flag: measured on movers_live/stack2.log it was
     # shoved off its own segment and wedged there for 60+ s. Kinematic bodies
     # ignore contact forces, so the base cannot displace it.
-    'mover_3:11.71,-4.45,12.65,-5.91,0.08,k'
+    'mover_3:12.47,-4.00,12.58,-7.30,0.20,k;'
+    # Fourth lane: across the upper wall opening, as drawn in the Gazebo view.
+    # Endpoints stay inside the opening; the 0.22 m box has >=0.30 m centre
+    # clearance from the static map along the whole segment.
+    'mover_4:-2.50,0.80,0.95,1.00,0.20,k'
 )
 
 

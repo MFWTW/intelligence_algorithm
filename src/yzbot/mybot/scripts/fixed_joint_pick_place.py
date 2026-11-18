@@ -27,10 +27,11 @@ from gazebo_msgs.msg import LinkStates
 from gazebo_msgs.srv import SetEntityState
 from geometry_msgs.msg import PoseStamped, Twist
 from linkattacher_msgs.srv import AttachLink, DetachLink
+from std_srvs.srv import Empty
 from nav2_msgs.action import NavigateThroughPoses, NavigateToPose
 from nav2_msgs.msg import SpeedLimit
 from nav2_msgs.srv import ClearEntireCostmap
-from nav_msgs.msg import Odometry
+from nav_msgs.msg import OccupancyGrid, Odometry
 from rcl_interfaces.msg import (
     Parameter,
     ParameterDescriptor,
@@ -69,6 +70,89 @@ YIELD_STOP_SPEED_LIMIT = 0.001
 # A sweep stamp this far from the node's own clock is not staleness, it is two
 # different time bases. 10^6 s is ~11.6 days: far beyond any real pause.
 CLOCK_MISMATCH_SEC = 1.0e6
+
+
+def dock_creep_twist(
+    dx, dy, yaw, base_yaw, distance, speed, forward_gain, yaw_tolerance,
+    align_distance, lateral_band=0.06,
+):
+    """One step of the final dock creep, as ``(linear_x, angular_z)``.
+
+    Split out of ``_creep_to_dock__timed`` so the law can be tested without a
+    live node. The shape matters more than it looks:
+
+    * Far field (``distance > align_distance``): point at the goal and drive.
+    * Near field: rotate in place while the heading is far off (a translating
+      spin used to orbit the dock), then translate.
+    * 2026-11-16: inside ``align_distance`` the old law only ever drove
+      FORWARD, ``max(0.02, min(speed, gain * max(forward, 0)))``, so a residual
+      that was mostly SIDEWAYS collapsed to the 0.02 m/s floor and the base
+      parked short. Measured on run_logs/competition_lanes_v02: two warehouse A
+      docks accepted at 0.210 m (two runs in a row, one at 0.210 m), which threw
+      the released cube 0.153 m off in y and failed VERIFY_PLACE. While the
+      lateral error is above ``lateral_band`` the creep now points at the goal
+      again and drives with a 0.05 m/s floor, so a sideways 0.2 m closes in a
+      couple of seconds; only the last few centimetres (lateral <= band, dock
+      ahead) use the plate-yaw-hold law the drop point is calibrated against.
+    """
+    distance = max(0.0, float(distance))
+    yaw_error = math.atan2(math.sin(yaw - base_yaw), math.cos(yaw - base_yaw))
+    if distance > align_distance:
+        bearing = math.atan2(dy, dx)
+        bearing_error = math.atan2(
+            math.sin(bearing - base_yaw), math.cos(bearing - base_yaw)
+        )
+        if abs(bearing_error) > 0.6:
+            return 0.0, max(-1.0, min(1.0, 1.5 * bearing_error))
+        return (
+            max(0.03, min(speed, forward_gain * distance)),
+            max(-1.0, min(1.0, 2.0 * bearing_error)),
+        )
+    forward = dx * math.cos(yaw) + dy * math.sin(yaw)
+    lateral = -dx * math.sin(yaw) + dy * math.cos(yaw)
+    # 2026-11-16: the base can arrive at the plate facing anything from -161 to
+    # -21 deg (trace: competition_lanes_v02h). Unwinding 160 deg at the 0.45
+    # rad/s fine-trim clamp took 20 s and pushed the base 0.2 m past the plate
+    # on the way, so the trim clamp is reached in two stages: swing fast while
+    # the error is large, trim slowly only near the end.
+    if abs(yaw_error) > 0.6:
+        return 0.0, max(-1.0, min(1.0, 1.2 * yaw_error))
+    # 2026-11-16: the near-field turn used 2.0*yaw_error clamped at 0.8 rad/s.
+    # The loop spins at 20 Hz in real time but the sim runs at ~0.2 RTF, so the
+    # effective control period is ~0.25 s of sim time and one step of that law
+    # turned ~11 deg past the target: run_logs/competition_lanes_v02b ended two
+    # creeps at 22.6 and -41.1 deg off after 26 s of hunting. Gain 1.5 with a
+    # 0.45 rad/s clamp and a 0.04 rad deadband converges instead of orbiting.
+    # 2026-11-16: the lateral residual has to win while it is still large. With
+    # the yaw-first order below, a dock that ended 0.106 m off to the side and
+    # 19.7 deg off in heading stayed in "rotate only" (19.7 > 4 * tolerance),
+    # and rotating can never close a sideways offset: competition_lanes_v02j
+    # spent its whole 26 s budget at d=0.154 m. Aim at the plate and creep while
+    # the heading is still sane, and let joint1 absorb the rest (limit 34 deg).
+    if abs(lateral) > lateral_band and abs(yaw_error) < 1.0:
+        bearing = math.atan2(dy, dx)
+        bearing_error = math.atan2(
+            math.sin(bearing - base_yaw), math.cos(bearing - base_yaw)
+        )
+        return (
+            max(0.05, min(speed, forward_gain * distance)),
+            max(-1.0, min(1.0, 2.0 * bearing_error)),
+        )
+    if abs(yaw_error) > max(0.04, 4.0 * yaw_tolerance):
+        return 0.0, max(-0.45, min(0.45, 1.0 * yaw_error))
+    if abs(lateral) > lateral_band or forward <= 0.02:
+        bearing = math.atan2(dy, dx)
+        bearing_error = math.atan2(
+            math.sin(bearing - base_yaw), math.cos(bearing - base_yaw)
+        )
+        return (
+            max(0.05, min(speed, forward_gain * distance)),
+            max(-1.0, min(1.0, 2.0 * bearing_error)),
+        )
+    return (
+        max(0.02, min(speed, forward_gain * max(forward, 0.0))),
+        max(-0.8, min(0.8, 2.0 * yaw_error + 1.5 * lateral)),
+    )
 
 
 class FixedJointPickPlace(Node):
@@ -114,6 +198,9 @@ class FixedJointPickPlace(Node):
         # handed off at 0.247 m, round43 at 0.260 m, while every other cube hands
         # off at ~1.18 m. Below the minimum the base is backed off first.
         self.declare_parameter('visual_handoff_min_distance_m', 0.85)
+        # 停稳后到方块的距离低于此值就必须先退避：相机的行先验在这里已经
+        # 跑出画面，探测会把所有轮廓都拒掉，症状只是 "Visual blob lost"。
+        self.declare_parameter('visual_handoff_coast_min_distance_m', 0.45)
         self.declare_parameter('visual_handoff_retreat_target_m', 1.10)
         # 8 s x 0.06 m/s was not enough: measured 2026-10-07 (round45) the base
         # only opened 0.26 -> 0.473 m and the servo timed out again, because the
@@ -147,8 +234,11 @@ class FixedJointPickPlace(Node):
         #   +0.053 / +0.018 / +0.004 / -0.009 m, i.e. the last one missed the
         #   zone by 9 mm and failed the round (VERIFY_PLACE:...CUBE_RELEASED).
         # Slots 1/2/4, which sit at 0.00/+0.16, always had 0.17-0.23 m of margin
-        # and never failed. Pulling the y slots in to +/-0.12 raises the budget
-        # to 0.115 m, which the worst measured error (0.084 m) still fits.
+        # and never failed. The y slots stay at +/-0.12 because the heading term
+        # is now compensated in joint1 and the position term is held to <=0.10 m
+        # by dock_creep_accept_m, so 0.12+0.10 = 0.22 m fits the +/-0.235 half
+        # width. 2026-11-16: the old 0.22 m acceptance let a 0.21 m residue stand
+        # and put a cube at -0.257 m, 0.022 m outside the box.
         self._zone_deliveries = {}
         self.declare_parameter(
             'zone_slot_offsets',
@@ -236,46 +326,18 @@ class FixedJointPickPlace(Node):
         self.declare_parameter(
             'blue_cube_1_warehouse_c_via_2', [-2.3, 0.0, 0.0]
         )
-        # 2026-10-07: red_cube_1 -> C wedged twice in the same pocket (round30
-        # was flung out of the map from it, round32 produced 884 rejected
-        # rollouts and died with the cube still attached). West of the wall at
-        # x=-3.35 the base is boxed in: the pocket is closed to the north by the
-        # wall at y=-4.4, and a flood fill with the loaded 0.35 m footprint
-        # cannot reach the goal from inside it at all (the reachable set
-        # collapses to the start cell). The gap the planner aims at is simply
-        # too narrow to turn in, so the fix is to not go in: leave the pocket
-        # southward, run east, and come back up the x=+0.03 corridor. Both
-        # straight legs are clear at 0.35 m, verified by flood fill on the
-        # static map rather than by eye.
-        self.declare_parameter(
-            'red_cube_1_warehouse_c_via_1', [-3.275, -6.725, -0.475695]
-        )
-        self.declare_parameter(
-            'red_cube_1_warehouse_c_via_2', [0.025, -4.875, 0.510950]
-        )
-        # 2026-10-07 (round36): blue_cube_3 -> A is the second leg that cannot be
-        # driven direct. It carried the cube correctly (traced z=+0.238 m, so not
-        # dragging) yet still produced 383 rejected rollouts and "Controller
-        # patience exceeded" on the A aligned approach - exactly where round29
-        # died. A flood fill with the loaded 0.35 m footprint reaches A only by
-        # looping east: out along y=-5.98 to x=+12.88, north to y=-3.5, then back
-        # west. The middle point is kept because the original shortcut from
-        # (12.88,-3.88) to (12.48,-3.18) had 11 blocked cells at 0.35 m.
-        # Even the new third target cannot safely be cut to in a straight line
-        # from via_1 (static occupied-edge clearance dips to 0.318 m).
-        self.declare_parameter(
-            'blue_cube_3_warehouse_a_via_1', [12.875, -3.875, 0.454302]
-        )
-        self.declare_parameter(
-            'blue_cube_3_warehouse_a_via_2', [12.875, -3.525, 1.570796]
-        )
-        # Keep the standalone/default executor aligned with the validated YAML.
-        # The old target's nominal via_2 chord entered the 0.35 m loaded
-        # footprint; two same-task five-cube runs reached this open-area target
-        # in ~3 s without the previously repeated 45 s stall.
-        self.declare_parameter(
-            'blue_cube_3_warehouse_a_via_3', [12.700, -2.800, 2.422763]
-        )
+        # Red cube 1 -> C: operator requested a Nav2-planned route without
+        # fixed intermediate points. Keep explicit numeric overrides possible.
+        for index in (1, 2):
+            self.declare_parameter(
+                f'red_cube_1_warehouse_c_via_{index}', [], waypoint_descriptor
+            )
+        # No forced blue_cube_3 -> A detour: let Nav2 plan around the walls and
+        # live obstacles. Dynamic typing still permits explicit numeric routes.
+        for index in (1, 2, 3):
+            self.declare_parameter(
+                f'blue_cube_3_warehouse_a_via_{index}', [], waypoint_descriptor
+            )
         self.declare_parameter('robot_model_name', 'six_arm')
         self.declare_parameter('robot_base_link', 'base_footprint')
         # The folded arm already sweeps about 0.32 m from the base centre while
@@ -440,6 +502,12 @@ class FixedJointPickPlace(Node):
         # ATTACH/DETACH 服务迟到；超时后不要立刻报废整轮，先重试一次，并用 Gazebo
         # link states 判定真实状态（详见 _call_link_service / _confirm_detached）。
         self.declare_parameter('link_service_attempts', 2)
+        # 2026-11-16: the attacher mutates joints from a ROS callback thread
+        # while ODE steps in the physics thread. Freezing the world for the
+        # width of the ATTACH/DETACH call keeps that mutation between two
+        # physics steps; see _freeze_physics() for the crash it addresses.
+        self.declare_parameter('freeze_physics_around_link_services', True)
+        self.declare_parameter('physics_freeze_timeout_sec', 2.0)
         # Discovering every Nav2 service can take longer than a single service
         # call budget right after startup, especially on loaded WSL hosts; the
         # dependency gate gets its own, more generous timeout.
@@ -492,6 +560,24 @@ class FixedJointPickPlace(Node):
         self.declare_parameter('yield_arc_offset_m', 0.55)
         self.declare_parameter('yield_arc_apex_m', 0.8)
         self.declare_parameter('yield_arc_goal_radius_m', 0.35)
+        # How close to a patrol centre line a hold is allowed to park, and how
+        # far outside the swept band a held obstacle must be before the hold is
+        # released. Both are pinned in the deployment profile: they decide how
+        # close the base may come to a kinematic box that never yields.
+        self.declare_parameter('yield_lane_hold_clearance_m', 0.62)
+        self.declare_parameter('yield_lane_escape_delay_sec', 1.0)
+        self.declare_parameter('yield_go_commit_sec', 0.8)
+        self.declare_parameter('yield_go_commit_m', 0.40)
+        self.declare_parameter('yield_hold_release_margin_m', 0.12)
+        self.declare_parameter('yield_clear_hold_sec', 0.5)
+        # The lateral exit is a Nav2 goal, so it is only worth issuing if the
+        # planner will accept it. Without this check the arc landed on a cell
+        # inside the inflated band and NavFn answered "Failed to create a plan
+        # from potential when a legal potential was found" three times in a row
+        # (2026-11-15, 16:13:09-16:13:38), each followed by a failed
+        # backup/spin on the same costmap.
+        self.declare_parameter('yield_arc_costmap_check', True)
+        self.declare_parameter('global_costmap_topic', 'global_costmap/costmap')
         # The patrol boxes' centre lines, published latched by moving_obstacles.
         # Without them the policy cannot tell "stop beside the box" from "stop
         # inside the box's lane", and a base parked in a lane is trapped: the box
@@ -620,6 +706,12 @@ class FixedJointPickPlace(Node):
         self.declare_parameter(
             'pre_place_joints', [0.0, 0.9, 1.17, 0.0, -0.3, 0.0]
         )
+        # joint1 turns about the vertical axis (arm.xacro), so the heading the
+        # dock ended with can be taken out of the release point instead of
+        # being inherited by it: a 0.36 m leash turns 20 deg of base yaw into
+        # 0.12 m of sideways throw, which is a whole slot (2026-11-16).
+        self.declare_parameter('place_yaw_compensation', True)
+        self.declare_parameter('place_yaw_comp_limit_rad', 0.6)
         # Raised relative to the grasp posture so the cube is released on top
         # of the 0.02 m zone plate instead of inside it.
         self.declare_parameter(
@@ -660,6 +752,8 @@ class FixedJointPickPlace(Node):
         )
         self._attach_client = self.create_client(AttachLink, '/ATTACHLINK')
         self._detach_client = self.create_client(DetachLink, '/DETACHLINK')
+        self._link_service_frozen = False
+        self._physics_clients = {}
         self._clear_global_client = self.create_client(
             ClearEntireCostmap, '/global_costmap/clear_entirely_global_costmap'
         )
@@ -693,6 +787,7 @@ class FixedJointPickPlace(Node):
         # gzserver is the bottleneck (measured RTF 0.18 with the full stack).
         self._vision_enabled = False
         self._visual_range_gate_active = False
+        self._range_gate_warned = False
         self._target_colour = 'red'
         camera_topic = str(self.get_parameter('camera_topic').value)
         self._image_sub = self.create_subscription(
@@ -769,12 +864,38 @@ class FixedJointPickPlace(Node):
             arc_apex_m=float(self.get_parameter('yield_arc_apex_m').value),
             arc_goal_radius_m=float(
                 self.get_parameter('yield_arc_goal_radius_m').value),
+            lane_hold_clearance_m=float(
+                self.get_parameter('yield_lane_hold_clearance_m').value),
+            lane_escape_delay_sec=float(
+                self.get_parameter('yield_lane_escape_delay_sec').value),
+            go_commit_sec=float(
+                self.get_parameter('yield_go_commit_sec').value),
+            go_commit_m=float(self.get_parameter('yield_go_commit_m').value),
+            hold_release_margin_m=float(
+                self.get_parameter('yield_hold_release_margin_m').value),
+            clear_hold_sec=float(
+                self.get_parameter('yield_clear_hold_sec').value),
+        )
+        # Latest global costmap, used only to reject an unusable lateral exit.
+        # Unknown/absent map = no opinion (the lidar gate still applies).
+        self._global_costmap = None
+        costmap_qos = QoSProfile(depth=1)
+        costmap_qos.reliability = ReliabilityPolicy.RELIABLE
+        costmap_qos.durability = DurabilityPolicy.TRANSIENT_LOCAL
+        self.create_subscription(
+            OccupancyGrid,
+            str(self.get_parameter('global_costmap_topic').value),
+            self._global_costmap_callback, costmap_qos
         )
         self._yield_tracker = obstacle_yield.YieldTracker(self._yield_config)
         self._yield_decision = obstacle_yield.YieldDecision(
             obstacle_yield.ACTION_GO, obstacle_yield.REASON_CLEAR
         )
+        self._dock_yaw_error = 0.0
+        self._dock_distance = float('inf')
         self._yield_latched = False
+        self._yield_release_from = None
+        self._yield_release_since = None
         self._yield_wait_since = None
         self._yield_clear_since = None
         self._yield_arc_attempts = 0
@@ -921,6 +1042,34 @@ class FixedJointPickPlace(Node):
                 f'{math.sqrt(angular.x ** 2 + angular.y ** 2 + angular.z ** 2):.2f}'
             )
         return ','.join(parts) + ' rad/s'
+
+    def _carrying_now(self) -> bool:
+        """True while the grasped cube rides on the base.
+
+        The yield layer needs this to exclude the cube's own returns: at
+        0.233 m from the lidar axis it sits outside the 0.12 m self-return
+        cutoff, so without the flag it enters the tracker as a cluster that
+        travels with the base (r3b: track world=0.15 m, decision=go/behind -
+        cleared only because the geometry happened to put it behind).
+        Reads the cached link states; never blocks.
+        """
+        msg = self._latest_link_states
+        if msg is None:
+            return False
+        names = list(msg.name)
+        try:
+            cube = msg.pose[names.index(
+                f"{self.get_parameter('cube_name').value}::"
+                f"{self.get_parameter('cube_link').value}")]
+            base = msg.pose[names.index(
+                f"{self.get_parameter('robot_model_name').value}::"
+                f"{self.get_parameter('robot_base_link').value}")]
+        except (ValueError, IndexError):
+            return False
+        horizontal = math.hypot(cube.position.x - base.position.x,
+                                cube.position.y - base.position.y)
+        lift = cube.position.z - base.position.z
+        return horizontal <= 1.0 and lift > 0.10
 
     def _log_carried_cube_state(self, label: str) -> None:
         """Trace the carried cube while a loaded leg is running (rate limited).
@@ -1100,6 +1249,26 @@ class FixedJointPickPlace(Node):
                     expected_bottom = row_center + row_k / max(
                         0.05, camera_standoff - row_offset
                     )
+                    # 2026-11-17: below roughly 0.45 m this prior runs past the
+                    # bottom of the frame (66 / 0.25 m = 264 px under the horizon,
+                    # but 66 / 0.10 m = 660 px), so every contour fails the gate
+                    # and the detector returns None for the whole servo window -
+                    # the run only shows "Visual blob lost" and a 75 s timeout.
+                    # Outside the range the prior was calibrated for, fall back to
+                    # the area/aspect gates instead of rejecting everything.
+                    if not (
+                        0.35 * image_height <= expected_bottom <= 1.05 * image_height
+                    ):
+                        if not self._range_gate_warned:
+                            self._range_gate_warned = True
+                            self.get_logger().warning(
+                                'Row prior '
+                                f'{expected_bottom:.0f} px is outside the frame '
+                                f'({image_height} px) at '
+                                f'{base_distance:.2f} m; skipping the row gate '
+                                'instead of rejecting every contour.'
+                            )
+                        expected_bottom = None
             contours, _ = cv2.findContours(
                 mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
             )
@@ -1505,6 +1674,38 @@ class FixedJointPickPlace(Node):
             float(self.get_parameter('arm_motion_sec').value),
         )
 
+    def _move_arm_placing(self, label: str, parameter_name: str) -> bool:
+        """Move the arm to a place posture, rotating joint1 to cancel the dock
+        heading error.
+
+        joint1 turns about the vertical axis (arm.xacro: axis 0 0 1), so adding
+        the base heading error to it rotates the whole arm - and therefore the
+        release point - back onto the plate's y axis. Without this the drop
+        inherits the base's yaw: measured 2026-11-16, warehouse A docks
+        accepted at 22.6 and -41.1 deg while the creep was refusing to converge
+        (0.36 m leash x sin(22.6 deg) = 0.14 m of sideways throw, more than the
+        whole slot allowance).
+        """
+        target = self._double_list(parameter_name, len(ARM_JOINTS))
+        if not target:
+            return self._move_arm(label, parameter_name)
+        if bool(self.get_parameter('place_yaw_compensation').value):
+            limit = float(self.get_parameter('place_yaw_comp_limit_rad').value)
+            yaw_error = float(getattr(self, '_dock_yaw_error', 0.0))
+            comp = max(-limit, min(limit, yaw_error))
+            if abs(comp) > 1.0e-3:
+                target[0] = target[0] + comp
+                self.get_logger().info(
+                    f'{label}: joint1 {math.degrees(comp):+.1f} deg of dock '
+                    f'heading compensation (dock ended '
+                    f'{math.degrees(yaw_error):+.1f} deg off at '
+                    f'{getattr(self, "_dock_distance", float("nan")):.3f} m).'
+                )
+        return self._execute_trajectory(
+            label, self._arm_client, ARM_JOINTS, target,
+            float(self.get_parameter('arm_motion_sec').value),
+        )
+
     def _move_gripper(self, label: str, position: float) -> bool:
         return self._execute_trajectory(
             label,
@@ -1860,8 +2061,9 @@ class FixedJointPickPlace(Node):
         )
         timeout = float(self.get_parameter('dock_creep_timeout_sec').value)
         accept_radius = float(self.get_parameter('dock_creep_accept_m').value)
-        accept_yaw = float(
-            self.get_parameter('navigation_accept_yaw_rad').value
+        accept_yaw = min(
+            float(self.get_parameter('navigation_accept_yaw_rad').value),
+            float(self.get_parameter('place_yaw_comp_limit_rad').value),
         )
         attempts = max(1, int(self.get_parameter('dock_creep_attempts').value))
         align_distance = float(
@@ -1885,14 +2087,56 @@ class FixedJointPickPlace(Node):
         # large (|dx| <= 0.485 m, |dy| <= 0.235 m), so a base yaw error still
         # drops the cube inside the zone as long as it stays under the ~60 deg
         # cliff derived in navigation_accept_yaw_rad. So once the position is
-        # inside dock_creep_accept_m we still POLISH the heading - it keeps the
-        # drop closer to the zone centre - but we no longer refuse the arrival
-        # for it: after position_hold_sec of holding position we accept.
+        # inside dock_creep_accept_m and the arm's compensation limit, stop and
+        # verify the measured pose remains in bounds for position_hold_sec.
         position_hold_sec = 2.0
         position_since = None
+        # The placement posture is a fixed set of joint angles, so the drop
+        # point sits a fixed ~0.36 m leash from the base. A base heading error
+        # of theta therefore throws the release sideways by ~0.36*sin(theta):
+        # 20 deg is 0.12 m, which is a whole slot. Record what the dock ended
+        # with so the place step can rotate joint1 by the same angle and put the
+        # drop back on the plate's axis instead of the base's.
+        self._dock_yaw_error = 0.0
+        self._dock_distance = float('inf')
+        started = time.monotonic()
+        # 2026-11-16: Nav2 hands over while the base is still doing up to
+        # 1.5 m/s, and with max_decel 2.5 m/s^2 it coasts ~0.4 m. Starting the
+        # law straight away made it overshoot the plate and turn around
+        # (competition_lanes_v02h, warehouse B: t=0.0 d=0.281 m, t=1.0 s
+        # odom=0.368 m/s -> d=0.044 m, then 0.500 m and a 175 deg heading
+        # error). Hold still until the coast is spent instead.
+        settle_until = time.monotonic() + 2.0
+        while rclpy.ok() and time.monotonic() < settle_until:
+            self._stop_base()
+            rclpy.spin_once(self, timeout_sec=0.05)
+            first = self._base_pose()
+            if first is None:
+                continue
+            time.sleep(0.10)
+            self._stop_base()
+            second = self._base_pose()
+            if second is None:
+                continue
+            coast = math.hypot(
+                second[0] - first[0], second[1] - first[1]
+            ) / 0.10
+            if coast < 0.06:
+                self.get_logger().info(
+                    f'{label}: base settled before the dock creep '
+                    f'(coast {coast:.3f} m/s).'
+                )
+                break
         for attempt in range(1, attempts + 1):
             deadline = time.monotonic() + timeout
             position_since = None
+            # One line per second of the creep. Without it the docking phase is
+            # a 12-28 s black box: measured 2026-11-16 (competition_lanes_v02g)
+            # the creep burned 28.1/13.1/12.6/12.6 s to close <=0.35 m, and the
+            # per-second trace is what tells a slow law from a base that cannot
+            # track the command.
+            trace_at = 0.0
+            trace_pose = self._base_pose()
             while rclpy.ok() and time.monotonic() < deadline:
                 rclpy.spin_once(self, timeout_sec=0.05)
                 pose = self._base_pose()
@@ -1905,118 +2149,46 @@ class FixedJointPickPlace(Node):
                 yaw_error = math.atan2(
                     math.sin(yaw - base_yaw), math.cos(yaw - base_yaw)
                 )
-                if (
-                    distance <= position_tolerance
-                    and abs(yaw_error) <= yaw_tolerance
-                ):
-                    break
-                if distance <= accept_radius:
-                    # Position is good; give the heading a short chance to settle,
-                    # then take the pose - but ONLY while the heading is still
-                    # inside the bound the drop geometry allows.
-                    # 2026-10-08: an earlier version accepted at ANY heading and
-                    # the cube landed outside the zone:
-                    #   Cube missed warehouse C: cube at (0.149,-2.445), centre
-                    #   (0.016,-3.060), offset (+0.133,+0.615), limits [0.50x0.25]
-                    #   (run_logs/dockfix_20261008-004925)
-                    # 136.6 deg of heading error threw the fixed-posture drop
-                    # 0.615 m off, so my earlier ~60 deg estimate (from a 0.35 m
-                    # lever) was far too generous. Back-solving that drop: a pure-y
-                    # offset needs |sin| = 0.615/L and a pure-x one |1-cos| = 0.133/L,
-                    # which no single L satisfies - the offset is mixed, so the
-                    # tighter bound wins. Centring the cube needs <= ~8 deg and
-                    # staying inside the 0.235 m half-width needs <= ~49 deg, so gate
-                    # on accept_yaw (the 45.8 deg bound used elsewhere in the leg) and
-                    # otherwise keep polishing: a retry with a fresh heading beats a
-                    # cube off the plate.
+                elapsed = time.monotonic() - started
+                if elapsed >= trace_at and trace_pose is not None:
+                    trace_at = elapsed + 1.0
+                    moved = math.hypot(base_x - trace_pose[0], base_y - trace_pose[1])
+                    trace_pose = (base_x, base_y, base_yaw)
+                    self.get_logger().info(
+                        f'{label}: creep t={elapsed:.1f}/{attempt} d={distance:.3f} '
+                        f'yaw={math.degrees(yaw_error):+.1f} '
+                        f'lateral={-dx * math.sin(base_yaw) + dy * math.cos(base_yaw):+.3f} '
+                        f'odom={moved / max(1.0, elapsed - (trace_at - 1.0)):.3f} m/s '
+                        f'cmd=({command.linear.x:.3f},{command.angular.z:+.2f})'
+                    )
+                if distance <= accept_radius and abs(yaw_error) <= accept_yaw:
+                    # Stop correcting as soon as both placement bounds are met.
+                    # Continue sampling the actual pose while stopped: if the base
+                    # coasts out of bounds the hold is reset and docking resumes.
+                    self._stop_base()
+                    command.linear.x = 0.0
+                    command.angular.z = 0.0
                     now = time.monotonic()
                     if position_since is None:
                         position_since = now
                     elif now - position_since >= position_hold_sec:
-                        if abs(yaw_error) <= accept_yaw:
-                            self.get_logger().warning(
-                                f'{label}: holding position for '
-                                f'{position_hold_sec:.1f} s at {distance:.3f} m, '
-                                f'heading {math.degrees(yaw_error):+.1f} deg off - '
-                                f'inside the {math.degrees(accept_yaw):.1f} deg drop '
-                                'bound, so accepting the arrival and letting the arm '
-                                'place. verify_placement still decides.'
-                            )
-                            command.linear.x = 0.0
-                            command.angular.z = 0.0
-                            self._fine_cmd_pub.publish(command)
-                            # Must RETURN, not break: breaking only leaves the inner
-                            # `while`, so the outer `for attempt` loop ran on, hit its
-                            # own deadline, and overwrote the acceptance with
-                            #   "dock creep failed at 0.121 m, -134.6 deg off yaw"
-                            self._stop_base()
-                            final_distance = distance
-                            final_yaw = yaw_error
-                            return True
-                        # Heading still outside the drop bound: keep creeping and
-                        # re-arm the hold so the next check is a fresh 2 s window.
-                        position_since = now
+                        self.get_logger().info(
+                            f'{label}: stopped within placement bounds for '
+                            f'{position_hold_sec:.1f} s at {distance:.3f} m, '
+                            f'heading {math.degrees(yaw_error):+.1f} deg off.'
+                        )
+                        self._dock_yaw_error = yaw_error
+                        self._dock_distance = distance
+                        return True
+                    continue
                 else:
                     position_since = None
-                if distance > align_distance:
-                    # Far field: point at the goal and drive. The previous law
-                    # drove along the plate axis instead, so an arrival whose
-                    # error was mostly lateral collapsed to the 0.03 m/s floor and
-                    # stalled about 0.2 m short (round21 C dock: 0.165 m in 8 s;
-                    # round22: 0.198 m in 14 s, three times, cube attached).
-                    bearing = math.atan2(dy, dx)
-                    bearing_error = math.atan2(
-                        math.sin(bearing - base_yaw),
-                        math.cos(bearing - base_yaw),
-                    )
-                    if abs(bearing_error) > 0.6:
-                        command.linear.x = 0.0
-                        command.angular.z = max(
-                            -1.2, min(1.2, 2.0 * bearing_error)
-                        )
-                    else:
-                        command.linear.x = max(
-                            0.03, min(speed, forward_gain * distance)
-                        )
-                        command.angular.z = max(
-                            -1.0, min(1.0, 2.0 * bearing_error)
-                        )
-                else:
-                    # Final centimetres: hold the plate yaw, because the arm's
-                    # fixed offset - and with it the drop point - is calibrated
-                    # against exactly this pose.
-                    forward = dx * math.cos(yaw) + dy * math.sin(yaw)
-                    lateral = -dx * math.sin(yaw) + dy * math.cos(yaw)
-                    # 2026-10-07: inside the align distance the old law always
-                    # creeped forward (>= 0.02 m/s floor) while the yaw term
-                    # 2.0 * yaw_error + 1.5 * lateral saturated the 0.8 rad/s
-                    # clamp. An arrival that was badly mis-yawed therefore could
-                    # not stop turning: it circled the dock point instead of
-                    # settling on it. Measured on run_logs/attachfix_...: the base
-                    # orbited (0.02, -2.70) inside a +/-0.25 m box for 8 s and
-                    # swept 2351 deg of yaw across the two attempts, passing the
-                    # -1.571 rad target without ever stopping - dock creep then
-                    # died on its 14 s timeout (0.171/0.169/0.080 m, 176/82/-32
-                    # deg off). The caster-friction fix made rotation easier and
-                    # amplified it (the same dock had already swept 826 deg
-                    # before). So: when the heading is still far off, rotate in
-                    # place and do not translate at all. Translation resumes once
-                    # the yaw is inside the alignment band, which is also when
-                    # the forward/lateral maths stops fighting itself.
-                    if abs(yaw_error) > max(0.12, 4.0 * yaw_tolerance):
-                        command.linear.x = 0.0
-                        # One-sided clamp: a full 0.8 rad/s spin overshoots the
-                        # small residual errors that matter for docking.
-                        command.angular.z = max(
-                            -0.8, min(0.8, 2.0 * yaw_error)
-                        )
-                    else:
-                        command.linear.x = max(
-                            0.02, min(speed, forward_gain * max(forward, 0.0))
-                        )
-                        command.angular.z = max(
-                            -0.8, min(0.8, 2.0 * yaw_error + 1.5 * lateral)
-                        )
+                vx, wz = dock_creep_twist(
+                    dx, dy, yaw, base_yaw, distance, speed, forward_gain,
+                    yaw_tolerance, align_distance,
+                )
+                command.linear.x = vx
+                command.angular.z = wz
                 self._fine_cmd_pub.publish(command)
             self._stop_base()
             for _ in range(3):
@@ -2387,8 +2559,9 @@ class FixedJointPickPlace(Node):
         accept_radius = float(
             self.get_parameter('navigation_accept_radius_m').value
         )
-        accept_yaw = float(
-            self.get_parameter('navigation_accept_yaw_rad').value
+        accept_yaw = min(
+            float(self.get_parameter('navigation_accept_yaw_rad').value),
+            float(self.get_parameter('place_yaw_comp_limit_rad').value),
         )
         accept_hold = float(
             self.get_parameter('navigation_accept_hold_sec').value
@@ -2740,8 +2913,45 @@ class FixedJointPickPlace(Node):
             for _ in range(3):
                 self._stop_base()
                 rclpy.spin_once(self, timeout_sec=0.1)
+            # 2026-11-17: the retreat check above runs *before* the base has
+            # stopped, so it only sees the distance at the moment Nav2 was
+            # cancelled. Cancelling and flushing three zero setpoints costs
+            # 0.3-1.0 s of travel, and the first attempts showed the base
+            # arriving at 0.09 m (run_logs/legprobe_rule1_20261117-184656:
+            # "... is only 0.093 m away - too close for the camera servo"),
+            # while the handoff itself had been logged at 1.34 m. Below about
+            # 0.45 m the cube sits under the level camera and the row prior in
+            # pick_best runs past the bottom of the image, so every contour is
+            # rejected and the only symptom is a 75 s "Visual blob lost"
+            # timeout. Re-measure once the base is actually still.
+            stopped_distance = self._cached_planar_distance_to_cube(
+                visual_handoff_cube
+            )
+            coast_min = float(
+                self.get_parameter('visual_handoff_coast_min_distance_m').value
+            )
+            if stopped_distance is not None and stopped_distance < coast_min:
+                self.get_logger().warning(
+                    f'{visual_handoff_cube}: base coasted to '
+                    f'{stopped_distance:.3f} m '
+                    f'(< {coast_min:.2f} m) after stopping; opening '
+                    'the standoff before the camera servo.'
+                )
+                stopped_distance = self._retreat_to_handoff_standoff(
+                    visual_handoff_cube, stopped_distance
+                )
+                if stopped_distance < coast_min:
+                    self.get_logger().error(
+                        f'{visual_handoff_cube}: retreat after stopping ended at '
+                        f'{stopped_distance:.3f} m (< {coast_min:.2f} '
+                        'm); refusing blind servo.'
+                    )
+                    return False
+            shown = ('unknown' if stopped_distance is None
+                     else f'{stopped_distance:.3f} m')
             self.get_logger().info(
-                f'Nav2 control released at the {visual_handoff_cube} visual handoff.'
+                f'Nav2 control released at the {visual_handoff_cube} visual '
+                f'handoff (base-to-cube {shown}).'
             )
             return True
 
@@ -3297,6 +3507,36 @@ class FixedJointPickPlace(Node):
                 room[name] = max(0.0, best * math.cos(half_width) - 0.2)
         return room['left'], room['right']
 
+    def _global_costmap_callback(self, msg) -> None:
+        """Keep the newest global costmap; it is only used to vet lateral exits."""
+        self._global_costmap = msg
+
+    def _costmap_clearance_at(self, x: float, y: float) -> bool | None:
+        """Is (x, y) outside the global costmap's lethal/inscribed band?
+
+        Returns None when there is nothing to judge against (no map yet, or the
+        point is outside it): callers must treat that as "no opinion", not as
+        free space. Published values follow nav2_costmap_2d: cell 99 means the
+        cell is inside the inscribed radius (cost 253), 100 is lethal (254), and
+        -1 is unknown - a planner cannot seed a goal in unknown space either.
+        """
+        msg = self._global_costmap
+        if msg is None:
+            return None
+        info = msg.info
+        resolution = float(info.resolution)
+        if resolution <= 0.0:
+            return None
+        mx = int(math.floor((x - (info.origin.position.x)) / resolution))
+        my = int(math.floor((y - (info.origin.position.y)) / resolution))
+        if mx < 0 or my < 0 or mx >= info.width or my >= info.height:
+            return None
+        index = my * info.width + mx
+        data = msg.data
+        if index < 0 or index >= len(data):
+            return None
+        return -1 < int(data[index]) < 99
+
     def _yield_step(self, distance_to_goal_m: float | None):
         """One policy tick. Returns (decision, latched, arc goal in map frame)."""
         motion_vx, motion_vy, wz, base_x, base_y = self._yield_base_motion()
@@ -3347,11 +3587,14 @@ class FixedJointPickPlace(Node):
             sum(r * math.sin(a) for a, r in c) / len(c),
         ) for c in boxes]
         now = time.monotonic()
+        carrying = self._carrying_now()
         self._yield_tracker.update(
-            centroids, now, (base_x, base_y, yaw, motion_vx, motion_vy, wz))
+            centroids, now, (base_x, base_y, yaw, motion_vx, motion_vy, wz),
+            carrying=carrying)
         track = self._yield_tracker.nearest(
             now, (base_x, base_y, yaw, motion_vx, motion_vy, wz),
-            min_world_speed=self._yield_config.min_mover_speed_mps)
+            min_world_speed=self._yield_config.min_mover_speed_mps,
+            carrying=carrying)
         excluded = [] if track is None else [
             (track['base_x'], track['base_y'])]
         left_room, right_room = self._yield_room(points, excluded)
@@ -3400,21 +3643,36 @@ class FixedJointPickPlace(Node):
                 if not any(math.hypot(x - ex, y - ey) <= 0.22
                            for ex, ey in excluded)
             ]
-            if obstacle_yield.arc_scan_clear(
+            target = (
+                base_x + math.cos(yaw) * decision.arc_x
+                - math.sin(yaw) * decision.arc_y,
+                base_y + math.sin(yaw) * decision.arc_x
+                + math.cos(yaw) * decision.arc_y,
+            )
+            blocked = None
+            if not obstacle_yield.arc_scan_clear(
                 static_returns, decision.arc_x, decision.arc_y,
                 radius_m=self._yield_config.base_half_width_m + 0.05,
             ):
-                arc_goal = (
-                    base_x + math.cos(yaw) * decision.arc_x
-                    - math.sin(yaw) * decision.arc_y,
-                    base_y + math.sin(yaw) * decision.arc_x
-                    + math.cos(yaw) * decision.arc_y,
-                )
+                blocked = 'arc approach blocked or unobserved by lidar'
+            elif bool(self.get_parameter('yield_arc_costmap_check').value):
+                clear = self._costmap_clearance_at(*target)
+                if clear is False:
+                    blocked = ('arc target sits inside the global costmap\'s '
+                               'inscribed band or unknown space')
+            if blocked is None:
+                arc_goal = target
             else:
+                # Do NOT release the hold over a rejected arc. Releasing hands
+                # control back to Nav2 with the box still in the corridor, and
+                # the controller then refuses the path every tick (the 18 s
+                # stall of 2026-10-14). Keep waiting and spend this attempt, so
+                # the per-leg ceiling still bounds how long the base waits.
+                self._yield_arc_attempts += 1
                 decision = obstacle_yield.YieldDecision(
-                    obstacle_yield.ACTION_GO,
-                    obstacle_yield.REASON_WAIT_EXPIRED,
-                    detail='arc approach blocked or unobserved by lidar',
+                    obstacle_yield.ACTION_STOP,
+                    obstacle_yield.REASON_WAIT,
+                    detail=blocked,
                 )
         if self._yield_config.enabled and decision.action != obstacle_yield.ACTION_GO:
             self._yield_log_decision(decision, obs)
@@ -3540,6 +3798,31 @@ class FixedJointPickPlace(Node):
                 latched = True
         else:
             self._yield_clear_since = None
+        # A release has to survive the base's own acceleration (see
+        # YieldConfig.go_commit_sec): keep the latch - never the hold - until the
+        # base has actually moved, so the next tick judges the corridor at the
+        # speed the base is about to drive instead of at "stopped, so 0.05 m/s".
+        if (self._yield_latched and not latched
+                and decision.action == obstacle_yield.ACTION_GO):
+            if self._yield_release_from is None:
+                self._yield_release_from = self._cached_base_position()
+                self._yield_release_since = now
+            position = self._cached_base_position()
+            moved = 0.0
+            if position is not None and self._yield_release_from is not None:
+                moved = math.hypot(position[0] - self._yield_release_from[0],
+                                   position[1] - self._yield_release_from[1])
+            commit_m = float(getattr(self._yield_config, 'go_commit_m', 0.0))
+            commit_sec = float(getattr(self._yield_config, 'go_commit_sec', 0.0))
+            if (moved < commit_m
+                    and now - (self._yield_release_since or now) < commit_sec):
+                latched = True
+            else:
+                self._yield_release_from = None
+                self._yield_release_since = None
+        else:
+            self._yield_release_from = None
+            self._yield_release_since = None
         self._yield_decision = decision
         self._update_yield_episode(now, latched)
         if latched:
@@ -3607,6 +3890,8 @@ class FixedJointPickPlace(Node):
         one's spent patience.
         """
         self._yield_latched = False
+        self._yield_release_from = None
+        self._yield_release_since = None
         self._yield_wait_since = None
         self._yield_clear_since = None
         self._yield_arc_attempts = 0
@@ -3950,6 +4235,13 @@ class FixedJointPickPlace(Node):
         # which is why the hole went unnoticed. Re-searching can only help find
         # the cube; every acceptance gate below is unchanged.
         lost_since = None
+        backed_off = False
+        last_row = None
+        # Whether the last frame that produced a row was also centred. A blob
+        # that vanished while it was still off to one side never sat on the
+        # camera axis, so the row it left behind says nothing about the standoff
+        # and must not be handed to the creep (see the "left the frame" branch).
+        last_centred = False
         research_after = float(
             self.get_parameter('visual_research_after_sec').value
         )
@@ -3991,19 +4283,72 @@ class FixedJointPickPlace(Node):
                     now = time.monotonic()
                     if lost_since is None:
                         lost_since = now
+                        # 2026-11-17: if the blob disappeared only after its
+                        # bottom row had reached the acceptance band, the cube
+                        # has simply slid under the level camera (the fifth cube
+                        # leaves the image at about 0.22 m). Searching cannot
+                        # find it again - hand the measured row to the creep
+                        # instead of burning the remaining 70 s of the timeout.
+                        # Only a CENTRED frame can be handed over: the row is
+                        # the standoff along the camera axis, and the creep
+                        # drives straight down that axis. A blob that was still
+                        # off to one side when it vanished leaves a row that
+                        # describes a cube somewhere else, and creep would
+                        # grasp air. Such a loss falls through to the re-search
+                        # below, which is what it was doing before this branch.
+                        if (
+                            last_row is not None
+                            and last_centred
+                            and last_row >= approach_row - row_tolerance
+                        ):
+                            self.get_logger().warning(
+                                'Visual blob left the frame at row '
+                                f'{last_row:.0f} (>= '
+                                f'{approach_row - row_tolerance:.0f}); the cube '
+                                'is under the camera, handing over to creep.'
+                            )
+                            stable_frames_used = max(1, stable)
+                            return self._creep_to_grasp(last_row)
                     elif now - lost_since >= research_after:
                         # Stop waiting out the timeout: go back and look again.
                         self.get_logger().warning(
                             'Visual blob lost for '
                             f'{now - lost_since:.1f} s; restarting the search.'
                         )
+                        # 2026-11-17: rotating on the spot cannot help when the
+                        # cube is too close to be inside the frame at all (a
+                        # 5 cm cube under a level camera leaves the image below
+                        # ~0.22 m). Open the standoff once, then look again;
+                        # without this the run spins for the whole 75 s window
+                        # (run_logs/legprobe_rule1_20261117-184656).
+                        handoff_cube_name = str(
+                            self.get_parameter('cube_name').value
+                        )
+                        if not backed_off and handoff_cube_name:
+                            near = self._cached_planar_distance_to_cube(
+                                handoff_cube_name
+                            )
+                            coast_min = float(self.get_parameter(
+                                'visual_handoff_coast_min_distance_m').value)
+                            if near is not None and near < coast_min:
+                                backed_off = True
+                                self.get_logger().warning(
+                                    f'{handoff_cube_name}: only {near:.3f} m away '
+                                    'while searching; opening the standoff before '
+                                    'looking again.'
+                                )
+                                self._retreat_to_handoff_standoff(
+                                    handoff_cube_name, near
+                                )
                         lost_since = None
                         search_started = time.monotonic()
                         break
                     continue
                 lost_since = None
                 centre_x, width, area, image_width, bottom_row = detection
+                last_row = float(bottom_row)
                 centre_error = (centre_x - image_width / 2.0) / (image_width / 2.0)
+                last_centred = abs(centre_error) <= centre_tolerance
                 # Bottom row grows as the robot approaches: it is the range error.
                 row_error = (approach_row - bottom_row) / approach_row
                 centred = abs(centre_error) <= centre_tolerance
@@ -4143,8 +4488,17 @@ class FixedJointPickPlace(Node):
         self.get_logger().info('Release stabilised: cube velocity zeroed.')
         return True
 
-    def _verify_placement(self) -> bool:
-        """Confirm the released cube actually rests inside the target zone."""
+    def _verify_placement(self, *, count: bool = False) -> bool:
+        """Confirm the released cube actually rests inside the target zone.
+
+        `count` marks the authoritative check for this delivery: the early one,
+        taken right after the release. The post-retreat confirmation reuses the
+        same measurement but must NOT advance the slot rotation - measured
+        2026-11-16 (lanes_gui1, x=1 red -> A) both calls incremented, so two
+        cubes left the counter at 4 and the third delivery was aimed at slot 1,
+        on top of the cube already there; it slid 0.283 m off and failed
+        VERIFY_PLACE with a delivery that had actually beeped fine.
+        """
         if not bool(self.get_parameter('verify_placement').value):
             return True
         # The arm is already home, so nothing will touch the cube again: clear
@@ -4178,8 +4532,14 @@ class FixedJointPickPlace(Node):
             f'±{half_width - tolerance:.3f}] m'
         )
         if inside:
+            if not count:
+                self.get_logger().info(
+                    f'{message}, inside limits. (slot rotation unchanged: the '
+                    f'early check already counted this cube)')
+                return True
             # Only a cube that actually landed inside counts towards the slot
-            # rotation, so a failed delivery does not consume a slot.
+            # rotation, so a failed delivery does not consume a slot. Counted
+            # exactly once per delivery - see the `count` note above.
             warehouse = str(self.get_parameter('warehouse').value).upper()
             self._zone_deliveries[warehouse] = \
                 self._zone_deliveries.get(warehouse, 0) + 1
@@ -4407,11 +4767,146 @@ class FixedJointPickPlace(Node):
         return False
 
     def _call_link_service(self, label: str, client, request) -> bool:
+        """Freeze the world around the joint mutation, then run the call.
+
+        IFRA's attacher creates/detaches joints inside a ROS service callback,
+        i.e. on a thread that is not the physics thread. Gazebo Classic does not
+        serialise that: the ODE wrapper is stepped at the same time, and this
+        project sees the result as `gzserver exit code -11` about half a second
+        after DETACH, always during VERIFY_PLACE, always the same fault:
+          segfault at 158 ... in libgazebo_ode.so.11.10.2[...+7f4ae]  (klog)
+        i.e. a null dereference at a fixed struct offset inside libgazebo_ode.
+        The same signature appears in runs from 2026-10-08 (final3/sim.log:885)
+        and 2026-10-13 (full_round_repro/sim.log:2948) as well as in
+        run_logs/competition_yieldfix2/launch.log:1416 and
+        run_logs/competition_yieldfix5/launch.log:2297, so it predates the
+        navigation work. Pausing the world for the ~15 ms the service needs puts
+        the mutation between two steps instead of inside one.
+        """
+        frozen = self._freeze_physics()
+        self._link_service_frozen = frozen
+        try:
+            return self._call_link_service_unfrozen(label, client, request)
+        finally:
+            self._link_service_frozen = False
+            if frozen and self._thaw_physics() is False:
+                raise RuntimeError('GAZEBO_UNPAUSE_STATE_UNKNOWN')
+
+    def _link_service_freeze_enabled(self) -> bool:
+        try:
+            return bool(self.get_parameter(
+                'freeze_physics_around_link_services').value)
+        except Exception:
+            return False
+
+    def _physics_client(self, name: str):
+        cache = getattr(self, '_physics_clients', None)
+        if cache is None:
+            cache = self._physics_clients = {}
+        if name in cache:
+            return cache[name]
+        client = None
+        try:
+            client = self.create_client(Empty, name)
+            if not client.wait_for_service(timeout_sec=0.5):
+                self.destroy_client(client)
+                client = None
+        except Exception:
+            client = None
+        if client is None and name not in cache:
+            self.get_logger().warning(
+                f'{name} is unavailable; will retry discovery when needed.')
+        # A missing service can appear later during Gazebo startup or recovery.
+        # Never permanently cache a failed discovery.
+        if client is not None:
+            cache[name] = client
+        return client
+
+    def _freeze_physics(self) -> bool:
+        """Pause Gazebo; return True when the world is actually paused."""
+        if not self._link_service_freeze_enabled():
+            return False
+        client = self._physics_client('/pause_physics')
+        if client is None:
+            raise RuntimeError('GAZEBO_PAUSE_STATE_UNKNOWN: service unavailable')
+        timeout = float(self.get_parameter('physics_freeze_timeout_sec').value)
+        try:
+            started = time.monotonic()
+            future = client.call_async(Empty.Request())
+            rclpy.spin_until_future_complete(self, future, timeout_sec=timeout)
+            if not future.done():
+                # ROS service requests cannot be cancelled. If this pause takes
+                # effect late, undo it after its response, not merely now (an
+                # early unpause can otherwise race ahead of the late pause).
+                def undo_late_pause(done):
+                    try:
+                        if done.result() is not None:
+                            resume = self._physics_client('/unpause_physics')
+                            if resume is not None:
+                                resume.call_async(Empty.Request())
+                            else:
+                                self.get_logger().error('Late Gazebo pause could not be undone: unpause service unavailable.')
+                    except Exception as exc:
+                        self.get_logger().error(f'Late Gazebo pause recovery failed: {exc}')
+                future.add_done_callback(undo_late_pause)
+                self._thaw_physics()
+                raise RuntimeError('GAZEBO_PAUSE_TIMEOUT')
+            ok = future.result() is not None
+            if not ok:
+                raise RuntimeError('GAZEBO_PAUSE_FAILED')
+        except Exception as exc:
+            self.get_logger().error(f'pause_physics failed; refusing joint mutation: {exc}')
+            raise RuntimeError('GAZEBO_PAUSE_STATE_UNKNOWN') from exc
+        if ok and not getattr(self, '_freeze_announced', False):
+            self._freeze_announced = True
+            self.get_logger().info(
+                f'Gazebo paused for joint services '
+                f'({time.monotonic() - started:.3f} s); the ATTACH/DETACH '
+                'mutation now runs between two physics steps.')
+        return ok
+
+    def _thaw_physics(self) -> bool:
+        timeout = float(self.get_parameter('physics_freeze_timeout_sec').value)
+        for attempt in range(1, 4):
+            try:
+                client = self._physics_client('/unpause_physics')
+                if client is not None:
+                    future = client.call_async(Empty.Request())
+                    rclpy.spin_until_future_complete(self, future, timeout_sec=timeout)
+                    if future.done() and future.result() is not None:
+                        return True
+                self.get_logger().warning(
+                    f'unpause_physics did not respond (attempt {attempt}/3).')
+            except Exception as exc:
+                self.get_logger().warning(
+                    f'unpause_physics failed (attempt {attempt}/3): {exc}')
+        self.get_logger().error(
+            'GAZEBO_UNPAUSE_FAILED: physics may still be paused; '
+            'stop the task and inspect Gazebo before restarting.')
+        return False
+
+    def _link_service_timeout(self) -> float:
+        """How long to wait for ATTACH/DETACH.
+
+        While the world is frozen for the call the wait is capped by
+        `physics_freeze_timeout_sec`: a wedged service must not leave the whole
+        simulation paused (the controllers and health checks would time out).
+        """
+        timeout = float(self.get_parameter('service_timeout_sec').value)
+        if getattr(self, '_link_service_frozen', False):
+            try:
+                timeout = min(timeout, float(
+                    self.get_parameter('physics_freeze_timeout_sec').value))
+            except Exception:
+                pass
+        return timeout
+
+    def _call_link_service_unfrozen(self, label: str, client, request) -> bool:
         self.get_logger().info(
             f'{label}: {request.model1_name}::{request.link1_name} <-> '
             f'{request.model2_name}::{request.link2_name}'
         )
-        timeout = float(self.get_parameter('service_timeout_sec').value)
+        timeout = self._link_service_timeout()
         attempts = max(1, int(self.get_parameter('link_service_attempts').value))
         for attempt in range(1, attempts + 1):
             future = client.call_async(request)
@@ -4429,7 +4924,8 @@ class FixedJointPickPlace(Node):
                     'letting the lift/attachment check decide.'
                 )
                 return True
-            if self._confirm_detached():
+            if (not getattr(self, '_link_service_frozen', False)
+                    and self._confirm_detached()):
                 return True
             if attempt < attempts:
                 self.get_logger().warning(
@@ -4579,9 +5075,12 @@ class FixedJointPickPlace(Node):
             ('VERIFY_GRASP', 'verify carried cube', self._verify_attachment),
             (
                 'PLACING', 'pre-place',
-                lambda: self._move_arm('Move to pre-place', 'pre_place_joints'),
+                lambda: self._move_arm_placing('Move to pre-place', 'pre_place_joints'),
             ),
-            ('PLACING', 'place', lambda: self._move_arm('Lower to place', 'place_joints')),
+            (
+                'PLACING', 'place',
+                lambda: self._move_arm_placing('Lower to place', 'place_joints'),
+            ),
             # Open while the Gazebo fixed joint still supports the cube, then
             # detach after the fingers no longer pinch or eject it.
             ('PLACING', 'open gripper', lambda: self._move_gripper('Open gripper', open_position)),
@@ -4594,7 +5093,9 @@ class FixedJointPickPlace(Node):
             # sequence check found the cube 1.9 m away and could not say whether
             # it was placed badly or knocked away afterwards. This early check
             # answers that, and reports a bad placement ~40 s sooner.
-            ('VERIFY_PLACE', 'verify placement', self._verify_placement),
+            # This is the authoritative check: it owns the slot rotation.
+            ('VERIFY_PLACE', 'verify placement',
+             lambda: self._verify_placement(count=True)),
             (
                 'VERIFY_PLACE', 'retreat',
                 lambda: self._move_arm('Retreat from place', 'pre_place_joints'),
@@ -4602,8 +5103,9 @@ class FixedJointPickPlace(Node):
             ('VERIFY_PLACE', 'return home', lambda: self._move_arm('Return home', 'home_joints')),
             # Final confirmation in the resting position: a cube that the
             # retreat later nudged out of the plate still counts as missed.
+            # Same measurement, but it must not advance the slot rotation.
             ('VERIFY_PLACE', 'verify placement after retreat',
-             self._verify_placement),
+             lambda: self._verify_placement(count=False)),
         ]
 
         attached = False

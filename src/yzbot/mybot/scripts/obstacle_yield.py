@@ -27,6 +27,7 @@ ACTION_GO = 'go'
 ACTION_CAP = 'cap'
 ACTION_ARC = 'arc'
 ACTION_STOP = 'stop'
+REASON_KEEPOUT = 'keepout'
 
 # Why the action was chosen. Purely diagnostic: these strings land in the round
 # log so a failed round can be attributed to a rule rather than to "it stopped".
@@ -87,6 +88,16 @@ class YieldConfig:
     # standstill has no time-to-crossing, which would otherwise make every
     # obstacle look like it is about to arrive ("wait forever" bug).
     min_speed_mps: float = 0.05
+    # 自车挂载箱的排除半径。抓取后箱心只在激光轴前 0.23 m（实测
+    # `carried red_cube_1 ... horizontal=0.233 m`），落在 track 起点半径
+    # (0.12 m) 之外，于是它会被当成一个"跟着车走"的移动簇：r3b 实测
+    # world=0.15 m、decision=go/behind，只因被算到车后才侥幸放行；几何一抖
+    # 它就跑到车前，机器人会对自己停车。带载时把这一圈回报整段排除。
+    self_exclusion_radius_m: float = 0.35
+    # moving_obstacles 的 keep-out：箱子 0.75 m 以内就是"已经贴上"，此时把速度
+    # 压到 cap_speed（0.8 m/s）是错的。r10c 实测 mover 顶到机座 0.38 m，让行层
+    # 仍判 cap 0.8 并连打 27 条，机器人被顶死 45 s × 4 次后整轮 FAILED。
+    keepout_conflict_m: float = 0.75
     # Escalation bands, expressed as base-frame range to the obstacle.
     cap_range_m: float = 1.8
     stop_range_m: float = 1.2
@@ -150,15 +161,46 @@ class YieldConfig:
     # An empty corridor for this long releases the stop, even if the track that
     # caused it is still nominally alive somewhere in the scan.
     clear_hold_sec: float = 0.5
+    # Hysteresis for a hold that is already in force. A held base re-decides
+    # against a projection built from a *tiny* relative velocity, so a box
+    # crossing at 0.05-0.1 m/s flips "clear / conflict" on +/-0.05 m/s of track
+    # noise: measured 2026-11-15, 388.158 "mover hold clear; resuming" ->
+    # 388.262 "Yield hold" again, ~1 Hz for 20 s (run_logs/
+    # competition_margin010_1608/launch.log). Each of those resumes was a fresh
+    # stop (obs.latched False), which also made the lane escape - reachable
+    # only from the latched branch - dead code for the whole incident. Once the
+    # base is holding, release only when the box is this far outside the swept
+    # band AND on its way out of it; inside the band, hold.
+    hold_release_margin_m: float = 0.12
     # Parking inside a patrol lane is a trap: the box comes back every few
     # seconds, each individual hold is short, and the base can never finish
     # crossing - measured 2026-10-13, 0.30 m from mover_3's segment, 18 s of
     # zero motion across 30 hold/resume cycles. Any hold this close to a lane
     # centre line is refused: the base caps and keeps crossing instead.
-    lane_hold_clearance_m: float = 0.5
+    # Raised 0.5 -> 0.62 m on 2026-11-15. The swept band is not 0.35 m but
+    # ``base_half_width + obstacle_half_width = 0.35`` *plus* the base's own
+    # reach: at 0.5 m the base was held 0.72 m from mover_3's box and the box
+    # still swept through it down to 0.32 m centre-to-centre
+    # (run_logs/competition_margin010_1608/launch.log, 16:13:07-16:13:38):
+    # once the box is inside its footprint, RPP refuses every tick, NavFn
+    # cannot seed a plan from a lethal start cell, and backup/spin fail on the
+    # same costmap, so the only exit left is waiting for the box to pass.
+    # 0.62 = 0.35 + 0.11 (box half width) + 0.16 m of real clearance.
+    lane_hold_clearance_m: float = 0.62
     # ...and an episode that is already holding inside a lane leaves sideways
     # after this long rather than waiting out the full budget in the box's way.
     lane_escape_delay_sec: float = 1.0
+    # A release has to survive the base's own acceleration. While the base is
+    # restarting, its measured vx is ~0, so the next tick re-decides with
+    # ``max(vx, min_speed_mps)`` and projects the crossing ~12 s out; the hold
+    # returns before the base has moved. Measured 2026-11-15: "hold clear;
+    # resuming" and "Yield hold" alternated at ~1 Hz for 20 s and the base
+    # finished that episode 0.32 m from a box that never yields (run_logs/
+    # competition_margin010_1608/launch.log). The latch is therefore kept until
+    # the base has travelled ``go_commit_m`` or ``go_commit_sec`` has passed,
+    # so the policy keeps judging at its resume speed instead of at zero.
+    go_commit_sec: float = 0.8
+    go_commit_m: float = 0.40
     # How close to a patrol endpoint a box must be before its "I am leaving"
     # velocity stops being believable (it is about to turn around). Kept tight
     # AND combined with "is it still heading for that endpoint": the patrol
@@ -435,6 +477,23 @@ def detect_conflict(obs: 'YieldObservation', cfg: 'YieldConfig') -> _Conflict:
 
     half = cfg.half_width_m + cfg.obstacle_half_width_m
 
+    # Hysteresis for a hold that is already in force (see
+    # YieldConfig.hold_release_margin_m). The projection below is built from the
+    # obstacle's *measured* relative velocity, and while the base is held that
+    # velocity is a slow box's whole motion - 0.05 m/s of noise flips the answer.
+    # Inside the swept band, "still in the way" is the only honest answer.
+    if obs.latched:
+        band = half + cfg.hold_release_margin_m
+        if abs(obs.box_y) <= band:
+            away = obs.box_vy * (1.0 if obs.box_y >= 0.0 else -1.0)
+            if not (away > 0.0 and abs(obs.box_y) >= half):
+                return _Conflict(
+                    True, clears_at,
+                    f'holding: obstacle at y={obs.box_y:+.2f} m '
+                    f'(v={obs.box_vy:+.2f} m/s) is inside the swept band '
+                    f'+-{band:.2f} m',
+                )
+
     # A box that is still *outside* the corridor is judged by when it will
     # enter it, and the base must be past with the latency margin to spare.
     # This is the "早决策" half of the rule: the answer is decided while the box
@@ -595,8 +654,19 @@ def decide(
             # Already holding inside a box's lane: waiting there is the trap.
             # Leave sideways now instead of spending the whole budget in its
             # way (measured: 18 s frozen in 30 alternating hold/resume cycles).
-            return lateral_exit(obs, cfg, arc_attempts, wait_elapsed_sec,
-                                conflict)
+            escape = lateral_exit(obs, cfg, arc_attempts, wait_elapsed_sec,
+                                  conflict)
+            # An arc is taken when one exists; otherwise the leg goes back to
+            # Nav2, the hand-back this branch has always done.
+            #
+            # Holding instead ("no room, so wait it out") was tried and
+            # reverted. When the base's own route runs ALONG mover_1's lane it
+            # is in_lane for the whole transit, the box oscillates inside the
+            # swept band the entire time, and the base sat at (-11.89,-3.55) for
+            # three consecutive 45 s legs (run_logs/competition_yieldfix3,
+            # 1794738100..1794738300). A hold that never resolves is worse than
+            # the refusal loop, which at least lets the dead-zone escape fire.
+            return escape
         if wait_elapsed_sec >= cfg.wait_budget_sec:
             # Patience is spent and the obstacle still owns the lane. Do NOT
             # simply keep waiting: the controller's own progress checker fails
@@ -605,9 +675,11 @@ def decide(
             # waiting for. Leave along a lateral waypoint instead.
             return lateral_exit(obs, cfg, arc_attempts, wait_elapsed_sec,
                                 conflict)
+        # `conflict.why` already starts with "holding: " when the hysteresis
+        # band made the decision, so do not prefix it twice.
         return YieldDecision(
             ACTION_STOP, REASON_WAIT, wait_elapsed_sec=wait_elapsed_sec,
-            detail=f'holding: {conflict.why}',
+            detail=conflict.why,
         )
 
     if not conflict.conflict:
@@ -624,6 +696,18 @@ def decide(
     #    at which point the base is already crawling, the box clears first, and
     #    there is no conflict left to solve. Slow down, let the costmap's own
     #    inflation layer bias the path away from it, and escalate to a stop.
+    # 4a. Already inside the keep-out: never "cap". Capping means "keep going,
+    #     slowly", which is exactly wrong when the box is closer than the
+    #     moving-obstacle node's 0.75 m warning band - the two layers then
+    #     disagree in public (27 `Yield cap ... 0.80 m/s` lines while mover_2
+    #     sat 0.38 m from the base, r10c). Inside the band the base holds.
+    if rng < cfg.keepout_conflict_m:
+        return YieldDecision(
+            ACTION_STOP, REASON_KEEPOUT,
+            detail=f'box {rng:.2f} m inside the {cfg.keepout_conflict_m:.2f} m '
+                   f'keep-out; {conflict.why}',
+        )
+
     if rng > cfg.cap_range_m:
         return YieldDecision(
             ACTION_CAP, REASON_CAPPED,
@@ -792,7 +876,8 @@ class YieldTracker:
                       + self.cfg.max_mover_speed_mps * max(0.0, dt))
         return math.hypot(x - track['x'], y - track['y']) <= allowed
 
-    def update(self, points, now: float, base_state) -> None:
+    def update(self, points, now: float, base_state,
+               carrying: bool = False) -> None:
         """Fold one sweep of base-frame points into the tracks.
 
         ``points`` is any iterable of ``(x, y)`` in the base frame; a box is
@@ -810,11 +895,13 @@ class YieldTracker:
         """
         bx, by, yaw, vx, vy, wz = base_state
         cos_yaw, sin_yaw = math.cos(yaw), math.sin(yaw)
+        # 带载时把整圈自车挂载箱排除掉，而不是只排除 0.12 m 内的自车本体回报。
+        min_rng = (self.cfg.self_exclusion_radius_m if carrying else 0.12)
         for track in self._tracks:
             track['seen'] = False
         for px, py in points:
             rng = math.hypot(px, py)
-            if not (0.12 <= rng <= self.cfg.track_range_m):
+            if not (min_rng <= rng <= self.cfg.track_range_m):
                 continue
             # Base frame -> odom frame.
             x = bx + cos_yaw * px - sin_yaw * py
@@ -856,7 +943,8 @@ class YieldTracker:
         ]
 
     def nearest(self, now: float, base_state,
-                min_world_speed: float = 0.0) -> dict | None:
+                min_world_speed: float = 0.0,
+                carrying: bool = False) -> dict | None:
         """Closest live track, reported in the base frame at call time.
 
         When requested, exclude stationary returns in the world frame *before*

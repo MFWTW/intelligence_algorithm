@@ -21,6 +21,22 @@ fixed_joint_pick_place:
     # Detect the 0.08 m/s patrols but exclude measured 0.86+ m/s phantom tracks.
     yield_max_mover_speed_mps: 0.6
     yield_wait_budget_sec: 20.0
+    # Pinned for the same reason as the three above. These decide where a hold
+    # is allowed to park and when it may end, measured against mover_3 on
+    # 2026-11-15: at 0.5 m the base held 0.72 m from the box, the box still
+    # swept through it to 0.32 m, and the hold/resume pair flipped ~1 Hz for
+    # 20 s. See obstacle_yield.YieldConfig for the full note.
+    yield_lane_hold_clearance_m: 0.62
+    yield_lane_escape_delay_sec: 1.0
+    yield_hold_release_margin_m: 0.12
+    yield_clear_hold_sec: 0.5
+    # Keep the episode latch (not the hold) through the base's restart, so a
+    # release is judged at the resume speed rather than at 0.05 m/s.
+    yield_go_commit_sec: 0.8
+    yield_go_commit_m: 0.40
+    # A lateral exit is a Nav2 goal: reject it locally if the target cell is
+    # already inside the global costmap's inscribed band.
+    yield_arc_costmap_check: true
     cube_name: red_cube_1
     warehouse: A
     navigation_frame: map
@@ -69,6 +85,9 @@ fixed_joint_pick_place:
     enable_visual_handoff: true
     visual_handoff_distance_m: 1.4
     visual_handoff_min_distance_m: 0.85
+    # 停稳后低于这个距离先退避：相机行先验在 ~0.45 m 内会跑出画面，
+    # 探测器会把所有轮廓拒掉，表现成 "Visual blob lost" + 75 s 超时。
+    visual_handoff_coast_min_distance_m: 0.45
     warehouse_a_pose:
     - 7.244
     - -2.483
@@ -134,41 +153,21 @@ fixed_joint_pick_place:
     - 0.016
     - -2.702
     - -1.570796
-    red_cube_1_warehouse_c_via_1:
-    - -3.85
-    - -6.725
-    - -0.475695
-    red_cube_1_warehouse_c_via_2:
-    - 0.025
-    - -4.875
-    - 0.51095
-    # blue_cube_3 -> A: the old straight approach to (12.875,-3.875)
-    # crossed mover_3's (11.76,-4.53)<->(12.62,-5.87) patrol lane.
-    # In the 2026-10-14 GUI round it wedged at (11.6,-5.5), spending 105 s
-    # in NAV_TO_ZONE before failing with the cube attached. The static map has
-    # a wall at y~-3.7 ending near x=12.7, so a north-side shortcut is NOT safe.
-    # Stage outside the patrol band to the south, pass its east end, then cross
-    # to the north side east of the wall. The existing yield policy can stop at
-    # the first waypoint without parking on the moving box's path. Keep the
-    # loaded footprint unchanged; these points are a route trial, not proof of
-    # collision-free driving (Nav2 still checks live costmaps).
-    blue_cube_3_warehouse_a_via_1:
-    - 10.8
-    - -6.65
-    - -0.16
-    blue_cube_3_warehouse_a_via_2:
-    - 13.65
-    - -6.85
-    - -0.07
-    blue_cube_3_warehouse_a_via_3:
-    - 13.65
-    - -3.0
-    - 1.570796
+    # Red cube 1 -> C: Nav2 chooses the route; no fixed intermediate points.
+    red_cube_1_warehouse_c_via_1: []
+    red_cube_1_warehouse_c_via_2: []
+    # Blue cube 3 -> A: no mandatory intermediate points; Nav2 chooses the
+    # route around walls and moving obstacles using the loaded costmaps.
+    blue_cube_3_warehouse_a_via_1: []
+    blue_cube_3_warehouse_a_via_2: []
+    blue_cube_3_warehouse_a_via_3: []
     robot_model_name: six_arm
     robot_base_link: base_footprint
     empty_robot_radius_m: 0.32
     empty_inflation_radius_m: 0.55
-    global_radius_margin_m: 0.0
+    # 全局规划额外余量：0.0 时 NavFn 会贴着车体半径（内切带 253）走，RPP 的
+    # 前向投影弧随即拒绝，表现为墙角静止 18 s + 后退重试。受控试验量化后取 0.10。
+    global_radius_margin_m: 0.10
     loaded_robot_radius_m: 0.35
     loaded_inflation_radius_m: 0.6
     robot_attach_link: link6
@@ -181,20 +180,52 @@ fixed_joint_pick_place:
     navigation_accept_yaw_rad: 0.79
     navigation_accept_hold_sec: 1.0
     enable_dock_creep: true
-    dock_creep_trigger_m: 0.35
+    # 2026-11-16: Nav2 hands the base over at full speed, and from 1.5 m/s
+    # it coasts ~0.45 m before the smoother's 2.5 m/s^2 ramp stops it. At
+    # 0.35 m the creep therefore started past the plate and had to swing
+    # 168 deg back (competition_lanes_v02h trace). Hand over at 0.8 m so
+    # the coast lands short of the plate.
+    dock_creep_trigger_m: 0.8
     dock_creep_speed_mps: 0.15
     dock_creep_forward_gain: 0.8
     dock_creep_tolerance_m: 0.03
     dock_creep_yaw_tolerance_rad: 0.06
     dock_creep_timeout_sec: 26.0
-    dock_creep_accept_m: 0.22
-    dock_creep_attempts: 1
+    # 2026-11-16: 0.22 was the hole that lost the slot - two warehouse A docks in
+    # a row were accepted at 0.210 m and the released cube landed 0.153 m off in
+    # y, outside the +/-0.235 slot box. 0.06 turned out to be unreachable (the
+    # creep hunted for its whole 26 s budget at 0.089-0.143 m and the leg died),
+    # so 0.10 is the value the base can actually deliver: 0.10 + slot 0.12 +
+    # bias 0.02 = 0.24, inside 0.235 with the heading error now compensated in
+    # joint1 instead of being inherited by the drop.
+    dock_creep_accept_m: 0.10
+    # 2026-11-16: the place posture is a fixed set of joint angles, so the drop
+    # sits a fixed leash (~0.36 m) from the base and inherits its heading. joint1
+    # is the arm's vertical axis, so rotating it by the dock heading error puts
+    # the drop back on the plate's y axis. Limit 0.6 rad = 34 deg.
+    place_yaw_compensation: true
+    place_yaw_comp_limit_rad: 0.6
+    # Two windows: a refused creep costs one nav retry (~10 s), a misplaced cube
+    # costs the round.
+    dock_creep_attempts: 2
     dock_creep_align_distance_m: 0.25
     escape_distance_m: 0.7
+    # 2026-11-17 A/B 结论：把无进展判据压到 25 s 并把重试预算压到 1，两轮 rule1
+    # 全部 FAILED（abaz1 2/5、abaz2 0/5）——它砍掉的是“控制器零指令 45 s 后靠逃逸
+    # 重试救回来”的那条路，而不是纯粹浪费的尾巴。故保持 45 s 与 retry=2 不变。
+    # 若要快速放弃，应判“规划器连续 N 次失败（目标不可达）”，不要用原始静止计时。
     navigation_retry_count: 2
     action_retry_count: 2
     service_timeout_sec: 20.0
     link_service_attempts: 2
+    # Pause the world for the ATTACH/DETACH call. The attacher mutates
+    # joints from a ROS callback thread while ODE keeps stepping, and
+    # every recorded gzserver SIGSEGV (4 runs, 2026-10-08 .. 2026-11-15)
+    # lands ~0.5 s after DETACH during VERIFY_PLACE. The pause is capped
+    # by physics_freeze_timeout_sec so a wedged service cannot freeze the
+    # simulation.
+    freeze_physics_around_link_services: true
+    physics_freeze_timeout_sec: 2.0
     dependency_timeout_sec: 60.0
     enable_visual_alignment: true
     camera_topic: /camera/image_raw
@@ -227,12 +258,16 @@ fixed_joint_pick_place:
     visual_standoff_frames: 5
     visual_stable_span_px: 8.0
     visual_center_tolerance: 0.04
-    visual_linear_gain: 0.45
+    # 2026-11-16: the servo spends its budget on the 1.2 m run-in from the
+    # handoff, not on the last centimetres - the approach is error-proportional,
+    # so a bigger cap only speeds up the far field. Measured before the change:
+    # 7.5-15.2 s of vision_align per cube (run_logs/competition_lanes_v02c).
+    visual_linear_gain: 1.2
     visual_min_linear_speed: 0.06
     visual_angular_gain: 0.8
-    visual_max_linear_speed: 0.15
+    visual_max_linear_speed: 0.40
     visual_max_angular_speed: 0.25
-    visual_search_rate: 0.35
+    visual_search_rate: 0.60
     visual_search_timeout_sec: 18.0
     visual_research_after_sec: 3.0
     require_proximity_check: true
@@ -313,16 +348,23 @@ fixed_joint_pick_place:
     wedge_collision_timeout_sec: 18.0
     wedge_collision_min_messages: 5
     wedge_collision_radius_m: 0.05
+    # 2026-11-17 A/B：原配置半径 1.2–1.4 m、限速 0.6 m/s。逐帧分解显示 A 段直线段
+    # 中位速度只有 0.60 m/s（上限 1.5），几乎全程被这圈限速押着。收到 0.8 m + 0.9 m/s 后：
+    #   直线段中位 0.60 -> 1.50 m/s，A 段"在走"的均速 0.64 -> 0.72/0.78（两轮）
+    #   来源 run_logs/vfix_rule1_20261117-191204（基线）与 run_logs/abaz4_*、run_logs/abaz7_*
+    # 总时长仍被交通停顿和控制器零指令卡死掩盖，所以看"在走"的均速，不看单轮总时长。
+    # 同期 5 次尝试里 2 次启动失败（TF/DDS 发现）、2 次 45 s 零指令卡死，均与本改动无关。
+    # 真窄口（历史 0.318 m 弦宽、现净空 0.58 m）仍在 0.8 m 半径内被 0.9 m/s 压着。
     slow_zones:
     - 12.78
     - -3.7
-    - 1.4
-    - 0.6
+    - 0.8
+    - 0.9
     - 5.3
     - -0.4
-    - 1.2
-    - 0.6
+    - 0.8
+    - 0.9
     - 10.8
     - -8.1
-    - 1.1
-    - 0.6
+    - 0.8
+    - 0.9
