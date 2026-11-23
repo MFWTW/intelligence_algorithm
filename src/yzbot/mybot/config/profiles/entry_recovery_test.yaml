@@ -1,0 +1,50 @@
+# Opt-in overlay: the C-zone narrow-entrance recovery (P0, 2026-11-21).
+#
+# This is NOT part of the scored competition profile. Merged over whichever
+# executor profile the launch selected when MYBOT_ENTRY_RECOVERY=1, by
+# merged_executor_profile() in scripts/yield_nav_profile.py, so a unit run can
+# show in its own log which parameters were actually loaded.
+#
+# Enable only for a Gazebo unit run of red_cube_1 -> C. Validate against the
+# round report before adding any of these keys to executor_fast.yaml.
+fixed_joint_pick_place:
+  ros__parameters:
+    entry_recovery_enabled: true
+    entry_recovery_zone: C
+    # Clearance-verified against src/yzbot/bot_navigation/maps/room_from_world.pgm
+    # (the map the competition launch actually loads):
+    #   wait pose (-4.60, -6.90): 1.12 m static, 0.44 m from the pose the
+    #     failed round stopped at (-4.19, -6.74)
+    #   alt  pose (-5.10, -6.55): 1.50 m static, 0.61 m from the wait pose
+    # The loaded envelope is 0.35 m radius plus the stowed arm; the test file
+    # src/yzbot/mybot/test/test_entry_recovery.py fails if either point moves
+    # closer to a wall than that, if the two collapse onto each other, or if
+    # 1.5x the arrival radius eats the 0.44 m separation from the failed pose.
+    entry_recovery_wait_pose:
+    - -4.60
+    - -6.90
+    - 0.0
+    entry_recovery_alt_pose:
+    - -5.10
+    - -6.55
+    - 0.0
+    # One deadline for staging, probing and every attempt (the old code spent
+    # 60 s of a 45 s budget because each stage restarted its own timer).
+    entry_recovery_wait_budget_sec: 45.0
+    entry_recovery_max_attempts: 3
+    entry_recovery_attempt_timeout_sec: 30.0
+    # Timeout of the plan-only probe tree (ComputePathToPose, no motion).
+    entry_recovery_plan_abort_sec: 5.0
+    # Arrival radius: inside the planner's 0.10-0.25 m goal tolerances, and
+    # small enough that the 0.44 m separation from the failed pose survives the
+    # 1.5x verification radius.
+    entry_recovery_reach_m: 0.15
+    entry_recovery_yaw_tol_rad: 0.35
+    entry_recovery_retreat_m: 0.6
+    entry_recovery_retreat_speed_mps: 0.10
+    entry_recovery_stop_clearance_m: 0.40
+    entry_recovery_scan_max_age_sec: 0.6
+    # Deterministic Gazebo exercise: hand the C dock leg to the recovery before
+    # the ordinary first attempt. Test overlay only - the scored profile must
+    # never carry this key.
+    entry_recovery_force_first: true

@@ -1,0 +1,29 @@
+<!--
+  Recovery-free drive tree for the narrow-entrance recovery.
+
+  Same replanning pipeline as nav_to_pose_short_recovery.xml - 1 Hz
+  ComputePathToPose, then FollowPath - with every recovery action removed:
+  no ClearEntireCostmap, no BackUp, no Spin, no RetryNode around the planner
+  or the controller.
+
+  Why (2026-11-21, red_cube_1 -> C): the recovery must be the only thing that
+  decides whether to retreat, wait or give up. With the stock trees each failed
+  attempt was followed by Nav2's own 0.5 m back-up and 0.8 rad spin and a
+  double costmap clear, so the base left the staging point on its own, the
+  recovery's "came back to the same pose" assumption broke, and the log read
+  like the recovery had cleared the maps (it had not - the behaviour tree had).
+
+  A failure here therefore means exactly one thing: from the current start cell
+  the planner or the controller refused, with the base still where the recovery
+  put it, and the recovery's own classification is the only authority.
+-->
+<root main_tree_to_execute="MainTree">
+  <BehaviorTree ID="MainTree">
+    <PipelineSequence name="NavigateWithoutRecovery">
+      <RateController hz="1.0">
+        <ComputePathToPose goal="{goal}" path="{path}" planner_id="GridBased"/>
+      </RateController>
+      <FollowPath path="{path}" controller_id="FollowPath"/>
+    </PipelineSequence>
+  </BehaviorTree>
+</root>

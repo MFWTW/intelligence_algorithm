@@ -86,6 +86,19 @@ DEFAULT_PATROLS = (
 # Footprint served to the costmaps (and the X/Y size in BOX_SDF).
 BOX_SIZE_M = 0.22
 
+# Height at which the box marks are placed in the costmaps. The box is 0.22 m
+# tall, so any height inside it is truthful; this one is deliberately the lidar
+# plane (lidar_joint z = base_height/2 + 0.01 = 0.06 above base_link, base_link
+# 0.1034 above the floor -> ~0.163 m). The local costmap's voxel layer is 0.05 m
+# tall per voxel, so marks published at the box centre (0.11 m, voxel 2) sit one
+# voxel below the scan rays (0.163 m, voxel 3): the 2D projection keeps the
+# lethal cell, and a 3D raytrace only clears the voxel the ray passes through.
+# That is the suspected reason each patrol leaves a trail of lethal cells the
+# scan cannot erase (rounds of 2026-11-23: 85-95% of all "detected collision
+# ahead" time had neither static-map nor laser support). Publishing at the lidar
+# plane should let the 360 degree scan raytrace those marks away - under test.
+MARK_Z_M = 0.16
+
 
 def transform_point_xyz(point, transform):
     """Apply a map->base_link TF to one simulated obstacle return.
@@ -254,6 +267,14 @@ class MovingObstacles(Node):
         # 130 s trace (run_logs/yield3_131041) and deadlocked the base in front
         # of it.
         self.declare_parameter('robot_clearance_m', DEFAULT_CLEARANCE_M)
+        # Hard limit: the box is not served a pose that would put it inside this
+        # distance of the base origin. 0.42 m = base circle 0.20 m + box half
+        # diagonal sqrt(2)*0.11 = 0.156 m + a 6 cm margin, i.e. the box stops
+        # just before the surfaces touch. Contact between the kinematic box and
+        # the dynamic base is what blew the simulation up on 2026-11-23 (see
+        # _contact_guard_holds); unlike robot_clearance_m this one does gate the
+        # motion, but only in the last few centimetres.
+        self.declare_parameter('contact_guard_m', 0.42)
         self.declare_parameter('spawn_on_start', True)
         # The first box is requested while Gazebo is still inserting the robot
         # and its plugins, and that request loses the race ("Entity pushed to
@@ -284,6 +305,7 @@ class MovingObstacles(Node):
             SetEntityState, '/gazebo/set_entity_state')
         self._spawn_client = self.create_client(SpawnEntity, '/spawn_entity')
         self._robot_xy = None
+        self._guard_warn_at = {}
         self.create_subscription(
             Odometry, '/odom',
             lambda msg: setattr(
@@ -372,7 +394,7 @@ class MovingObstacles(Node):
             for dx, dy in offsets:
                 world = (patrol.x + cos_yaw * dx - sin_yaw * dy,
                          patrol.y + sin_yaw * dx + cos_yaw * dy,
-                         BOX_SIZE_M / 2.0)
+                         MARK_Z_M)
                 points.append(transform_point_xyz(world, tf.transform))
         header = Header()
         header.stamp = stamp
@@ -401,7 +423,11 @@ class MovingObstacles(Node):
             # run_logs/yield3_131041, mover_2 sat frozen for 110 s of a 130 s
             # trace while the base paced in front of it, and neither could get
             # through.
+            previous = (patrol.s, patrol.direction, patrol.x, patrol.y)
             patrol.advance(dt)
+            guard = getattr(self, '_contact_guard_holds', None)
+            if guard is not None and guard(patrol, previous):
+                continue
             if not self._reset_client.service_is_ready():
                 continue
             request = SetEntityState.Request()
@@ -418,6 +444,42 @@ class MovingObstacles(Node):
             self._warn_if_base_inside_box(patrol)
         if bool(self.get_parameter('publish_obstacle_cloud').value):
             self._publish_obstacle_cloud()
+
+    def _contact_guard_holds(self, patrol, previous):
+        """Stop one step short of touching the base, and put the box back.
+
+        A kinematic box is an infinite-mass body, and its pose is served every
+        tick, so when it is driven into the dynamic base it keeps advancing
+        regardless of the contact. Measured 2026-11-23 on ..._holdfix1: a box
+        was 0.17-0.26 m from the base origin (the surfaces overlapped) for
+        2.5 s and Gazebo then blew up - the base reached 3.4 m/s, yaw spun, and
+        the round was lost. Two other rounds in the same series (probe,
+        round3_rule3) show the same "mover next to the base, then explosion"
+        pattern, so the box must never be teleported into the base.
+
+        This is NOT the old 0.75 m "yield to the base" bubble that deadlocked
+        the base (run_logs/yield3_131041): the box only pauses in the last
+        ``contact_guard_m`` before a collision, which is well inside the range
+        where the base is already yielding or refusing, and it resumes as soon
+        as the base is clear.
+        """
+        guard = max(0.0, float(self.get_parameter('contact_guard_m').value))
+        if guard <= 0.0 or self._robot_xy is None:
+            return False
+        rx, ry = self._robot_xy
+        gap = math.hypot(patrol.x - rx, patrol.y - ry)
+        if gap >= guard:
+            return False
+        patrol.s, patrol.direction, patrol.x, patrol.y = previous
+        now = time.monotonic()
+        if now - self._guard_warn_at.get(patrol.name, 0.0) >= 2.0:
+            self._guard_warn_at[patrol.name] = now
+            self.get_logger().warning(
+                f'MOVER {patrol.name}: held at {gap:.2f} m from the base '
+                f'(contact guard {guard:.2f} m) instead of being driven into it; '
+                'a kinematic box inside the dynamic base makes the contact '
+                'solver blow up.')
+        return True
 
     def _report(self):
         self._patrols_pub.publish(self._patrols_msg)

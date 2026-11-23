@@ -5,7 +5,7 @@ import unittest
 from unittest.mock import patch
 
 from launch import LaunchContext
-from launch.actions import IncludeLaunchDescription, OpaqueFunction
+from launch.actions import DeclareLaunchArgument, IncludeLaunchDescription, OpaqueFunction
 from launch.utilities import perform_substitutions
 from launch_ros.actions import Node
 
@@ -53,12 +53,29 @@ class TargetedUdpLaunchTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, 'Stock Nav2 launch changed'):
                 module.generate_launch_description()
 
-    def test_competition_default_stays_on_stock_bringup(self):
-        launch = (BOT / 'launch' / 'nav_bringup_gazebo2.launch.py').read_text()
-        self.assertIn("'smoother_udp_experiment', default_value='false'", launch)
-        self.assertIn('condition=UnlessCondition(experimental)', launch)
-        self.assertIn('condition=IfCondition(smoother_udp)', launch)
-        self.assertIn("'smoother_trace_experiment', default_value='false'", launch)
+    def nav_context(self, description, **overrides):
+        context = LaunchContext()
+        context.launch_configurations.update(overrides)
+        for action in description.entities:
+            if isinstance(action, DeclareLaunchArgument):
+                action.execute(context)
+        return context
+
+    def active_nav_includes(self, description, context):
+        guard = next(e for e in description.entities if isinstance(e, OpaqueFunction))
+        for action in guard.execute(context):
+            action.execute(context)
+        return [e for e in description.entities if isinstance(e, IncludeLaunchDescription)
+                and e.condition.evaluate(context)]
+
+    def test_default_stays_on_stock_bringup(self):
+        desc = nav_module.generate_launch_description()
+        ctx = self.nav_context(desc, _nav_experiment_mode='udp')
+        active = self.active_nav_includes(desc, ctx)
+        self.assertEqual(len(active), 1)
+        source = active[0].launch_description_source
+        source.get_launch_description(ctx)
+        self.assertEqual(Path(source.location).name, 'bringup_launch.py')
 
     def test_trace_replaces_only_one_stock_smoother_without_udp(self):
         desc = trace_module.generate_launch_description()
@@ -116,78 +133,62 @@ class TargetedUdpLaunchTests(unittest.TestCase):
             else:
                 self.assertIsNone(env)
 
-    def test_default_and_experiment_graph_are_exclusive(self):
+    def test_legacy_flags_route_to_localization_and_one_navigation_variant(self):
+        cases = [
+            ('smoother_udp_experiment', 'true', 'navigation_udp_experiment.launch.py'),
+            ('smoother_trace_experiment', 'true', 'navigation_trace_experiment.launch.py'),
+            ('smoother_trace_udp_experiment', '1', 'navigation_trace_udp_experiment.launch.py'),
+            ('yield_pause_mode', 'true', 'navigation_yield_pause.launch.py'),
+        ]
+        for flag, value, expected in cases:
+            with self.subTest(flag=flag):
+                desc = nav_module.generate_launch_description()
+                ctx = self.nav_context(desc, **{flag: value}, map='/tmp/test-map.yaml',
+                                       smoother_trace_file='/tmp/trace.jsonl',
+                                       smoother_poll_fallback_sec='0.3')
+                active = self.active_nav_includes(desc, ctx)
+                self.assertEqual(len(active), 1)
+                *arguments, child = active[0].execute(ctx)
+                self.assertEqual(Path(active[0].launch_description_source.location).name,
+                                 'navigation_experiments.launch.py')
+                for action in arguments:
+                    action.execute(ctx)
+                localization, navigation = child.entities[0].execute(ctx)
+                for include, filename in ((localization, 'localization_launch.py'),
+                                          (navigation, expected)):
+                    source = include.launch_description_source
+                    source.get_launch_description(ctx)
+                    self.assertEqual(Path(source.location).name, filename)
+                map_arg = dict(localization.launch_arguments)['map']
+                self.assertEqual(map_arg.perform(ctx), '/tmp/test-map.yaml')
+                nav_args = dict(navigation.launch_arguments)
+                if 'trace' in flag:
+                    self.assertEqual(nav_args['smoother_trace_file'].perform(ctx),
+                                     '/tmp/trace.jsonl')
+                    self.assertEqual(nav_args['smoother_poll_fallback_sec'].perform(ctx), '0.3')
+                else:
+                    self.assertNotIn('smoother_trace_file', nav_args)
+
+    def test_invalid_experiment_flags_fail_closed(self):
         desc = nav_module.generate_launch_description()
-        includes = [e for e in desc.entities if isinstance(e, IncludeLaunchDescription)]
-        guard = next(e for e in desc.entities if isinstance(e, OpaqueFunction))
-        for udp, trace, trace_udp, pause, expected in [
-                ('false', 'false', 'false', 'false', [True, False, False, False, False, False]),
-                ('true', 'false', 'false', 'false', [False, True, True, False, False, False]),
-                ('false', 'true', 'false', 'false', [False, True, False, True, False, False]),
-                ('false', 'false', 'true', 'false', [False, True, False, False, True, False]),
-                ('false', 'false', 'false', 'true', [False, True, False, False, False, True])]:
-            ctx = LaunchContext()
-            ctx.launch_configurations.update({
-                'smoother_udp_experiment': udp, 'smoother_trace_experiment': trace,
-                'smoother_trace_udp_experiment': trace_udp,
-                'yield_pause_mode': pause,
-                'smoother_trace_file': '/tmp/trace.jsonl',
-                'use_composition': 'False', 'slam': 'False'})
-            self.assertEqual([i.condition.evaluate(ctx) for i in includes], expected)
-            if 'true' in (udp, trace, trace_udp, pause):
-                self.assertEqual(guard.execute(ctx), [])
-        for combo in [('true', 'true', 'false'), ('true', 'false', 'true'),
-                      ('false', 'true', 'true')]:
-
-            ctx = LaunchContext()
-            ctx.launch_configurations.update({
-                'smoother_udp_experiment': combo[0], 'smoother_trace_experiment': combo[1],
-                'smoother_trace_udp_experiment': combo[2],
-                'yield_pause_mode': 'false',
-                'smoother_trace_file': '/tmp/trace.jsonl',
-                'use_composition': 'False', 'slam': 'False'})
-            with self.assertRaisesRegex(RuntimeError, 'mutually exclusive'):
-                guard.execute(ctx)
-        ctx = LaunchContext()
-        ctx.launch_configurations.update({
-            'smoother_udp_experiment': 'false', 'smoother_trace_experiment': 'false',
-            'smoother_trace_udp_experiment': 'true', 'yield_pause_mode': 'false',
-            'smoother_trace_file': '  ',
-            'use_composition': 'False', 'slam': 'False'})
-        with self.assertRaisesRegex(RuntimeError, 'non-empty smoother_trace_file'):
-            guard.execute(ctx)
-
-    def test_guard_treats_launch_true_vocabulary_as_a_mode(self):
-        """`IfCondition` accepts '1', so the guard must not treat it as off."""
-        desc = nav_module.generate_launch_description()
-        includes = [e for e in desc.entities if isinstance(e, IncludeLaunchDescription)]
-        guard = next(e for e in desc.entities if isinstance(e, OpaqueFunction))
-
-        def ctx_for(**kwargs):
-            ctx = LaunchContext()
-            ctx.launch_configurations.update({
-                'smoother_udp_experiment': 'false', 'smoother_trace_experiment': 'false',
-                'smoother_trace_udp_experiment': 'false',
-                'yield_pause_mode': 'false',
-                'smoother_trace_file': '/tmp/trace.jsonl',
-                'use_composition': 'False', 'slam': 'False'})
-            ctx.launch_configurations.update(kwargs)
-            return ctx
-
-        # '1' alone must still run every check, not silently skip them.
-        ctx = ctx_for(smoother_trace_udp_experiment='1')
-        self.assertEqual([i.condition.evaluate(ctx) for i in includes],
-                         [False, True, False, False, True, False])
-        self.assertEqual(guard.execute(ctx), [])
-        with self.assertRaisesRegex(RuntimeError, 'mutually exclusive'):
-            guard.execute(ctx_for(smoother_trace_udp_experiment='1',
-                                  smoother_udp_experiment='true'))
-        # Unknown words must fail closed rather than fall through as "off".
-        with self.assertRaisesRegex(RuntimeError, 'Unrecognized smoother experiment'):
-            guard.execute(ctx_for(smoother_trace_udp_experiment='maybe'))
-        # Composition/slam are rejected for a '1'-style mode too.
-        with self.assertRaisesRegex(RuntimeError, 'non-composed'):
-            guard.execute(ctx_for(smoother_trace_udp_experiment='1', use_composition='true'))
+        cases = [
+            ('mutually exclusive', {'smoother_udp_experiment': 'true',
+                                    'smoother_trace_experiment': 'true'}),
+            ('mutually exclusive', {'smoother_trace_udp_experiment': '1',
+                                    'smoother_udp_experiment': 'true'}),
+            ('mutually exclusive', {'smoother_trace_experiment': 'true',
+                                    'smoother_trace_udp_experiment': 'true'}),
+            ('mutually exclusive', {'yield_pause_mode': 'true',
+                                    'smoother_udp_experiment': '1'}),
+            ('non-empty smoother_trace_file', {'smoother_trace_udp_experiment': '1',
+                                              'smoother_trace_file': '  '}),
+            ('Unrecognized smoother experiment', {'smoother_trace_udp_experiment': 'maybe'}),
+            ('non-composed', {'smoother_trace_udp_experiment': '1', 'use_composition': 'true'}),
+            ('map-based', {'smoother_udp_experiment': 'true', 'slam': 'true'}),
+        ]
+        for error, overrides in cases:
+            with self.subTest(overrides=overrides), self.assertRaisesRegex(RuntimeError, error):
+                self.active_nav_includes(desc, self.nav_context(desc, **overrides))
 
     def test_missing_or_extra_smoother_environment_fails_closed(self):
         calls = []

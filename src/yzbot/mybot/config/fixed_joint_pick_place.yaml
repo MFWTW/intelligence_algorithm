@@ -1,5 +1,6 @@
 fixed_joint_pick_place:
   ros__parameters:
+    use_sim_time: true
     cube_name: red_cube_1
     warehouse: A
     navigation_frame: map
@@ -85,6 +86,29 @@ fixed_joint_pick_place:
     - 0.0
     - 3.141593
     red_cube_2_pickup_via_1: []
+    # blue_cube_5 is the one cube whose only approach from warehouse B runs
+    # through the 1.10 m mouth at (-4.3, -1.1). A mover parked in that mouth
+    # made the rule 3 round spend 426 s (62 %) on this single pickup: two 45 s
+    # stalls at the wall tip before the retry ladder backed off. This outer
+    # route leaves B westwards, rounds the wall at y ~ -4.4 through the 1.5 m
+    # gap at x ~ -12.9, and rejoins the goal from the west. Verified on
+    # room_from_world.pgm: waypoint clearance 1.40 / 1.01 / 0.75 m and
+    # 0.85 / 1.00 / 0.58 m straight-chord clearance. Driven at most once per
+    # pickup, only after a failed attempt, and the last leg to the pickup pose
+    # is left to the planner as usual.
+    blue_cube_5_pickup_fallback_via_1:
+    - -10.6
+    - -3.0
+    - 3.141593
+    blue_cube_5_pickup_fallback_via_2:
+    - -12.3
+    - -3.4
+    - -2.91
+    blue_cube_5_pickup_fallback_via_3:
+    - -12.95
+    - -4.45
+    - -0.2
+    pickup_fallback_enabled: true
     blue_cube_1_warehouse_b_via_1:
     - -7.321
     - -3.018
@@ -132,7 +156,56 @@ fixed_joint_pick_place:
     dock_creep_accept_m: 0.22
     dock_creep_attempts: 1
     dock_creep_align_distance_m: 0.12
-    escape_distance_m: 0.7
+    # The executor owns recovery: no hidden clear/spin/back-up in Nav2.
+    guarded_navigation_recovery: true
+    escape_distance_m: 0.25
+    # Only a verified global-only inscribed start may relax. Never change local
+    # geometry or use an ordinary planner abort as a reason to shrink it.
+    stuck_relax_global_radius: true
+    # P0（2026-11-21）：C 区入口恢复。red_cube_1 → C 在 0.89 m 窄口处贴墙，停在离
+    # 墙尖 0.30 m 的位姿——同时落在 0.45 m（规划）和 0.35 m（控制）两个内接带里，
+    # NavFn 直接拒绝起点格，三次重试都是同一结果（0/5，174 s）。开启后，最后一段
+    # 入库腿失败时改为：
+    #   1. 雷达逐拍验证的有界倒退，直到离开内接带；
+    #   2. 退到下面两个净空验证过的等待点之一（每次尝试轮换，避免重走同一条失败路线）；
+    #   3. 先用「只规划不开车」的行为树问全局规划器有没有路——全局代价地图不含
+    #      mover，所以「没路」只能等地图/轮廓变化，不能靠等障碍物走开；
+    #   4. 再用「不带任何恢复动作」的行为树真正开进去，失败按实际位移分类。
+    # 全程共用一个截止时间；不缩载货轮廓、不清图、不盲目后退。
+    # 等待点 (-4.60, -6.90)：静态净空 1.12 m（载货包络 0.35 m + 折臂余量），
+    # 离「上一轮失败的那个位姿」(-4.19, -6.74) 0.44 m。这个 0.44 m 是刻意留的：
+    # 上一次把等待点放在 (-4.30, -6.80)，离失败位姿只有 0.125 m，等于让车从原地
+    # 重走同一条失败路线。备用点 (-5.10, -6.55) 净空 1.50 m，离主点 0.61 m，
+    # 进场角不同；两次尝试轮换使用。test_entry_recovery.py 会校验净空、两点间距、
+    # 以及「主点到失败位姿的距离 − 1.5×reach」仍留有 0.20 m 以上。
+    entry_recovery_enabled: true
+    entry_recovery_zone: C
+    # C 区首条入库路线卡住时，尽早交给已有的带净空检查的恢复流程。
+    entry_recovery_stall_timeout_sec: 18.0
+    entry_recovery_wait_pose:
+    - -4.60
+    - -6.90
+    - 0.0
+    entry_recovery_alt_pose:
+    - -5.10
+    - -6.55
+    - 0.0
+    entry_recovery_wait_budget_sec: 45.0
+    entry_recovery_max_attempts: 3
+    entry_recovery_attempt_timeout_sec: 30.0
+    entry_recovery_plan_abort_sec: 5.0
+    # 到达判据：0.15 m（规划器 xy_goal_tolerance 0.10–0.25 之间），并且在到位
+    # 后还要复核 ≤1.5×reach；旧的 0.45 m 比失败位姿到等待点的距离还大。
+    entry_recovery_reach_m: 0.15
+    entry_recovery_yaw_tol_rad: 0.35
+    entry_recovery_retreat_m: 0.6
+    entry_recovery_retreat_speed_mps: 0.10
+    entry_recovery_stop_clearance_m: 0.40
+    entry_recovery_scan_max_age_sec: 0.6
+    # 仅供测试：把 C 区入库腿直接交给恢复流程，跳过第一次普通导航尝试。
+    # 正常进门不会失败，没有这个开关就只能等偶然出现的切角失败才能验证
+    # 等待点、只查路探测和免恢复行为树；比赛配置不含此键（保持 false）。
+    entry_recovery_force_first: false
     navigation_retry_count: 2
     action_retry_count: 2
     service_timeout_sec: 20.0

@@ -1,4 +1,5 @@
 #!/usr/bin/python3
+"""Legacy simulation launch, retained for map.yaml and older workflows."""
 
 # Copyright (c) 2022, www.guyuehome.com
 #

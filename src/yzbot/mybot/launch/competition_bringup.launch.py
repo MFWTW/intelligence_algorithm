@@ -50,6 +50,24 @@ def generate_launch_description():
         from yield_nav_profile import guarded_profile, guarded_executor_profile
         navigation_params = guarded_profile(navigation_params)
         executor_params = guarded_executor_profile(executor_params)
+    # Opt-in only: the C-zone entrance recovery is NOT part of the scored
+    # competition profile yet (config/profiles/executor_fast.yaml does not
+    # contain entry_recovery_* keys, and this launch loads that file INSTEAD OF
+    # config/fixed_joint_pick_place.yaml, not merged with it). Setting
+    # MYBOT_ENTRY_RECOVERY=1 merges config/profiles/entry_recovery_test.yaml
+    # over whichever executor profile was selected, so a unit run can be shown
+    # to have loaded the recovery instead of assuming it.
+    if os.environ.get('MYBOT_ENTRY_RECOVERY', '').lower() in ('1', 'true'):
+        overlay = os.path.join(_profiles, 'entry_recovery_test.yaml')
+        if os.path.isfile(overlay):
+            sys.path.insert(0, os.path.join(
+                get_package_prefix('mybot'), 'lib', 'mybot'))
+            from yield_nav_profile import merged_executor_profile
+            executor_params = merged_executor_profile(executor_params, overlay)
+        else:
+            print(
+                'MYBOT_ENTRY_RECOVERY is set but the overlay is missing: '
+                f'{overlay}', file=sys.stderr)
 
     def _yaml_default(env_name, yaml_path, node_key, param, fallback):
         """Read a switch's default from its YAML, with an env override.

@@ -1,0 +1,5 @@
+<library path="mover_snapshot_layer">
+  <class name="bot_navigation::MoverSnapshotLayer" type="bot_navigation::MoverSnapshotLayer" base_class_type="nav2_costmap_2d::Layer">
+    <description>Opt-in simulation layer for authoritative mover occupancy snapshots.</description>
+  </class>
+</library>

@@ -156,6 +156,69 @@ class RetainedGoalTests(unittest.TestCase):
                                     ('gate', False)])
 
 
+class YieldCancellationTests(unittest.TestCase):
+    def test_cancel_wins_when_stock_hold_clears_on_the_same_tick(self):
+        from test_navigation_control import module as executor
+        oy = executor.obstacle_yield
+        node = SimpleNamespace(
+            _cancel_requested=False,
+            _yield_decision=oy.YieldDecision(oy.ACTION_STOP, oy.REASON_WAIT),
+            _stop_base=mock.Mock(),
+            _cached_planar_distance_to_point=lambda *args: 2.0,
+            get_logger=mock.Mock(),
+        )
+        node._tick_yield = lambda _: setattr(
+            node, '_yield_decision', oy.YieldDecision(oy.ACTION_GO, oy.REASON_CLEAR))
+        with mock.patch.object(executor.rclpy, 'ok', return_value=True), \
+             mock.patch.object(executor.rclpy, 'spin_once', side_effect=lambda *a, **k:
+                               setattr(node, '_cancel_requested', True)):
+            self.assertFalse(executor.FixedJointPickPlace._hold_until_clear(
+                node, 'warehouse B', 1.0, 2.0, time.monotonic() + 2.0))
+        node._stop_base.assert_called_once()
+
+    def test_retained_hold_cancels_before_clearing_gate_on_abort(self):
+        from test_navigation_control import module as executor
+        oy = executor.obstacle_yield
+        calls = []
+        node = SimpleNamespace(
+            _cancel_requested=False,
+            _yield_decision=oy.YieldDecision(oy.ACTION_STOP, oy.REASON_WAIT),
+            _yield_arc_goal=None,
+            _command_yield_gate=lambda value, **_: calls.append(value) or True,
+            _release_nav_control=lambda *args: calls.append('cancel'),
+            _yield_hold_pub=mock.Mock(),
+            _cached_planar_distance_to_point=lambda *args: 2.0,
+            _tick_yield=mock.Mock(),
+            get_logger=mock.Mock(),
+        )
+        with mock.patch.object(executor.rclpy, 'ok', return_value=True), \
+             mock.patch.object(executor.rclpy, 'spin_once', side_effect=lambda *a, **k:
+                               setattr(node, '_cancel_requested', True)):
+            self.assertFalse(executor.FixedJointPickPlace._hold_until_clear_retained(
+                node, 'warehouse B', 1.0, 2.0, time.monotonic() + 2.0,
+                object(), mock.Mock(done=lambda: False), 5.0))
+        self.assertEqual(calls, [True, 'cancel', False])
+
+    def test_resume_cancels_goal_accepted_during_supervisor_abort(self):
+        from test_navigation_control import module as executor
+        result = object()
+        handle = SimpleNamespace(accepted=True, get_result_async=lambda: result)
+        node = SimpleNamespace(_cancel_requested=False, _release_nav_control=mock.Mock())
+
+        def send(*args):
+            node._cancel_requested = True
+            return handle
+
+        node._send_goal_tolerant = mock.Mock(side_effect=send)
+        resume = executor.FixedJointPickPlace._resume_nav_goal
+        self.assertIsNone(resume(node, 'warehouse B', object(), 20.0, client=object()))
+        node._release_nav_control.assert_called_once_with('warehouse B', handle, result, 5.0)
+        node._stop_base = mock.Mock()
+        self.assertIsNone(resume(node, 'warehouse B', object(), 20.0, client=object()))
+        node._send_goal_tolerant.assert_called_once()
+        node._stop_base.assert_called_once()
+
+
 class GuardedLaunchTests(unittest.TestCase):
     def test_stock_nav_routes_behavior_and_smoother_through_gate(self):
         gate_source = (SRC / 'yield_velocity_gate.py').read_text(encoding='utf-8')

@@ -11,6 +11,7 @@ from lifecycle_msgs.msg import State, Transition
 from lifecycle_msgs.srv import ChangeState, GetState
 from moveit_msgs.action import MoveGroup
 from nav2_msgs.action import NavigateToPose
+from nav2_msgs.srv import ManageLifecycleNodes
 from rclpy.action import ActionClient
 from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
@@ -30,6 +31,14 @@ NAV2_NODES = [
     'smoother_server',
     'waypoint_follower',
     'velocity_smoother',
+]
+
+# The two managers that own the Nav2 bringup. Each exposes /manage_nodes
+# (nav2_msgs/srv/ManageLifecycleNodes) and walks its own node list in order; see
+# _retry_bringup for why the recovery has to go through them.
+LIFECYCLE_MANAGERS = [
+    'lifecycle_manager_localization',
+    'lifecycle_manager_navigation',
 ]
 
 
@@ -84,6 +93,22 @@ class SystemHealthCheck(Node):
         # requests later it was still reported non-active and ACTIVATE was never
         # requested. Six repair rounds is ~30 s at recover_interval_sec 5 s.
         self.declare_parameter('stuck_repairs_before_restart', 6)
+        # A third way the bringup dies: a lifecycle manager abandons the WHOLE
+        # bringup after one failed transition. Measured 2026-11-23 18:52
+        # (runs/2026-11-23_rule3_probe11l): map_server logged "Configuring" at
+        # 1795431183.273 and "Loading image_file" at 1795431183.275, and
+        # lifecycle_manager_localization logged "Failed to change state for
+        # node: map_server" + "Failed to bring up all requested nodes. Aborting
+        # bringup." at 1795431183.278 - 3 ms later, with no error from
+        # map_server itself. lifecycle_manager_navigation then lost
+        # controller_server the same way, every Nav2 node stayed non-active, and
+        # the round burned its whole 5 min startup gate before reporting READY
+        # FAILED. The managers never retry on their own and _recover_nav2 only
+        # nudges single nodes, leaving the list half-walked; restarting the walk
+        # through the managers themselves is the only recovery that cannot race
+        # it (see _retry_bringup).
+        self.declare_parameter('retry_bringup_sec', 70.0)
+        self.declare_parameter('bringup_retry_attempts', 2)
 
         self._timeout_sec = float(self.get_parameter('timeout_sec').value)
         self._require_moveit = bool(self.get_parameter('require_moveit').value)
@@ -123,6 +148,17 @@ class SystemHealthCheck(Node):
             1, int(self.get_parameter('stuck_repairs_before_restart').value)
         )
         self._ever_ready = False
+        self._retry_bringup_sec = float(
+            self.get_parameter('retry_bringup_sec').value
+        )
+        self._bringup_attempts = max(
+            0, int(self.get_parameter('bringup_retry_attempts').value)
+        )
+        self._bringup_clients = {}
+        self._bringup_retries = 0
+        self._bringup_snapshot = None
+        self._bringup_since = 0.0
+        self._bringup_commands = []
         if self._require_nav2:
             for name in NAV2_NODES:
                 self._state_clients[name] = self.create_client(
@@ -348,6 +384,80 @@ class SystemHealthCheck(Node):
                     f'it stayed non-active through '
                     f'{self._stuck_repairs.get(name, 0)} repair attempts'))
 
+    def _issue_manage_nodes(self, command: int, label: str) -> int:
+        """Send one ManageLifecycleNodes command to every manager that answered."""
+        sent = 0
+        for manager in LIFECYCLE_MANAGERS:
+            client = self._bringup_clients.get(manager)
+            if client is None:
+                client = self.create_client(
+                    ManageLifecycleNodes, f'/{manager}/manage_nodes')
+                self._bringup_clients[manager] = client
+            if not client.service_is_ready():
+                continue
+            request = ManageLifecycleNodes.Request()
+            request.command = command
+            client.call_async(request)
+            sent += 1
+            self.get_logger().warning(f'Sent {label} to {manager}.')
+        return sent
+
+    def _retry_bringup(self, now: float) -> None:
+        """Restart a Nav2 bringup that a lifecycle manager abandoned.
+
+        See the retry_bringup_sec comment for the measured failure. Only the
+        manager owns the ordered node list, so the recovery is RESET (all nodes
+        back to unconfigured) followed by STARTUP, sent through
+        /manage_nodes. The progress test is the observed state snapshot: a
+        healthy bringup changes it every second, so a frozen snapshot for
+        retry_bringup_sec means the walk is dead rather than slow. States at or
+        above 10 are the transitioning ones (ACTIVATING 10/DEACTIVATING 11, see
+        lifecycle_msgs/State) and always count as progress.
+        """
+        if not self._require_nav2 or not self._auto_recover or self._ever_ready:
+            return
+        if self._bringup_commands:
+            due, command, label = self._bringup_commands[0]
+            if now < due:
+                return
+            self._bringup_commands.pop(0)
+            if self._issue_manage_nodes(command, label) == 0:
+                self.get_logger().error(
+                    f'{label}: no lifecycle manager service is reachable; '
+                    'leaving the bringup alone.')
+                self._bringup_commands.clear()
+                self._bringup_since = now
+            return
+        observed = {
+            name: self._nav2_states[name] for name in NAV2_NODES
+            if self._nav2_states.get(name) is not None
+        }
+        if not observed:
+            return
+        snapshot = tuple(sorted(observed.items()))
+        if snapshot != self._bringup_snapshot:
+            self._bringup_snapshot = snapshot
+            self._bringup_since = now
+            return
+        if any(state >= 10 for state in observed.values()):
+            self._bringup_since = now
+            return
+        if self._bringup_retries >= self._bringup_attempts:
+            return
+        if now - self._bringup_since < self._retry_bringup_sec:
+            return
+        self._bringup_retries += 1
+        self.get_logger().error(
+            f'Nav2 states have not moved for {now - self._bringup_since:.0f}s '
+            f'({", ".join(f"{k}={v}" for k, v in sorted(observed.items()))}); '
+            f'restarting the bringup through the lifecycle managers '
+            f'(attempt {self._bringup_retries}/{self._bringup_attempts}).'
+        )
+        self._bringup_commands = [
+            (now, ManageLifecycleNodes.Request.RESET, 'RESET'),
+            (now + 6.0, ManageLifecycleNodes.Request.STARTUP, 'STARTUP'),
+        ]
+
     def _check_health(self):
         now = time.monotonic()
         self._request_controllers()
@@ -399,6 +509,7 @@ class SystemHealthCheck(Node):
             for name in list(self._inactive_since):
                 if name not in known_inactive:
                     del self._inactive_since[name]
+            self._retry_bringup(now)
             if known_inactive and self._auto_recover:
                 grace = float(self.get_parameter('recover_grace_sec').value)
                 stuck = [

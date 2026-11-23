@@ -1,0 +1,15 @@
+<!-- Competition executor owns recovery. Keep continuous planning and waypoint
+     removal, but do not clear obstacles or move independently on failure. -->
+<root main_tree_to_execute="MainTree">
+  <BehaviorTree ID="MainTree">
+    <PipelineSequence name="NavigateThroughPosesWithoutRecovery">
+      <RateController hz="0.333">
+        <ReactiveSequence>
+          <RemovePassedGoals input_goals="{goals}" output_goals="{goals}" radius="0.7"/>
+          <ComputePathThroughPoses goals="{goals}" path="{path}" planner_id="GridBased"/>
+        </ReactiveSequence>
+      </RateController>
+      <FollowPath path="{path}" controller_id="FollowPath"/>
+    </PipelineSequence>
+  </BehaviorTree>
+</root>

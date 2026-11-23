@@ -36,7 +36,13 @@ REASON_PASSING = 'passing'
 REASON_ALONGSIDE = 'alongside'
 REASON_BEHIND = 'behind'
 REASON_CAPPED = 'capped'
+REASON_CLOUD_APPROACH = 'cloud-approach'
+REASON_BLOCKED_DETOUR = 'blocked-detour'
 REASON_ARC = 'arc'
+# A detour taken *before* the wait budget is spent, because standing still in
+# a patrol lane is what the round is paying for. Same geometry as
+# REASON_WAIT_EXPIRED's arc; only the timing differs.
+REASON_DETOUR = 'detour'
 REASON_WAIT = 'wait'
 REASON_WAIT_EXPIRED = 'wait-expired'
 REASON_ARC_FAILED = 'arc-failed'
@@ -47,6 +53,7 @@ class YieldConfig:
     """Tunables, all in SI units and all bounded by measurement elsewhere."""
 
     enabled: bool = True
+    approach_trial_enabled: bool = False
     # The corridor the base must keep clear, as a half-width to each side of its
     # forward axis. Carried envelope is 0.32 m; 0.11 m is half the 0.22 m box,
     # so `half_width_m + obstacle_half_width_m` reproduces the 0.46 m clearance
@@ -120,6 +127,30 @@ class YieldConfig:
     # policy gives up and waits instead. A third arc means the obstacle is
     # following the base, not crossing it.
     max_arc_attempts: int = 2
+    # Take that arc EARLY instead of standing still for the box first.
+    # The measured cost of the old order: movers patrol at 0.20 m/s, so a
+    # hold that waits for one to clear spends 10-40 s of round wall clock
+    # (2026-11-18 rounds: 26.75 s, 31.83 s, 42.02 s in single holds) while
+    # the base is stationary and the room around it is empty. The detour is
+    # the same waypoint the budget-expired escape already drives, taken
+    # while there is still room for it, so it is not a new manoeuvre.
+    # Never taken head-on (`early_detour_head_on_mps` below), never inside
+    # the keep-out, and never more than max_arc_attempts per leg.
+    early_detour_enabled: bool = True
+    # Only detour when the base would need at least this long to clear the
+    # conflict: if it clears sooner, driving on is already the answer.
+    early_detour_lead_sec: float = 0.6
+    # A box closing on the base faster than this is coming at it, not
+    # crossing: steering round a head-on box is what produced the 5.7 m/s
+    # fling on 2026-10-13, so that case still stops.
+    early_detour_head_on_mps: float = 0.05
+    # How far out a detour is worth taking. It is deliberately wider than
+    # cap_range_m (1.8 m): the offset needs ~0.9 m of floor beside the path,
+    # and in this room that room usually only exists further back. Measured
+    # 2026-11-18 round detour1: the only conflict where the base had to wait
+    # 11.3 s had 0.48 m of side room at 1.7 m range, so no arc fitted there,
+    # while the same approach 3 m earlier was in open floor.
+    early_detour_range_m: float = 3.0
     # Speed to assume when estimating how long the base needs to clear a point
     # while it is being held. Using the measured speed (0 when held) would make
     # every crossing look infinitely far away. Capped at the crawl ceiling
@@ -238,6 +269,46 @@ class YieldConfig:
     # existing hold is left to its own budget.
     rotation_guard_rad_s: float = 0.4
 
+    # --- predictive occupancy ------------------------------------------------
+    # The old policy timed a crossing against the *base's* clearance time and
+    # then judged the box's offset when the base got there. That answers "is
+    # the box on the path at the moment I arrive", not "will it still be
+    # there": r53 round 2 stopped at 0.24 m from a mover and was pushed, because
+    # the stop point itself was inside the box's sweep. Everything below
+    # compares the base's carried envelope with the box's predicted envelope at
+    # the same future instants, so a stop that is still swept is rejected.
+    predict_enabled: bool = True
+    # Evaluate from this range. 4 m is the lidar tracking range: at a 1.7 m/s
+    # closing rate that is 2.4 s, still longer than the 0.94 m braking distance.
+    predict_range_m: float = 4.0
+    # How far ahead the occupancy comparison runs. Long enough to see a 0.6 m/s
+    # box cross a 0.9 m corridor and to include a patrol-end reversal.
+    predict_horizon_sec: float = 4.0
+    predict_step_sec: float = 0.10
+    # Extra separation required on the predicted minimum clearance. This covers
+    # the part of the base that is not in the frozen base frame (the carried
+    # cube's overhang and the rear swing while turning) and lidar/prediction
+    # noise; it is a margin, not the contact threshold (0 m is contact).
+    predict_clearance_m: float = 0.15
+    # Reaction delay before a new plan changes the base's speed. The controller
+    # needs a command period plus acceleration time to react; ignoring it makes
+    # a stop look 0.2-0.3 m later than it really lands.
+    predict_latency_sec: float = 0.25
+    predict_accel_mps2: float = 1.0
+    predict_brake_mps2: float = 1.2
+    # Candidate speeds, fastest first. Cruise is the controller's own limit,
+    # clamped up from the measured speed so a base that is already slow does not
+    # look like it will accelerate to 1.5 m/s through the conflict.
+    predict_cruise_mps: float = 1.30
+    predict_slow_mps: float = 0.60
+    predict_crawl_mps: float = 0.30
+    # A lateral candidate is driven at this speed for the comparison; the arc
+    # itself is still issued at the executor's arc speed.
+    predict_arc_speed_mps: float = 0.60
+    # Release hysteresis: the planner holds until the *resume* plan is clear,
+    # which is this much better than bare contact.
+    predict_release_margin_m: float = 0.05
+
     def with_overrides(self, **kwargs) -> 'YieldConfig':
         """Copy with only recognised field overrides (ignores None)."""
         known = {k: v for k, v in kwargs.items()
@@ -294,6 +365,14 @@ class YieldObservation:
     # vx = 0 by construction, which would otherwise make every crossing look
     # infinitely far away and release the hold one tick after taking it.
     latched: bool = False
+    # True while the caller is driving a lateral exit. The policy then plans only
+    # with "continue the arc" / "brake on the arc" candidates, never a new arc or
+    # a full-speed straight resume: the base's future is the arc it is on.
+    arc_active: bool = False
+    # Arc target in the same frozen base frame as ``box_x``/``box_y``. Supplied
+    # whenever ``arc_active`` is set.
+    arc_target_x: float | None = None
+    arc_target_y: float | None = None
 
     def range_m(self) -> float:
         return math.hypot(self.box_x, self.box_y)
@@ -540,8 +619,8 @@ def detect_conflict(obs: 'YieldObservation', cfg: 'YieldConfig') -> _Conflict:
 
     # Inside the corridor at the crossing moment. How long until it leaves?
     if abs(obs.box_vy) > 1e-6:
-        # ...either it is on its way out (same sign as its position)...
-        leaving_in = (-math.copysign(half, projected_y) - projected_y) / obs.box_vy
+        # It exits at the edge in the direction of its lateral velocity.
+        leaving_in = (math.copysign(half, obs.box_vy) - projected_y) / obs.box_vy
         t_clear = clears_at + max(0.0, leaving_in)
     else:
         # ...or it is not crossing at all. Only a mover gets this far, so this
@@ -556,12 +635,49 @@ def detect_conflict(obs: 'YieldObservation', cfg: 'YieldConfig') -> _Conflict:
     )
 
 
+def with_numeric_velocity(obs):
+    """Give an unknown box velocity a number before any arithmetic.
+
+    2026-11-18: the patrol footprints (`/movers/obstacles`) tell the yield layer
+    where a box is up to 6 m out but carry no velocity, so the observation has
+    `box_vx = box_vy = None`. The conflict arithmetic multiplies those (`box_y +
+    box_vy * clears_at`), and the resulting `TypeError` escaped the navigation
+    call and aborted the whole task with a cube still in the gripper
+    (`UNSAFE_OBJECT_STATE:NAV_TO_ZONE:...:CUBE_ATTACHED`, round band047r1). An
+    unseen velocity is treated as zero: the box is assumed to hold its line,
+    which is the conservative reading for stopping, and the head-on gate still
+    treats a box we cannot see move as not closing on us. Pure, no state.
+    """
+    if obs is None or (obs.box_vx is not None and obs.box_vy is not None):
+        return obs
+    return replace(obs,
+                   box_vx=0.0 if obs.box_vx is None else obs.box_vx,
+                   box_vy=0.0 if obs.box_vy is None else obs.box_vy)
+
+
+def _clear_at_goal(decision, obs, cfg):
+    """Give the goal margin back to the controller instead of stalling in it.
+
+    A hold this close to the goal is pure loss: Nav2 cannot make progress, the
+    goal watchdog eventually expires, and the recovery tree backs the base up
+    into whatever it was waiting for.
+    """
+    if decision is None or decision.action != ACTION_STOP:
+        return decision
+    if obs.distance_to_goal_m is None \
+            or obs.distance_to_goal_m > cfg.wait_goal_margin_m:
+        return decision
+    return YieldDecision(ACTION_GO, REASON_CLEAR,
+                         detail='inside the goal margin')
+
+
 def decide(
     obs: YieldObservation | None,
     cfg: YieldConfig,
     *,
     wait_elapsed_sec: float = 0.0,
     arc_attempts: int = 0,
+    continuous_hold_sec: float = 0.0,
 ) -> YieldDecision:
     """Pick the yield action for the current control tick.
 
@@ -577,6 +693,20 @@ def decide(
                              detail=f'scan age {obs.scan_age_sec:.2f} s')
 
     rng = obs.range_m()
+    if (cfg.approach_trial_enabled
+            and (obs.box_vx is None or obs.box_vy is None)):
+        if obs.box_x < 0.0 or rng > 4.0:
+            return YieldDecision(ACTION_GO, REASON_CLEAR,
+                                 detail='position-only mover outside approach band')
+        # A fresh position-only footprint supports slowing down, not a transit
+        # prediction. Never steer around it or clear an active hold from it.
+        if rng <= cfg.keepout_conflict_m or obs.latched:
+            return YieldDecision(ACTION_STOP, REASON_CLOUD_APPROACH,
+                                 detail='position-only mover; no clear prediction')
+        return YieldDecision(ACTION_CAP, REASON_CLOUD_APPROACH,
+                             speed_mps=cfg.cap_speed_mps,
+                             detail=f'position-only mover at {rng:.2f} m')
+    obs = with_numeric_velocity(obs)
     if rng > cfg.track_range_m:
         return YieldDecision(ACTION_GO, REASON_CLEAR)
 
@@ -625,6 +755,15 @@ def decide(
     in_lane = (obs.lane_distance_m is not None
                and obs.lane_distance_m < cfg.lane_hold_clearance_m)
 
+    # Undo the base motion terms in BoxTracker's relative longitudinal speed.
+    forward_world_component = obs.box_vx + obs.vx - obs.wz * obs.box_y
+
+    # Keep the observation as measured: the predictive planner needs the real
+    # relative velocity to extrapolate the mover, and zeroing it here would make
+    # an approaching box look parked. The endpoint distrust below only feeds the
+    # legacy distance rules.
+    raw_obs = obs
+
     # A mover at the end of its segment is about to reverse, and its measured
     # velocity still points away until it does. Measured 2026-10-13: mover_2's
     # direction flipped from -1 to +1 between two samples while the policy read
@@ -642,31 +781,20 @@ def decide(
     #    lives in detect_conflict so it can be tested on its own.
     conflict = detect_conflict(obs, cfg)
 
+    # 2b. Space-time occupancy planning. It is the authoritative rule inside its
+    #     engagement window; everything below is the fallback for a box outside
+    #     that window or for prediction switched off. Note it is fed `raw_obs`:
+    #     the endpoint distrust above deliberately hides a reversal's stale
+    #     velocity from the distance rules, while the planner must predict that
+    #     reversal, not accelerate through it.
+    planned = plan_yield(raw_obs, cfg, wait_elapsed_sec=wait_elapsed_sec,
+                         arc_attempts=arc_attempts)
+
     # 3. While the base is ALREADY being held for this obstacle, re-decide only
     #    on "is the corridor clear yet?". Re-running the full escalation here
     #    would flip the hold off on the next tick (a held base has vx = 0), and
     #    the velocity smoother turns that stutter into a lurch.
     if obs.latched:
-        if not conflict.conflict:
-            return YieldDecision(ACTION_GO, REASON_CLEAR,
-                                 detail='hold released: ' + conflict.why)
-        if in_lane and wait_elapsed_sec >= cfg.lane_escape_delay_sec:
-            # Already holding inside a box's lane: waiting there is the trap.
-            # Leave sideways now instead of spending the whole budget in its
-            # way (measured: 18 s frozen in 30 alternating hold/resume cycles).
-            escape = lateral_exit(obs, cfg, arc_attempts, wait_elapsed_sec,
-                                  conflict)
-            # An arc is taken when one exists; otherwise the leg goes back to
-            # Nav2, the hand-back this branch has always done.
-            #
-            # Holding instead ("no room, so wait it out") was tried and
-            # reverted. When the base's own route runs ALONG mover_1's lane it
-            # is in_lane for the whole transit, the box oscillates inside the
-            # swept band the entire time, and the base sat at (-11.89,-3.55) for
-            # three consecutive 45 s legs (run_logs/competition_yieldfix3,
-            # 1794738100..1794738300). A hold that never resolves is worse than
-            # the refusal loop, which at least lets the dead-zone escape fire.
-            return escape
         if wait_elapsed_sec >= cfg.wait_budget_sec:
             # Patience is spent and the obstacle still owns the lane. Do NOT
             # simply keep waiting: the controller's own progress checker fails
@@ -675,12 +803,41 @@ def decide(
             # waiting for. Leave along a lateral waypoint instead.
             return lateral_exit(obs, cfg, arc_attempts, wait_elapsed_sec,
                                 conflict)
+        if planned is not None:
+            # Includes the case the old rules could not express: the hold point
+            # is inside the mover's sweep, so the planner leaves instead of
+            # standing still to be pushed.
+            return _clear_at_goal(planned, obs, cfg)
+        if not conflict.conflict:
+            return YieldDecision(ACTION_GO, REASON_CLEAR,
+                                 detail='hold released: ' + conflict.why)
+        if (cfg.approach_trial_enabled and continuous_hold_sec >= 3.0
+                and rng > cfg.keepout_conflict_m
+                and not rotating and not obs.lane_end_closing
+                and forward_world_component >= -cfg.early_detour_head_on_mps
+                and (obs.distance_to_goal_m is None
+                     or obs.distance_to_goal_m > cfg.wait_goal_margin_m)):
+            # Persistent conflict is not a reason to release the hold. Only
+            # reconsider a side with at least 0.90 m of observed room, then
+            # run the original geometry and the executor's scan/costmap checks.
+            roomy = replace(obs, **{
+                name: room if room is not None and room >= 0.90 else None
+                for name, room in (('left_room_m', obs.left_room_m),
+                                   ('right_room_m', obs.right_room_m))
+            })
+            detour = lateral_exit(roomy, cfg, arc_attempts, wait_elapsed_sec,
+                                  conflict)
+            if detour.action == ACTION_ARC:
+                return replace(detour, reason=REASON_BLOCKED_DETOUR)
         # `conflict.why` already starts with "holding: " when the hysteresis
         # band made the decision, so do not prefix it twice.
         return YieldDecision(
             ACTION_STOP, REASON_WAIT, wait_elapsed_sec=wait_elapsed_sec,
             detail=conflict.why,
         )
+
+    if planned is not None:
+        return _clear_at_goal(planned, obs, cfg)
 
     if not conflict.conflict:
         # The base gets past it - the plain "直行" case. No action at all, not
@@ -707,6 +864,35 @@ def decide(
             detail=f'box {rng:.2f} m inside the {cfg.keepout_conflict_m:.2f} m '
                    f'keep-out; {conflict.why}',
         )
+
+    # 4c. Prefer going round it to standing still for it.
+    #
+    #     The old order - cap, then stop, then (only after the whole wait
+    #     budget) take the lateral escape - is what makes a 0.20 m/s patrol box
+    #     cost 10-40 s of a round. The geometry of that escape does not depend
+    #     on waiting: `lateral_exit` measures both sides' static room and checks
+    #     the box's current *and* projected envelope, so taking it earlier is
+    #     the same manoeuvre with more room to make it.
+    #
+    #     Three gates keep this from becoming the 2026-10-13 lane crossing: the
+    #     box must not be closing on the base (head-on still stops), the base is
+    #     past the keep-out branch by construction, and the per-leg arc ceiling
+    #     still applies. The caller still verifies the arc target with the lidar
+    #     and (when enabled) the costmap before driving it.
+    if (cfg.early_detour_enabled and not obs.latched
+            and (obs.box_vx is None
+                 or obs.box_vx < cfg.early_detour_head_on_mps)
+            and rng <= cfg.early_detour_range_m
+            and conflict.clears_at >= cfg.early_detour_lead_sec
+            and (obs.distance_to_goal_m is None
+                 or obs.distance_to_goal_m > cfg.wait_goal_margin_m)):
+        detour = lateral_exit(obs, cfg, arc_attempts, wait_elapsed_sec, conflict)
+        if detour.action == ACTION_ARC:
+            return replace(
+                detour, reason=REASON_DETOUR,
+                detail='early detour instead of waiting: '
+                       + (detour.detail or ''),
+            )
 
     if rng > cfg.cap_range_m:
         return YieldDecision(
@@ -779,6 +965,7 @@ def lateral_exit(obs, cfg, arc_attempts: int, wait_elapsed_sec: float,
     on at least one side, and the single 0.10 m stretch where neither side does
     is documented in run_logs/yield_arc_clearance.md.
     """
+    obs = with_numeric_velocity(obs)
     if arc_attempts >= cfg.max_arc_attempts:
         return YieldDecision(
             ACTION_GO, REASON_WAIT_EXPIRED,
@@ -786,7 +973,6 @@ def lateral_exit(obs, cfg, arc_attempts: int, wait_elapsed_sec: float,
             detail=f'waited {wait_elapsed_sec:.1f} s and already used '
                    f'{arc_attempts} lateral exits; handing the leg back to Nav2',
         )
-    projected_y = obs.box_y + obs.box_vy * max(conflict.clears_at, 0.0)
     # The old rule unconditionally followed the box to the side it was leaving.
     # Measured at (-4.767,-1.526), the left clearance is only 0.008 m while the
     # right clearance is 2.522 m: that rule would run into a wall. Evaluate BOTH
@@ -798,10 +984,13 @@ def lateral_exit(obs, cfg, arc_attempts: int, wait_elapsed_sec: float,
             continue
         # Centre-to-centre separation must include the carried footprint and
         # half the box at both ends of the predicted crossing. If the box is on
-        # this side, offset needs to move past it, not onto it.
-        required = max(side * obs.box_y, side * projected_y, 0.0) + (
-            cfg.base_half_width_m + cfg.obstacle_half_width_m
-        )
+        # this side, offset needs to move past it, not onto it. A time-based
+        # "the box will have moved by then" variant was tried on 2026-11-18 and
+        # rejected: it let arcs through that the 2026-10-13 lane-crossing rule
+        # exists to prevent (7 regression tests encode that incident).
+        required = max(side * obs.box_y, side * (
+            obs.box_y + obs.box_vy * max(conflict.clears_at, 0.0)), 0.0) + (
+            cfg.base_half_width_m + cfg.obstacle_half_width_m)
         offset = min(cfg.arc_offset_m, room - cfg.obstacle_half_width_m)
         if (offset >= max(cfg.arc_offset_min_m, required)
                 and math.atan2(offset, cfg.arc_apex_m) <= cfg.max_arc_yaw_rad):
@@ -821,6 +1010,587 @@ def lateral_exit(obs, cfg, arc_attempts: int, wait_elapsed_sec: float,
         detail=f'waited {wait_elapsed_sec:.1f} s; no side clears both the box '
                'and measured static room; returning control to Nav2',
     )
+
+
+def resume_speed_limit(elapsed_sec: float) -> float | None:
+    """Absolute cap during restart; None preserves the controller's own limit."""
+    if elapsed_sec < 0.5:
+        return 0.6
+    if elapsed_sec < 1.0:
+        return 1.0
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Predictive occupancy
+#
+# The rules above answer "is the box on the base's path when the base gets
+# there". That is a different question from "will the box still be where the
+# base is going, when the base is there". r53 round 2 is the counter-example:
+# at 28.6 s the base stopped 0.24 m centre-to-centre from a mover whose
+# envelope was already 0.12 m into the base's footprint, and the mover pushed
+# the stopped base out of the way. The stop itself was the conflict.
+#
+# Everything below freezes the base pose at decision time and compares two
+# *time-parameterised* envelopes sample by sample: the base's carried
+# rectangle on a candidate path, and the mover's rectangle extrapolated at its
+# measured world velocity (including the reversal at a patrol endpoint). A
+# candidate is admissible only if the minimum signed clearance over the whole
+# horizon stays above ``predict_clearance_m``; among admissible candidates the
+# fastest wins. A hold is a candidate like any other, so it is rejected when
+# the mover's sweep will reach it.
+# ---------------------------------------------------------------------------
+
+REASON_PREDICT_PASS = 'predict-pass'
+REASON_PREDICT_SLOW = 'predict-slow'
+REASON_PREDICT_STOP = 'predict-stop'
+REASON_PREDICT_ARC = 'predict-arc'
+REASON_PREDICT_RELEASE = 'predict-release'
+REASON_PREDICT_SWEPT = 'swept-stop'
+REASON_PREDICT_HOLD = 'predict-hold'
+
+
+@dataclass(frozen=True)
+class _Plan:
+    """One candidate future for the base, sampled at the shared tick times."""
+
+    kind: str                 # 'cruise' | 'slow' | 'crawl' | 'stop' | 'arc'
+    speed: float              # commanded target for this candidate
+    xs: tuple[float, ...]
+    ys: tuple[float, ...]
+    yaws: tuple[float, ...]
+    arc_x: float = 0.0
+    arc_y: float = 0.0
+    progress: float = 0.0
+    # Time at which the plan is finished (reached the arc goal or stopped).
+    # Used only to estimate what the base could do after a detour.
+    t_end: float = 0.0
+
+
+@dataclass(frozen=True)
+class _Occupancy:
+    plan: _Plan
+    min_clear: float
+    min_clear_at: float
+    contact_at: float | None
+
+    def clear_of(self, cfg) -> bool:
+        return self.min_clear >= cfg.predict_clearance_m
+
+
+def _approach_speed(v: float, target: float, dt: float, cfg) -> float:
+    """One integration step of the speed actuator, never past the target."""
+    if v < target:
+        return min(target, v + cfg.predict_accel_mps2 * dt)
+    return max(target, v - cfg.predict_brake_mps2 * dt)
+
+
+def _mover_times(cfg) -> tuple[float, ...]:
+    n = max(1, int(round(cfg.predict_horizon_sec / cfg.predict_step_sec)))
+    return tuple(round(i * cfg.predict_step_sec, 6) for i in range(1, n + 1))
+
+
+def predict_mover_path(obs, cfg) -> tuple[tuple[float, float, float], ...]:
+    """Mover pose at each future tick, in the frozen base frame.
+
+    Velocity comes from the tracker as *relative* velocity, so the world
+    velocity is ``box_v + base velocity + wz x r``. Near a patrol endpoint the
+    box reverses on the next tick; ignoring that made the old policy believe a
+    box would keep receding after the turn and release a hold into it.
+    """
+    wx = obs.box_vx + obs.vx - obs.wz * obs.box_y
+    wy = obs.box_vy + obs.wz * obs.box_x
+    speed = math.hypot(wx, wy)
+    if speed > 1e-6:
+        ux, uy = wx / speed, wy / speed
+    else:
+        ux, uy = 1.0, 0.0
+    dt = cfg.predict_step_sec
+    n = max(1, int(round(cfg.predict_horizon_sec / dt)))
+    horizon = n * dt
+    turn_at = None
+    ex = ey = 0.0
+    if (speed > 1e-6 and obs.lane_end_closing
+            and obs.lane_end_distance_m is not None):
+        to_end = max(0.0, obs.lane_end_distance_m)
+        if to_end / speed <= horizon:
+            turn_at = to_end / speed
+            ex = obs.box_x + ux * to_end
+            ey = obs.box_y + uy * to_end
+    poses = []
+    for i in range(1, n + 1):
+        t = i * dt
+        x = obs.box_x + wx * t
+        y = obs.box_y + wy * t
+        yaw = math.atan2(uy, ux)
+        if turn_at is not None and t > turn_at:
+            x = 2.0 * ex - x
+            y = 2.0 * ey - y
+            yaw = math.atan2(-uy, -ux)
+        poses.append((x, y, yaw))
+    return tuple(poses)
+
+
+def _box_clearance(px: float, py: float, pyaw: float,
+                   mx: float, my: float, myaw: float, cfg) -> float:
+    """Signed distance between the base and mover rectangles (negative = into).
+
+    Separating-axis test over the four face normals of the two rectangles. For
+    non-overlapping convex polygons ``max(gap)`` is the separation along the
+    best axis, which never exceeds the true Euclidean distance, so this is a
+    conservative clearance and not an over-estimate.
+    """
+    ca, sa = math.cos(pyaw), math.sin(pyaw)
+    cb, sb = math.cos(myaw), math.sin(myaw)
+    dx, dy = mx - px, my - py
+    half_l = cfg.base_half_length_m
+    half_w = cfg.base_half_width_m
+    mover_half = cfg.obstacle_half_width_m
+    axes = ((ca, sa), (-sa, ca), (cb, sb), (-sb, cb))
+    best = -1.0e9
+    for ax, ay in axes:
+        dist = abs(dx * ax + dy * ay)
+        base_r = half_l * abs(ca * ax + sa * ay) + half_w * abs(-sa * ax + ca * ay)
+        mover_r = mover_half * (abs(cb * ax + sb * ay) + abs(-sb * ax + cb * ay))
+        gap = dist - base_r - mover_r
+        if gap > best:
+            best = gap
+    return best
+
+
+def _straight_plan(obs, cfg, kind: str, target: float, times) -> _Plan:
+    dt = cfg.predict_step_sec
+    v = max(0.0, obs.vx)
+    x = 0.0
+    xs = []
+    ys = []
+    yaws = []
+    for t in times:
+        if t > cfg.predict_latency_sec:
+            v = _approach_speed(v, target, dt, cfg)
+        x += v * dt
+        xs.append(x)
+        ys.append(0.0)
+        yaws.append(0.0)
+    return _Plan(kind, target, tuple(xs), tuple(ys), tuple(yaws),
+                 progress=xs[-1] if xs else 0.0)
+
+
+def _arc_polyline(ax: float, ay: float):
+    """Quadratic Bezier leaving along +X and ending at (ax, ay), unit-spaced."""
+    dist = math.hypot(ax, ay)
+    if dist < 0.05:
+        return None
+    cx = max(0.20, 0.55 * dist)
+    pts = []
+    for i in range(41):
+        u = i / 40.0
+        x = 2.0 * (1.0 - u) * u * cx + u * u * ax
+        y = u * u * ay
+        pts.append((x, y))
+    cum = [0.0]
+    for (x0, y0), (x1, y1) in zip(pts, pts[1:]):
+        cum.append(cum[-1] + math.hypot(x1 - x0, y1 - y0))
+    if cum[-1] < 0.05:
+        return None
+    return pts, cum
+
+
+def _pose_on_polyline(pts, cum, s: float):
+    total = cum[-1]
+    if s <= 0.0:
+        return 0.0, 0.0, 0.0
+    if s >= total:
+        (x0, y0), (x1, y1) = pts[-2], pts[-1]
+        return x1, y1, math.atan2(y1 - y0, x1 - x0)
+    lo, hi = 0, len(cum) - 1
+    while lo + 1 < hi:
+        mid = (lo + hi) // 2
+        if cum[mid] <= s:
+            lo = mid
+        else:
+            hi = mid
+    span = cum[hi] - cum[lo]
+    u = 0.0 if span <= 0.0 else (s - cum[lo]) / span
+    x0, y0 = pts[lo]
+    x1, y1 = pts[hi]
+    return (x0 + (x1 - x0) * u, y0 + (y1 - y0) * u,
+            math.atan2(y1 - y0, x1 - x0))
+
+
+def _arc_plan(obs, cfg, kind: str, target: float, ax: float, ay: float,
+              times) -> _Plan | None:
+    poly = _arc_polyline(ax, ay)
+    if poly is None:
+        return None
+    pts, cum = poly
+    total = cum[-1]
+    dt = cfg.predict_step_sec
+    v = max(0.0, obs.vx)
+    s = 0.0
+    t_end = times[-1] if times else 0.0
+    reached = False
+    end_x = end_y = 0.0
+    resume_v = target
+    resumed = 0.0
+    xs = []
+    ys = []
+    yaws = []
+    for t in times:
+        if not reached:
+            if t > cfg.predict_latency_sec:
+                v = _approach_speed(v, target, dt, cfg)
+                # The arc ends at a goal, so a candidate that is still moving
+                # must be able to stop there: apply the brake curve against it.
+                remaining = max(0.0, total - s)
+                v = min(v, math.sqrt(2.0 * cfg.predict_brake_mps2 * remaining))
+            s = min(total, s + v * dt)
+            x, y, yaw = _pose_on_polyline(pts, cum, s)
+            if s >= total - 0.01:
+                reached = True
+                t_end = t
+                end_x, end_y = x, y
+        else:
+            # After the lateral goal the base rejoins the leg, so the plan
+            # does not end at the arc: model the continuation along the
+            # original direction. An arc that merely stops short of the
+            # conflict, or one that dives into the mover's future line, is not
+            # a bypass and must not be scored as one.
+            if target <= 0.0:
+                x, y, yaw = end_x, end_y, 0.0
+            else:
+                resume_v = _approach_speed(resume_v, cfg.predict_cruise_mps,
+                                           dt, cfg)
+                resumed += resume_v * dt
+                x, y, yaw = end_x + resumed, end_y, 0.0
+        xs.append(x)
+        ys.append(y)
+        yaws.append(yaw)
+    return _Plan(kind, target, tuple(xs), tuple(ys), tuple(yaws),
+                 arc_x=ax, arc_y=ay, progress=(xs[-1] if xs else 0.0),
+                 t_end=t_end)
+
+
+def _occupancy(plan: _Plan, mover, times, cfg) -> _Occupancy:
+    min_clear = float('inf')
+    min_at = 0.0
+    contact_at = None
+    for (mx, my, myaw), t, x, y, yaw in zip(mover, times, plan.xs, plan.ys,
+                                            plan.yaws):
+        clear = _box_clearance(x, y, yaw, mx, my, myaw, cfg)
+        if clear < min_clear:
+            min_clear, min_at = clear, t
+        if clear < 0.0 and contact_at is None:
+            contact_at = t
+    return _Occupancy(plan, min_clear, min_at, contact_at)
+
+
+def _clearance_detail(occ: _Occupancy) -> str:
+    plan = occ.plan
+    where = f'{plan.kind} {plan.speed:.2f} m/s'
+    if plan.kind == 'arc':
+        where = (f'arc {plan.arc_x:.2f},{plan.arc_y:+.2f} '
+                 f'at {plan.speed:.2f} m/s')
+    contact = ''
+    if occ.contact_at is not None:
+        contact = f', contact at {occ.contact_at:.1f} s'
+    return f'{where}: predicted clearance {occ.min_clear:+.2f} m at ' \
+           f'{occ.min_clear_at:.1f} s{contact}'
+
+
+@dataclass(frozen=True)
+class ArcWatch:
+    """Verdict on the lateral exit that is being driven right now.
+
+    ``ok`` keeps the arc leg alive; ``speed_mps`` is a cap to apply while it is
+    driven (None leaves the controller's own limit alone). When ``ok`` is False
+    the base must stop and let the policy decide again: the sidestep no longer
+    clears the mover's predicted sweep, so continuing it blind is exactly the
+    "issued a stop that could not stop the push" failure this feature exists to
+    avoid.
+    """
+
+    ok: bool
+    speed_mps: float | None = None
+    detail: str = ''
+
+
+def watch_arc(obs, cfg) -> ArcWatch:
+    """Re-check the arc against the mover's latest prediction.
+
+    Runs every tick while the base drives the sidestep. Only the arc plans are
+    candidates (the arc is already committed), and the mover is re-predicted
+    from the current observation, so a turn, an acceleration, or a fresh track
+    that cuts the new line shows up here.
+
+    A speed of 0.0 is NOT offered as an admissible arc: braking to a halt on
+    the arc would leave the base standing in the sweep the arc was chosen to
+    leave, and it would hold the arc goal until its progress timeout. Stopping
+    is reported as ``ok=False`` instead, which hands the choice back to the
+    policy (it can hold, crawl, or take the other side).
+    """
+    ax = obs.arc_target_x
+    ay = obs.arc_target_y
+    if ax is None or ay is None:
+        return ArcWatch(True)
+    if math.hypot(ax, ay) < 0.15:
+        # Arrived: the remaining path is the leg Nav2 is already driving.
+        return ArcWatch(True)
+    # A footprint-only mover (patrol boxes seen on /movers/obstacles) carries
+    # no velocity. predict_mover_path multiplies it, so it must be given the
+    # same numeric fallback decide() applies before planning; without this the
+    # watch raised `NoneType + float` 4 ms into the arc and the state machine
+    # lost the whole pickup leg (measured 2026-11-21, blue_cube_4 attempt 1).
+    obs = with_numeric_velocity(obs)
+    times = _mover_times(cfg)
+    mover = predict_mover_path(obs, cfg)
+    judged = []
+    for speed in (cfg.predict_arc_speed_mps, cfg.predict_crawl_mps):
+        plan = _arc_plan(obs, cfg, 'arc', speed, ax, ay, times)
+        if plan is None:
+            continue
+        occ = _occupancy(plan, mover, times, cfg)
+        if occ.clear_of(cfg):
+            cap = speed if speed < cfg.predict_arc_speed_mps else None
+            return ArcWatch(True, cap, _clearance_detail(occ))
+        judged.append(occ)
+    # Nothing that still moves along the arc clears. Braking is judged only to
+    # explain the abort: a stop that would clear still ends the arc leg, because
+    # the policy re-decides from rest and may hold or take the other side.
+    stop = _arc_plan(obs, cfg, 'arc', 0.0, ax, ay, times)
+    if stop is not None:
+        stop_occ = _occupancy(stop, mover, times, cfg)
+        detail = _clearance_detail(stop_occ)
+        if stop_occ.clear_of(cfg):
+            return ArcWatch(False, 0.0,
+                            'the sidestep clears only from a stop: ' + detail)
+        return ArcWatch(False, 0.0, 'the sidestep no longer clears: ' + detail)
+    if not judged:
+        return ArcWatch(True)
+    return ArcWatch(False, 0.0,
+                    'the sidestep no longer clears: '
+                    + _clearance_detail(judged[-1]))
+
+
+def plan_yield(obs, cfg, *, wait_elapsed_sec: float = 0.0,
+               arc_attempts: int = 0,
+               allow_arc: bool = True) -> 'YieldDecision | None':
+    """Choose the fastest admissible candidate, or None when not engaged.
+
+    Returns None outside the engagement window or for a static obstacle; the
+    caller then keeps its ordinary behaviour. When engaged it always returns a
+    decision: a hold is one of the candidates, not the default.
+    """
+    if not cfg.predict_enabled:
+        return None
+    if obs.movers_present is not True:
+        return None
+    if abs(obs.wz) > cfg.rotation_guard_rad_s:
+        # A fast yaw smears the sweep across the scan and inflates every
+        # relative velocity; the track is no longer trustworthy enough to plan
+        # a transit against. Leave the tick to the legacy rules, which already
+        # distrust rotation (2026-10-13: a static cluster 3.5 m to the side read
+        # as 5.5 m/s relative to the base and the policy held itself still while
+        # the base circled beside it).
+        return None
+    if obs.scan_age_sec > cfg.track_timeout_sec:
+        return None
+    rng = obs.range_m()
+    if rng > cfg.predict_range_m:
+        return None
+    if obs.box_x < -cfg.behind_margin_m:
+        return None
+    if obs.box_vx is None or obs.box_vy is None:
+        # Position-only evidence (the cloud stage): it can justify slowing for
+        # something in the band, but not a time-parameterised transit and never
+        # a lateral exit. The legacy rules handle this case.
+        return None
+    obs = with_numeric_velocity(obs)
+    # Judge the mover by the velocity the geometry actually implies, not by the
+    # reported world speed. The two agree in production but the tracker's
+    # speed is a window average, and the kinematics decide the sweep.
+    speed = math.hypot(obs.box_vx + obs.vx - obs.wz * obs.box_y,
+                       obs.box_vy + obs.wz * obs.box_x)
+    if speed < cfg.min_mover_speed_mps:
+        return None
+    if speed > cfg.max_mover_speed_mps:
+        # A world speed this high is almost certainly the base's own rotation
+        # or a mis-association; a "mover" that fast cannot be planned against.
+        return None
+    times = _mover_times(cfg)
+    mover = predict_mover_path(obs, cfg)
+    v0 = max(0.0, obs.vx)
+    moving = v0 > cfg.min_speed_mps
+
+    plans: list[_Plan] = []
+    seen = set()
+
+    def add(plan: _Plan | None):
+        if plan is None:
+            return
+        key = (plan.kind, round(plan.speed, 3), round(plan.arc_x, 3),
+               round(plan.arc_y, 3))
+        if key in seen:
+            return
+        seen.add(key)
+        plans.append(plan)
+
+    cruise = max(v0, cfg.predict_cruise_mps) if moving else cfg.predict_cruise_mps
+    add(_straight_plan(obs, cfg, 'cruise', cruise, times))
+    if abs(cfg.predict_slow_mps - cruise) > 0.05:
+        add(_straight_plan(obs, cfg, 'slow', cfg.predict_slow_mps, times))
+    if abs(cfg.predict_crawl_mps - cruise) > 0.05:
+        add(_straight_plan(obs, cfg, 'crawl', cfg.predict_crawl_mps, times))
+    add(_straight_plan(obs, cfg, 'stop', 0.0, times))
+
+    if obs.arc_active and obs.arc_target_x is not None \
+            and obs.arc_target_y is not None:
+        # While an arc is being driven the only futures are along it: a new
+        # arc would be a second avoidance decision, and a straight resume
+        # would be a different path than the base is actually on.
+        ax, ay = obs.arc_target_x, obs.arc_target_y
+        add(_arc_plan(obs, cfg, 'arc', cfg.predict_arc_speed_mps, ax, ay, times))
+        add(_arc_plan(obs, cfg, 'arc', cfg.predict_crawl_mps, ax, ay, times))
+        add(_arc_plan(obs, cfg, 'arc', 0.0, ax, ay, times))
+    elif allow_arc and arc_attempts < cfg.max_arc_attempts:
+        conflict = detect_conflict(obs, cfg)
+        escape = lateral_exit(obs, cfg, arc_attempts, wait_elapsed_sec, conflict)
+        if escape.action == ACTION_ARC:
+            add(_arc_plan(obs, cfg, 'arc', cfg.predict_arc_speed_mps,
+                          escape.arc_x, escape.arc_y, times))
+
+    occs = [_occupancy(p, mover, times, cfg) for p in plans]
+    by_kind = {}
+    for occ in occs:
+        by_kind.setdefault(occ.plan.kind, occ)
+    hold = by_kind.get('stop')
+    if hold is None:
+        return None
+
+    def score(occ: _Occupancy) -> float:
+        # Forward distance covered over the horizon, with the arc's resume
+        # phase included by _arc_plan. The fastest admissible plan wins; a hold
+        # (which covers only its braking distance) loses to any moving option.
+        return occ.plan.progress
+
+    def moving_admissible():
+        safe = [o for o in occs if o.plan.kind != 'stop' and o.clear_of(cfg)]
+        return max(safe, key=lambda o: (score(o), o.min_clear)) if safe else None
+
+    def least_harmful():
+        # Nothing clears. Take the plan that intrudes the least, and when two
+        # are within the noise of each other take the slower one: a tie is not
+        # a licence to keep the cruise speed into a contact.
+        best_clear = max(o.min_clear for o in occs)
+        near = [o for o in occs if o.min_clear >= best_clear - 0.05]
+        return min(near, key=lambda o: (o.plan.speed, -o.min_clear))
+
+    if obs.latched:
+        if hold.clear_of(cfg):
+            resume = by_kind.get('slow')
+            if resume is not None and resume.clear_of(cfg):
+                return YieldDecision(
+                    ACTION_CAP, REASON_PREDICT_RELEASE,
+                    speed_mps=cfg.predict_slow_mps,
+                    wait_elapsed_sec=wait_elapsed_sec,
+                    detail='hold clears; resuming slowly. ' +
+                           _clearance_detail(resume),
+                )
+            return YieldDecision(
+                ACTION_STOP, REASON_PREDICT_HOLD,
+                wait_elapsed_sec=wait_elapsed_sec,
+                detail='holding: resume path not clear. ' +
+                       _clearance_detail(hold) + '; ' + _clearance_detail(
+                           resume if resume is not None else hold),
+            )
+        # The hold is inside the mover's sweep. Standing still cannot be made
+        # safe, so leave along the best admissible path; if none exists, take
+        # the least-bad one rather than the stop that will be pushed.
+        escape = moving_admissible()
+        if escape is None:
+            escape = least_harmful()
+        if escape.plan.kind == 'stop':
+            return YieldDecision(
+                ACTION_STOP, REASON_PREDICT_SWEPT,
+                wait_elapsed_sec=wait_elapsed_sec,
+                detail='hold swept and no escape admissible: ' +
+                       _clearance_detail(escape),
+            )
+        if escape.plan.kind == 'arc':
+            return YieldDecision(
+                ACTION_ARC, REASON_PREDICT_SWEPT,
+                arc_side=1 if escape.plan.arc_y >= 0 else -1,
+                arc_x=escape.plan.arc_x, arc_y=escape.plan.arc_y,
+                wait_elapsed_sec=wait_elapsed_sec,
+                detail='hold swept; escaping laterally. ' +
+                       _clearance_detail(escape),
+            )
+        return _moving_decision(escape, wait_elapsed_sec)
+
+    best = max((o for o in occs if o.clear_of(cfg)),
+               key=lambda o: (score(o), o.min_clear), default=None)
+    if best is None:
+        # Nothing is admissible. A moving plan with a sub-margin clearance is
+        # the coin flip this planner exists to refuse (2026-11-21: an arc with
+        # +0.14 m was issued as "least harmful" and had to be aborted by the
+        # arc watch one tick later). Braking is safe whenever the hold itself
+        # is not predicted to make contact, so only move when standing still
+        # is the worse option and the candidate measurably improves on it.
+        worst = least_harmful()
+        if hold.min_clear >= 0.0 or worst.min_clear <= hold.min_clear:
+            return YieldDecision(
+                ACTION_STOP, REASON_PREDICT_STOP,
+                wait_elapsed_sec=wait_elapsed_sec,
+                detail='no admissible candidate; braking. ' +
+                       _clearance_detail(worst),
+            )
+        return _moving_decision(worst, wait_elapsed_sec)
+    return _moving_decision(best, wait_elapsed_sec)
+
+
+def _moving_decision(occ: _Occupancy, wait_elapsed_sec: float) -> YieldDecision:
+    plan = occ.plan
+    detail = _clearance_detail(occ)
+    if plan.kind == 'cruise':
+        return YieldDecision(ACTION_GO, REASON_PREDICT_PASS,
+                             wait_elapsed_sec=wait_elapsed_sec, detail=detail)
+    if plan.kind == 'stop':
+        return YieldDecision(ACTION_STOP, REASON_PREDICT_STOP,
+                             wait_elapsed_sec=wait_elapsed_sec, detail=detail)
+    if plan.kind == 'arc':
+        return YieldDecision(
+            ACTION_ARC, REASON_PREDICT_ARC,
+            arc_side=1 if plan.arc_y >= 0 else -1,
+            arc_x=plan.arc_x, arc_y=plan.arc_y,
+            wait_elapsed_sec=wait_elapsed_sec, detail=detail)
+    return YieldDecision(ACTION_CAP, REASON_PREDICT_SLOW,
+                         speed_mps=plan.speed,
+                         wait_elapsed_sec=wait_elapsed_sec, detail=detail)
+
+
+def cloud_box_ahead(points, band_m: float = 0.47,
+                    max_range_m: float = 6.0,
+                    min_range_m: float = 0.25,
+                    min_points: int = 3):
+    """Nearest patrol box the base's own cloud sees inside its swept band.
+
+    The mover footprints are published in base_link as a PointCloud2, so they
+    are visible past the lidar's occlusion (measured detour1/detour2: the yield
+    layer first saw the box that cost an 11.3 s standstill at 1.7 m). Points
+    are (x, y) in the base frame. Returns ``(x, y)`` of the nearest face and the
+    mean lateral offset of its cluster, or ``None`` when nothing is inside the
+    band. Deliberately conservative: the nearest *face* is used, not a centre.
+    """
+    inside = [(x, y) for x, y in points
+              if min_range_m < x <= max_range_m and abs(y) <= band_m]
+    if len(inside) < min_points:
+        return None
+    inside.sort()
+    near_x, near_y = inside[0]
+    cluster = [y for x, y in inside if x <= near_x + 0.30]
+    if len(cluster) < min_points:
+        return None
+    return near_x, sum(cluster) / len(cluster)
 
 
 def arc_scan_clear(points, arc_x: float, arc_y: float,

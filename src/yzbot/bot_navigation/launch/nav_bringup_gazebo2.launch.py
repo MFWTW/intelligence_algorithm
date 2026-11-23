@@ -1,13 +1,16 @@
 #!/usr/bin/python3
+"""Standalone Nav2 bringup and compatibility entry point for experiment flags."""
 
 import os
 
 from ament_index_python.packages import PackageNotFoundError, get_package_share_directory
 from launch import LaunchDescription
-from launch.actions import DeclareLaunchArgument, IncludeLaunchDescription, OpaqueFunction
-from launch.conditions import IfCondition, UnlessCondition
+from launch.actions import (
+    DeclareLaunchArgument, IncludeLaunchDescription, OpaqueFunction, SetLaunchConfiguration,
+)
+from launch.conditions import IfCondition, LaunchConfigurationEquals, LaunchConfigurationNotEquals
 from launch.launch_description_sources import PythonLaunchDescriptionSource
-from launch.substitutions import LaunchConfiguration, OrSubstitution
+from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
 from nav2_common.launch import RewrittenYaml
 
@@ -80,23 +83,19 @@ def generate_launch_description():
     use_rviz = LaunchConfiguration('use_rviz')
     map_yaml = LaunchConfiguration('map')
     params_file = LaunchConfiguration('params_file')
-    # Every Nav2 node below - stock navigation_launch.py, the experimental
-    # smoother variants and the localized bringup - must see the same rewritten
-    # file, otherwise bt_navigator alone would fall back to the stock recovery
-    # tree while the rest of the stack runs the tuned parameters.
+    # Stock and experimental bringup must use the same BT path rewrite.
     nav_params_file = nav_params_with_local_bt_xml(params_file)
     slam = LaunchConfiguration('slam')
     use_composition = LaunchConfiguration('use_composition')
     use_respawn = LaunchConfiguration('use_respawn')
-    smoother_udp = LaunchConfiguration('smoother_udp_experiment')
-    smoother_trace = LaunchConfiguration('smoother_trace_experiment')
-    smoother_trace_udp = LaunchConfiguration('smoother_trace_udp_experiment')
+    experiment_mode = '_nav_experiment_mode'
+    experiment_flags = {
+        'udp': LaunchConfiguration('smoother_udp_experiment'),
+        'trace': LaunchConfiguration('smoother_trace_experiment'),
+        'trace_udp': LaunchConfiguration('smoother_trace_udp_experiment'),
+        'yield_pause': LaunchConfiguration('yield_pause_mode'),
+    }
     smoother_trace_file = LaunchConfiguration('smoother_trace_file')
-    smoother_poll_fallback_sec = LaunchConfiguration('smoother_poll_fallback_sec')
-    yield_pause_mode = LaunchConfiguration('yield_pause_mode')
-    experimental = OrSubstitution(
-        smoother_udp, OrSubstitution(smoother_trace,
-            OrSubstitution(smoother_trace_udp, yield_pause_mode)))
 
     nav2 = IncludeLaunchDescription(
         PythonLaunchDescriptionSource(
@@ -110,15 +109,12 @@ def generate_launch_description():
             'use_composition': use_composition,
             'use_respawn': use_respawn,
         }.items(),
-        condition=UnlessCondition(experimental),
+        condition=LaunchConfigurationEquals(experiment_mode, ''),
     )
 
-    def guard_experiment(context):
-        # `IfCondition`/`OrSubstitution` accept '1' (and coerce other strings),
-        # so a literal `== 'true'` test would treat `:=1` as "no experiment",
-        # skip every check below, and still let two experiment includes fire.
-        # Accept exactly the two true/false vocabularies and fail closed on
-        # anything else.
+    def select_experiment(context):
+        # Resolve the old public flags once, before starting any nodes. Both
+        # 'true' and '1' must go through the same validation.
         def enabled(cfg):
             value = cfg.perform(context).strip().lower()
             if value in ('false', '0', ''):
@@ -127,82 +123,26 @@ def generate_launch_description():
                 return True
             raise RuntimeError(f'Unrecognized smoother experiment value: {value!r}')
 
-        modes = [name for name, cfg in (
-            ('udp', smoother_udp), ('trace', smoother_trace),
-            ('trace_udp', smoother_trace_udp),
-            ('yield_pause', yield_pause_mode)) if enabled(cfg)]
-        if not modes:
-            return []
+        modes = [name for name, cfg in experiment_flags.items() if enabled(cfg)]
         if len(modes) > 1:
             raise RuntimeError(
                 f'Smoother experiments are mutually exclusive; got {modes}')
-        if use_composition.perform(context).strip().lower() not in ('false', '0', '') \
-                or slam.perform(context).strip().lower() not in ('false', '0', ''):
-            raise RuntimeError('Smoother experiment requires non-composed, map-based Nav2')
-        if 'trace' in modes[0] and not smoother_trace_file.perform(context).strip():
-            raise RuntimeError('Trace experiments require a non-empty smoother_trace_file')
-        return []
+        mode = modes[0] if modes else ''
+        if mode:
+            off_values = ('false', '0', '')
+            if any(cfg.perform(context).strip().lower() not in off_values
+                   for cfg in (use_composition, slam)):
+                raise RuntimeError('Smoother experiment requires non-composed, map-based Nav2')
+            if mode in ('trace', 'trace_udp') and not smoother_trace_file.perform(context).strip():
+                raise RuntimeError('Trace experiments require a non-empty smoother_trace_file')
+        return [SetLaunchConfiguration(experiment_mode, mode)]
 
-    # Stock bringup includes these two launches. Duplicate only their includes,
-    # not the Nav2 node definitions; the pinned stock navigation script itself
-    # supplies every node. Exactly one smoother is chosen by the mode guard.
-    nav2_experimental_localization = IncludeLaunchDescription(
+    experiments = IncludeLaunchDescription(
         PythonLaunchDescriptionSource(
-            os.path.join(nav2_bringup_share, 'launch', 'localization_launch.py')
+            os.path.join(navigation_share, 'launch', 'navigation_experiments.launch.py')
         ),
-        launch_arguments={
-            'map': map_yaml, 'use_sim_time': use_sim_time,
-            'params_file': nav_params_file, 'use_composition': use_composition,
-            'use_respawn': use_respawn,
-        }.items(),
-        condition=IfCondition(experimental),
-    )
-    nav2_udp_navigation = IncludeLaunchDescription(
-        PythonLaunchDescriptionSource(
-            os.path.join(navigation_share, 'launch', 'navigation_udp_experiment.launch.py')
-        ),
-        launch_arguments={
-            'use_sim_time': use_sim_time, 'params_file': nav_params_file,
-            'use_composition': use_composition, 'use_respawn': use_respawn,
-        }.items(),
-        condition=IfCondition(smoother_udp),
-    )
-    nav2_trace_navigation = IncludeLaunchDescription(
-        PythonLaunchDescriptionSource(
-            os.path.join(navigation_share, 'launch', 'navigation_trace_experiment.launch.py')
-        ),
-        launch_arguments={
-            'use_sim_time': use_sim_time, 'params_file': nav_params_file,
-            'use_composition': use_composition, 'use_respawn': use_respawn,
-            'smoother_trace_file': smoother_trace_file,
-            'smoother_poll_fallback_sec': smoother_poll_fallback_sec,
-        }.items(),
-        condition=IfCondition(smoother_trace),
-    )
-    nav2_trace_udp_navigation = IncludeLaunchDescription(
-        PythonLaunchDescriptionSource(
-            os.path.join(navigation_share, 'launch',
-                         'navigation_trace_udp_experiment.launch.py')
-        ),
-        launch_arguments={
-            'use_sim_time': use_sim_time, 'params_file': nav_params_file,
-            'use_composition': use_composition, 'use_respawn': use_respawn,
-            'smoother_trace_file': smoother_trace_file,
-            'smoother_poll_fallback_sec': smoother_poll_fallback_sec,
-        }.items(),
-        condition=IfCondition(smoother_trace_udp),
-    )
-
-    nav2_yield_pause_navigation = IncludeLaunchDescription(
-        PythonLaunchDescriptionSource(
-            os.path.join(navigation_share, 'launch',
-                         'navigation_yield_pause.launch.py')
-        ),
-        launch_arguments={
-            'use_sim_time': use_sim_time, 'params_file': nav_params_file,
-            'use_composition': use_composition, 'use_respawn': use_respawn,
-        }.items(),
-        condition=IfCondition(yield_pause_mode),
+        launch_arguments={'_nav_experiment_params_file': nav_params_file}.items(),
+        condition=LaunchConfigurationNotEquals(experiment_mode, ''),
     )
 
     map_to_odom = Node(
@@ -278,13 +218,9 @@ def generate_launch_description():
                         'smoother timer polls its own subscription directly. '
                         'Empty disables it and leaves the control path untouched.',
         ),
-        OpaqueFunction(function=guard_experiment),
+        OpaqueFunction(function=select_experiment),
         map_to_odom,
         nav2,
-        nav2_experimental_localization,
-        nav2_udp_navigation,
-        nav2_trace_navigation,
-        nav2_trace_udp_navigation,
-        nav2_yield_pause_navigation,
+        experiments,
         rviz,
     ])

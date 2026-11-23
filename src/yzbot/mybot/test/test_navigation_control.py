@@ -6,6 +6,7 @@ python3 -m unittest discover -s src/yzbot/mybot/test -p 'test_navigation_control
 import ast
 from collections import deque
 from concurrent.futures import Future
+from contextlib import nullcontext
 import importlib.util
 import math
 import subprocess
@@ -587,41 +588,62 @@ class MovingObstacleTests(unittest.TestCase):
         self.assertEqual(ceiling, YieldConfig().max_mover_speed_mps)
         self.assertTrue(all(speed < ceiling for *_, speed, _kin in patrols))
 
-    def test_a_box_never_yields_and_never_moves_off_its_line(self):
-        """The obstacle has the highest priority; the base has no influence.
+    def test_a_box_only_holds_at_the_contact_guard(self):
+        """No clearance bubble, but no contact either.
 
-        Requested 2026-10-13. The old behaviour - hold the box while the base was
-        inside a 0.75 m bubble - was measured on run_logs/yield3_131041: mover_2
+        Requested 2026-10-13: the old behaviour held the box while the base was
+        inside a 0.75 m bubble, and run_logs/yield3_131041 measured mover_2
         frozen for 110 s of a 130 s trace with the base parked 0.38 m away, so
-        neither could get through. A box's progress must be a pure function of
-        time, even with the base sitting on its next position.
+        neither could get through. The box's progress must therefore stay a
+        pure function of time everywhere except the last contact_guard_m
+        before the surfaces touch: measured 2026-11-23 on ..._holdfix1, a box
+        was served 0.17 m into the base, Gazebo resolved the deep penetration
+        by throwing the base to 3.4 m/s and the round was lost. Contact is the
+        only thing that may stop a box.
         """
         movers = self.module()
-        clock = {'t': 0.0}
-        node = SimpleNamespace(
-            patrols=[], _robot_xy=(1.0, 0.0), _spawned=True, _last_tick=None,
-            _reset_client=SimpleNamespace(service_is_ready=lambda: False),
-            get_clock=lambda: SimpleNamespace(
-                now=lambda: SimpleNamespace(nanoseconds=clock['t'] * 1e9)),
-            get_logger=lambda: SimpleNamespace(warning=lambda *a, **k: None),
-            get_parameter=lambda name: SimpleNamespace(
-                value={'robot_clearance_m': 0.75,
-                       'publish_obstacle_cloud': False}[name]))
-        for name in ('_tick', '_warn_if_base_inside_box'):
-            setattr(node, name, getattr(movers.MovingObstacles, name).__get__(node))
-        patrol = movers._Patrol('m', 0.0, 0.0, 2.0, 0.0, 0.2)
-        patrol.s = 1.0
-        node.patrols = [patrol]
-        node._tick()                      # first tick only seeds sim time
-        # Base parked on the box's next position, inside every clearance bubble
-        # this node ever had.
-        node._robot_xy = (1.05, 0.0)
+
+        def make_node():
+            clock = {'t': 0.0}
+            node = SimpleNamespace(
+                patrols=[], _robot_xy=(1.0, 0.0), _spawned=True,
+                _last_tick=None, _guard_warn_at={},
+                _reset_client=SimpleNamespace(service_is_ready=lambda: False),
+                get_clock=lambda: SimpleNamespace(
+                    now=lambda: SimpleNamespace(nanoseconds=clock['t'] * 1e9)),
+                get_logger=lambda: SimpleNamespace(warning=lambda *a, **k: None),
+                get_parameter=lambda name: SimpleNamespace(
+                    value={'robot_clearance_m': 0.75,
+                           'contact_guard_m': 0.42,
+                           'publish_obstacle_cloud': False}[name]))
+            for name in ('_tick', '_warn_if_base_inside_box',
+                         '_contact_guard_holds'):
+                setattr(node, name,
+                        getattr(movers.MovingObstacles, name).__get__(node))
+            patrol = movers._Patrol('m', 0.0, 0.0, 2.0, 0.0, 0.2)
+            patrol.s = 1.0
+            node.patrols = [patrol]
+            node._tick()                  # first tick only seeds sim time
+            return node, patrol, clock
+
+        # 0.75 m away: inside the retired bubble, far outside the contact guard.
+        node, patrol, clock = make_node()
+        node._robot_xy = (1.75, 0.0)
         before = patrol.s
         clock['t'] += 0.1
         node._tick()
         self.assertGreater(patrol.s, before, 'the box must keep moving')
         self.assertAlmostEqual(patrol.y, 0.0, places=6)
         self.assertAlmostEqual(patrol.s, before + 0.2 * 0.1, places=9)
+
+        # Parked on the box's next position: holding is safer than overlapping.
+        node, patrol, clock = make_node()
+        node._robot_xy = (1.05, 0.0)
+        before = patrol.s
+        clock['t'] += 0.1
+        node._tick()
+        self.assertAlmostEqual(patrol.s, before, places=9,
+                               msg='the box must not be served into the base')
 
     def test_every_box_is_spawned_kinematic(self):
         """A kinematic body ignores contact forces, so the base cannot move it."""
@@ -1970,7 +1992,44 @@ class ObstacleYieldTests(unittest.TestCase):
             self.movers.YieldObservation(**kwargs), self.cfg
         )
 
+    def sidestep_obs(self, *, arc_target_x=0.8, arc_target_y=-0.55, **kwargs):
+        """An observation taken while the base drives a lateral exit.
+
+        The box sits where the arc curves away to the right; the arc watch is
+        asked whether that remaining 0.8 m still passes it.
+        """
+        kwargs.setdefault('vx', 0.6)
+        kwargs.setdefault('box_world_speed_mps', 0.30)
+        kwargs.setdefault('distance_to_goal_m', 6.0)
+        return self.movers.YieldObservation(
+            arc_active=True, arc_target_x=arc_target_x,
+            arc_target_y=arc_target_y, **kwargs,
+        )
+
     # ---- the plain cases the user asked for ------------------------------
+
+    def test_inside_corridor_clear_time_uses_velocity_exit_edge(self):
+        # Base clears at 1 s; corridor edges are +/-0.35 m. Exercise both
+        # velocities with projected positions on each side of the centre.
+        for projected_y, box_vy, expected in (
+            (0.10, 0.10, '3.50'), (-0.10, 0.10, '5.50'),
+            (0.10, -0.10, '5.50'), (-0.10, -0.10, '3.50'),
+            (0.0, 0.0, 'never'),
+        ):
+            with self.subTest(projected_y=projected_y, box_vy=box_vy):
+                obs = self.movers.YieldObservation(
+                    box_x=0.64, box_y=projected_y - box_vy,
+                    box_vx=0.0, box_vy=box_vy, vx=1.0,
+                    box_world_speed_mps=0.30,
+                )
+                conflict = self.movers.detect_conflict(obs, self.cfg)
+                self.assertTrue(conflict.conflict)
+                self.assertAlmostEqual(conflict.clears_at, 1.0)
+                self.assertTrue(conflict.why.endswith(f'clear in {expected}' +
+                                                    ('' if expected == 'never' else ' s')))
+                decision = self.movers.decide(obs, self.cfg)
+                self.assertEqual(decision.action, self.movers.ACTION_STOP)
+                self.assertIn(conflict.why, decision.detail)
 
     def test_a_box_on_the_left_that_will_not_arrive_in_time_is_driven_past(self):
         """障碍物在左边、朝我们来，但在我们到达之前还进不了车道 -> 直行。
@@ -1981,11 +2040,20 @@ class ObstacleYieldTests(unittest.TestCase):
         of daylight - more than the 0.3 s the sensing/control chain eats.
         """
         decision = self.decision(
-            box_x=1.5, box_y=1.0, box_vx=-1.3, box_vy=-0.30, vx=1.3,
+            box_x=1.5, box_y=1.25, box_vx=-1.3, box_vy=-0.30, vx=1.3,
             left_room_m=1.0,
         )
         self.assertEqual(decision.action, self.movers.ACTION_GO)
-        self.assertEqual(decision.reason, self.movers.REASON_PASSING)
+        self.assertIn(decision.reason,
+                      (self.movers.REASON_PASSING,
+                       self.movers.REASON_PREDICT_PASS))
+        tight = self.decision(
+            box_x=1.5, box_y=1.0, box_vx=-1.3, box_vy=-0.30, vx=1.3,
+            left_room_m=1.0,
+        )
+        self.assertNotEqual(
+            tight.action, self.movers.ACTION_GO,
+            '0.14 m between the rear corner and the box is not daylight')
 
     def test_a_coin_flip_pass_is_refused_and_the_old_rule_is_reproducible(self):
         """This exact geometry used to be the "直行" test, and it was luck.
@@ -2004,9 +2072,14 @@ class ObstacleYieldTests(unittest.TestCase):
         )
         decision = self.movers.decide(obs, self.cfg)
         self.assertEqual(decision.action, self.movers.ACTION_STOP)
-        self.assertEqual(decision.reason, self.movers.REASON_WAIT)
+        self.assertIn(decision.reason,
+                      (self.movers.REASON_WAIT,
+                       self.movers.REASON_PREDICT_STOP))
+        # The equivalence check is about the formula, not this layer, so the
+        # occupancy planner has to be off for it to be visible at all.
         old = self.movers.decide(
-            obs, self.cfg.with_overrides(clear_margin_sec=0.0))
+            obs, self.cfg.with_overrides(clear_margin_sec=0.0,
+                                         predict_enabled=False))
         self.assertEqual(old.action, self.movers.ACTION_GO)
 
     def test_a_far_but_losing_conflict_is_capped_before_it_is_close(self):
@@ -2022,8 +2095,138 @@ class ObstacleYieldTests(unittest.TestCase):
             left_room_m=1.0,
         )
         self.assertEqual(decision.action, self.movers.ACTION_CAP)
-        self.assertEqual(decision.reason, self.movers.REASON_CAPPED)
-        self.assertLess(decision.speed_mps, 1.3)
+        self.assertEqual(decision.reason, self.movers.REASON_PREDICT_SLOW)
+        # 1.3 m/s reaches the corridor too early; 0.6 still does; only the
+        # crawl lets the box finish crossing before the nose arrives.
+        self.assertAlmostEqual(decision.speed_mps, self.cfg.predict_crawl_mps)
+
+    # ---- predictive occupancy --------------------------------------------
+
+    def test_the_crawl_is_chosen_when_only_the_crawl_clears(self):
+        """先排除会撞的，再选最快的: 1.3 and 0.6 m/s reach the crossing too
+        early, 0.3 m/s clears it, so 0.3 is what the base gets - not a stop."""
+        decision = self.decision(
+            box_x=2.0, box_y=0.8, box_vx=-1.3, box_vy=-0.5, vx=1.3,
+            left_room_m=1.4, right_room_m=1.4,
+        )
+        self.assertEqual(decision.action, self.movers.ACTION_CAP)
+        self.assertEqual(decision.reason, self.movers.REASON_PREDICT_SLOW)
+        self.assertAlmostEqual(decision.speed_mps, self.cfg.predict_crawl_mps)
+        self.assertIn('predicted clearance', decision.detail)
+
+    def test_a_hold_inside_the_crossing_sweep_is_left_sideways(self):
+        """A stop order cannot stop a box that sweeps the stop point.
+
+        Measured on 2026-11-21 (r53 rule 2, t=28.6 s): the base was stopped at
+        0.24 m centre distance while the box came through the hold point. The
+        planner must not return STOP when the hold itself is inside the sweep.
+        """
+        decision = self.movers.decide(
+            self.movers.YieldObservation(
+                box_x=0.35, box_y=1.1, box_vx=-0.001, box_vy=-0.5, vx=0.001,
+                left_room_m=1.4, right_room_m=1.4, box_world_speed_mps=0.5,
+                distance_to_goal_m=6.0, latched=True,
+            ),
+            self.cfg,
+        )
+        self.assertEqual(decision.action, self.movers.ACTION_ARC)
+        self.assertEqual(decision.reason, self.movers.REASON_PREDICT_SWEPT)
+        self.assertLess(decision.arc_y, 0.0, 'escape away from the box at +y')
+
+    def test_a_mover_that_turns_at_the_lane_end_comes_back(self):
+        """The patrol boxes reverse at the segment ends; a box moving away is
+        not gone if it turns inside the horizon."""
+        obs = self.movers.YieldObservation(
+            box_x=1.0, box_y=0.0, box_vx=0.55, box_vy=0.0, vx=0.0,
+            box_world_speed_mps=0.55, distance_to_goal_m=6.0, latched=True,
+        )
+        coming_back = self.movers.decide(
+            self.movers.replace(obs, lane_end_distance_m=0.3,
+                                lane_end_closing=True),
+            self.cfg,
+        )
+        self.assertEqual(coming_back.action, self.movers.ACTION_STOP)
+        self.assertEqual(coming_back.reason, self.movers.REASON_PREDICT_SWEPT)
+        self.assertIn('contact at', coming_back.detail)
+        # Same geometry with the turn beyond the horizon: the box really is
+        # leaving, so the hold is released.
+        turning_later = self.movers.decide(
+            self.movers.replace(obs, lane_end_distance_m=2.0,
+                                lane_end_closing=True),
+            self.cfg,
+        )
+        self.assertNotEqual(turning_later.action, self.movers.ACTION_STOP)
+
+    def test_a_mover_faster_than_the_tracker_can_plan_is_left_to_nav2(self):
+        """The kinematic world speed decides, not the reported window average."""
+        obs = self.movers.YieldObservation(
+            box_x=1.5, box_y=0.0, box_vx=0.0, box_vy=0.0, vx=0.7,
+            box_world_speed_mps=0.2, left_room_m=1.0, right_room_m=1.0,
+            distance_to_goal_m=6.0,
+        )
+        self.assertIsNone(self.movers.plan_yield(obs, self.cfg))
+        still = self.movers.replace(obs, vx=0.0)
+        self.assertIsNone(self.movers.plan_yield(still, self.cfg),
+                          'a stationary box is not a mover')
+
+    def test_a_sidestep_that_still_clears_keeps_being_driven(self):
+        """While the arc is driven the policy is suppressed, so the arc watch is
+        the only thing still looking at the mover. A box that is not closing on
+        the remaining arc must not abort it."""
+        obs = self.sidestep_obs(box_x=3.0, box_y=0.0, box_vx=-0.05, box_vy=0.0)
+        watch = self.movers.watch_arc(obs, self.cfg)
+        self.assertTrue(watch.ok)
+        self.assertIsNone(watch.speed_mps, '0.6 m/s needs no extra cap')
+        self.assertIn('predicted clearance', watch.detail)
+
+    def test_a_sidestep_into_the_movers_new_sweep_is_called_off(self):
+        """Measured 2026-11-21: the base drove a sidestep blind for 20.10 s
+        because the yield policy was suspended with the danger check. A mover
+        that cuts the arc must abort it, not be discovered at the costmap."""
+        obs = self.sidestep_obs(box_x=0.5, box_y=-0.8, box_vx=0.1, box_vy=0.25,
+                                vx=0.0)
+        watch = self.movers.watch_arc(obs, self.cfg)
+        self.assertFalse(watch.ok)
+        self.assertEqual(watch.speed_mps, 0.0)
+        self.assertIn('clears only from a stop', watch.detail)
+        # A box already alongside the flank does not even clear from a stop.
+        alongside = self.sidestep_obs(box_x=0.3, box_y=-0.50, box_vx=0.0,
+                                      box_vy=0.0, vx=0.0)
+        watch = self.movers.watch_arc(alongside, self.cfg)
+        self.assertFalse(watch.ok)
+        self.assertIn('no longer clears', watch.detail)
+
+    def test_the_arc_watch_slows_down_when_only_the_crawl_clears(self):
+        obs = self.sidestep_obs(box_x=0.6, box_y=-0.9, box_vx=0.0, box_vy=0.25)
+        watch = self.movers.watch_arc(obs, self.cfg)
+        self.assertTrue(watch.ok)
+        self.assertAlmostEqual(watch.speed_mps, self.cfg.predict_crawl_mps)
+
+    def test_an_arc_that_is_already_reached_is_not_judged(self):
+        obs = self.sidestep_obs(box_x=0.5, box_y=-0.8, box_vx=0.1, box_vy=0.25,
+                                vx=0.0, arc_target_x=0.05, arc_target_y=0.0)
+        self.assertTrue(self.movers.watch_arc(obs, self.cfg).ok)
+
+    def test_a_position_only_mover_does_not_crash_the_arc_watch(self):
+        """Regression for 2026-11-21, blue_cube_4 attempt 1.
+
+        A patrol box seen only on /movers/obstacles carries no velocity, so
+        the observation has box_vx = box_vy = None. The watch predicted from
+        it without decide()'s numeric fallback, `None + float` escaped 4 ms
+        into the sidestep, and the whole pickup leg was lost. An unseen
+        velocity is treated as zero here exactly as decide() does.
+        """
+        obs = self.sidestep_obs(box_x=3.0, box_y=0.0, box_vx=None, box_vy=None)
+        watch = self.movers.watch_arc(obs, self.cfg)
+        self.assertTrue(watch.ok, 'a box 3 m ahead does not cut this arc')
+        self.assertIn('predicted clearance', watch.detail)
+        # No velocity must not mean "no evidence": a box already beside the
+        # arc still aborts it when held still.
+        close = self.sidestep_obs(box_x=0.3, box_y=-0.50, box_vx=None,
+                                  box_vy=None, vx=0.0)
+        watch = self.movers.watch_arc(close, self.cfg)
+        self.assertFalse(watch.ok)
+        self.assertEqual(watch.speed_mps, 0.0)
 
     def test_crossing_time_uses_the_near_edge_the_box_reaches_first(self):
         """The formula used to return the *far* edge (3.83 s at y=0.80 m).
@@ -2073,10 +2276,16 @@ class ObstacleYieldTests(unittest.TestCase):
         """The mirror regression: a box on its way out is still *inside* the
         corridor, so an entry-time rule stops for something that is leaving."""
         decision = self.decision(
-            box_x=0.8, box_y=0.30, box_vx=-1.4, box_vy=0.30, vx=1.5,
+            box_x=0.8, box_y=0.55, box_vx=-1.4, box_vy=0.30, vx=1.5,
             left_room_m=1.0,
         )
         self.assertEqual(decision.action, self.movers.ACTION_GO)
+        # 0.30 m is *inside* the 0.46 m swept band: driving on would clip it.
+        inside = self.decision(
+            box_x=0.8, box_y=0.30, box_vx=-1.4, box_vy=0.30, vx=1.5,
+            left_room_m=1.0,
+        )
+        self.assertNotEqual(inside.action, self.movers.ACTION_GO)
 
     # ---- the arc / lateral exit ------------------------------------------
 
@@ -2115,6 +2324,71 @@ class ObstacleYieldTests(unittest.TestCase):
         self.assertNotEqual(exiting.arc_x, None)
         self.assertNotEqual(exiting.arc_y, 0.0)
 
+    # ---- early detour: go round it instead of standing still for it ------
+
+    def _detour_obs(self, **overrides):
+        values = dict(
+            box_x=1.3, box_y=0.05, box_vx=-0.2, box_vy=0.0, vx=1.2,
+            left_room_m=1.5, right_room_m=1.5, box_world_speed_mps=0.20,
+            distance_to_goal_m=6.0,
+        )
+        values.update(overrides)
+        return self.movers.YieldObservation(**values)
+
+    def test_a_crossing_box_is_driven_round_before_the_budget_is_spent(self):
+        """The detour is the same escape, taken while there is still room.
+
+        Movers patrol at 0.20 m/s, so waiting for one to clear the corridor
+        costs 10-40 s of round wall clock with the base parked. Nothing about
+        the lateral geometry depends on having waited: the offset is measured
+        from the box's current *and* projected position either way. With the
+        switch off the same geometry still stops, which is what makes the
+        switch - not the geometry - the thing under test.
+        """
+        decision = self.movers.decide(self._detour_obs(), self.cfg)
+        self.assertEqual(decision.action, self.movers.ACTION_ARC)
+        self.assertEqual(decision.reason, self.movers.REASON_DETOUR)
+        self.assertAlmostEqual(decision.arc_x, self.cfg.arc_apex_m)
+        self.assertGreater(abs(decision.arc_y), 0.0)
+        off = self.movers.decide(
+            self._detour_obs(),
+            self.cfg.with_overrides(early_detour_enabled=False),
+        )
+        self.assertEqual(off.action, self.movers.ACTION_STOP)
+        self.assertEqual(off.reason, self.movers.REASON_WAIT)
+
+    def test_a_head_on_box_is_never_detoured(self):
+        """Steering round a box that is closing on the base is the 2026-10-13
+        fling (mover_2 0.69 -> 0.24 m, base thrown at 5.7 m/s): it stops."""
+        decision = self.movers.decide(
+            self._detour_obs(box_vx=0.30), self.cfg)
+        self.assertEqual(decision.action, self.movers.ACTION_STOP)
+        self.assertEqual(decision.reason, self.movers.REASON_WAIT)
+
+    def test_keepout_still_stops_before_any_detour(self):
+        decision = self.movers.decide(
+            self._detour_obs(box_x=0.60), self.cfg)
+        self.assertEqual(decision.action, self.movers.ACTION_STOP)
+        self.assertEqual(decision.reason, self.movers.REASON_KEEPOUT)
+
+    def test_a_held_episode_is_left_to_its_own_budget(self):
+        """A latch means the base already stood still for this box; re-opening
+        a detour from that state is what lets a "waiting" base drive off."""
+        decision = self.movers.decide(
+            self._detour_obs(latched=True), self.cfg)
+        self.assertEqual(decision.action, self.movers.ACTION_STOP)
+
+    def test_early_detour_respects_the_per_leg_arc_ceiling(self):
+        decision = self.movers.decide(
+            self._detour_obs(), self.cfg,
+            arc_attempts=self.cfg.max_arc_attempts)
+        self.assertNotEqual(decision.action, self.movers.ACTION_ARC)
+
+    def test_early_detour_needs_floor_on_one_side(self):
+        decision = self.movers.decide(
+            self._detour_obs(left_room_m=0.05, right_room_m=0.05), self.cfg)
+        self.assertNotEqual(decision.action, self.movers.ACTION_ARC)
+
     def test_exit_chooses_free_side_not_obstacle_side(self):
         """At (-4.767,-1.526), left room is 0.008 m, right is 2.522 m.
         Choosing a direction from the box's side alone would hit that wall.
@@ -2130,6 +2404,100 @@ class ObstacleYieldTests(unittest.TestCase):
         self.assertEqual(exiting.action, self.movers.ACTION_ARC)
         self.assertEqual(exiting.arc_side, -1)
         self.assertLess(exiting.arc_y, 0.0)
+
+    def test_cloud_box_ahead_finds_the_nearest_cluster_in_the_band(self):
+        """The mover footprints are visible past lidar occlusion.
+
+        Measured detour1/detour2: the box that cost an 11.3 s standstill was
+        first seen by the laser at 1.7 m, already inside the choke; the
+        published footprints put it in view from 6 m.
+        """
+        points = [(5.0, 0.10), (5.02, 0.12), (5.01, 0.08),
+                  (3.0, 0.30), (3.01, 0.32), (3.02, 0.28), (3.0, 1.20)]
+        box = self.movers.cloud_box_ahead(points, band_m=0.47, max_range_m=6.0)
+        self.assertIsNotNone(box)
+        near_x, near_y = box
+        self.assertAlmostEqual(near_x, 3.0, places=2)
+        self.assertAlmostEqual(near_y, 0.30, places=2)
+
+    def test_cloud_box_ahead_ignores_points_outside_the_swept_band(self):
+        points = [(1.0, 1.10), (1.01, 1.12), (1.02, 1.08), (1.03, 1.15)]
+        self.assertIsNone(
+            self.movers.cloud_box_ahead(points, band_m=0.47, max_range_m=6.0))
+
+    def test_cloud_box_ahead_needs_a_cluster_and_respects_range(self):
+        # Two lone points are not a box: the lidar-side code learned this the
+        # hard way (17-41 spurious clusters per sweep on 2026-10-13).
+        self.assertIsNone(
+            self.movers.cloud_box_ahead([(2.0, 0.0), (2.01, 0.01)],
+                                        band_m=0.47, max_range_m=6.0))
+        far = [(7.0, 0.0), (7.01, 0.01), (7.02, -0.01)]
+        self.assertIsNone(
+            self.movers.cloud_box_ahead(far, band_m=0.47, max_range_m=6.0))
+
+    def test_unknown_box_velocity_is_a_number_before_any_arithmetic(self):
+        """A footprint-only observation must not crash the task.
+
+        Round band047r1: the patrol footprints carry position but no velocity,
+        so `box_vx = box_vy = None`; `box_y + box_vy * clears_at` raised
+        `TypeError: unsupported operand type(s) for *: 'NoneType' and 'float'`,
+        which escaped the navigation call and aborted the round with a cube in
+        the gripper (`UNSAFE_OBJECT_STATE:NAV_TO_ZONE:...:CUBE_ATTACHED`).
+        """
+        cfg = self.movers.YieldConfig()
+        unknown = self.movers.YieldObservation(
+            box_x=2.6, box_y=-0.2, box_vx=None, box_vy=None, vx=1.2, wz=0.0,
+            left_room_m=0.9, right_room_m=1.4, distance_to_goal_m=8.0,
+            scan_age_sec=0.1, box_world_speed_mps=0.20, latched=False)
+        stationary = self.movers.YieldObservation(
+            box_x=2.6, box_y=-0.2, box_vx=0.0, box_vy=0.0, vx=1.2, wz=0.0,
+            left_room_m=0.9, right_room_m=1.4, distance_to_goal_m=8.0,
+            scan_age_sec=0.1, box_world_speed_mps=0.20, latched=False)
+        for obs in (unknown, stationary):
+            decision = self.movers.decide(obs, cfg, wait_elapsed_sec=0.0,
+                                          arc_attempts=0)
+            self.assertTrue(decision.action)
+        normalised = self.movers.with_numeric_velocity(unknown)
+        self.assertEqual(normalised.box_vx, 0.0)
+        self.assertEqual(normalised.box_vy, 0.0)
+        self.assertEqual(self.movers.decide(
+            unknown, cfg, wait_elapsed_sec=0.0, arc_attempts=0),
+            self.movers.decide(stationary, cfg, wait_elapsed_sec=0.0,
+                               arc_attempts=0))
+
+    def test_trial_position_only_mover_caps_but_cannot_release_or_steer(self):
+        cfg = self.movers.YieldConfig(approach_trial_enabled=True)
+        for x, latched, action in ((3.8, False, 'cap'), (0.7, False, 'stop'),
+                                   (2.6, True, 'stop'), (4.1, False, 'go')):
+            with self.subTest(x=x, latched=latched):
+                obs = self.movers.YieldObservation(
+                    box_x=x, box_y=0.2, box_vx=None, box_vy=None, vx=1.2,
+                    box_world_speed_mps=0.2, latched=latched,
+                    left_room_m=1.4, right_room_m=1.4)
+                decision = self.movers.decide(obs, cfg)
+                self.assertEqual(decision.action, action)
+                if action == 'cap':
+                    self.assertEqual(decision.speed_mps, 0.8)
+
+    def test_trial_persistent_conflict_only_detours_with_room(self):
+        # The trial escape is what runs when the occupancy planner has nothing
+        # to extrapolate (position-only evidence), so test it with it off.
+        cfg = self.movers.YieldConfig(approach_trial_enabled=True,
+                                      predict_enabled=False)
+        for elapsed, room, vx, action in ((2.9, 1.2, 0.0, 'stop'),
+                                          (3.0, 1.2, 0.0, 'arc'),
+                                          (3.0, 0.48, 0.0, 'stop'),
+                                          (3.0, 1.2, -0.15, 'stop')):
+            with self.subTest(elapsed=elapsed, room=room, vx=vx):
+                obs = self.movers.YieldObservation(
+                    box_x=0.9, box_y=0.0, box_vx=vx, box_vy=-0.10, vx=0.0,
+                    left_room_m=room, right_room_m=room, box_world_speed_mps=0.14,
+                    distance_to_goal_m=6.0, latched=True)
+                decision = self.movers.decide(obs, cfg, wait_elapsed_sec=6.0,
+                                              continuous_hold_sec=elapsed)
+                self.assertEqual(decision.action, action)
+                if action == 'arc':
+                    self.assertEqual(decision.reason, self.movers.REASON_BLOCKED_DETOUR)
 
     def test_exit_rejected_when_box_envelope_cannot_be_cleared(self):
         crossing = self.movers.YieldObservation(
@@ -2205,13 +2573,13 @@ class ObstacleYieldTests(unittest.TestCase):
         infinitely far away and never let go - a permanent stop."""
         held = self.movers.decide(
             self.movers.YieldObservation(
-                box_x=0.4, box_y=0.40, box_vx=-0.2, box_vy=0.30, vx=0.001,
-                box_world_speed_mps=0.30, latched=True,
+                box_x=1.2, box_y=0.70, box_vx=-0.001, box_vy=0.30,
+                vx=0.001, box_world_speed_mps=0.30, latched=True,
             ),
             self.cfg,
         )
-        self.assertEqual(held.action, self.movers.ACTION_GO)
-        self.assertIn('hold released', held.detail)
+        self.assertNotEqual(held.action, self.movers.ACTION_STOP)
+        self.assertEqual(held.reason, self.movers.REASON_PREDICT_RELEASE)
 
     def test_a_latched_hold_is_released_when_the_corridor_clears(self):
         still_there = self.movers.decide(
@@ -2225,12 +2593,14 @@ class ObstacleYieldTests(unittest.TestCase):
         self.assertEqual(still_there.action, self.movers.ACTION_STOP)
         cleared = self.movers.decide(
             self.movers.YieldObservation(
-                box_x=0.4, box_y=0.40, box_vx=-0.2, box_vy=0.30, vx=0.001,
-                box_world_speed_mps=0.30, distance_to_goal_m=6.0, latched=True,
+                box_x=1.2, box_y=0.70, box_vx=-0.001, box_vy=0.30,
+                vx=0.001, box_world_speed_mps=0.30, distance_to_goal_m=6.0,
+                latched=True,
             ),
             self.cfg, wait_elapsed_sec=3.0,
         )
-        self.assertEqual(cleared.action, self.movers.ACTION_GO)
+        self.assertNotEqual(cleared.action, self.movers.ACTION_STOP)
+        self.assertEqual(cleared.reason, self.movers.REASON_PREDICT_RELEASE)
 
     def test_patience_expires_instead_of_waiting_forever(self):
         decision = self.movers.decide(
@@ -2389,21 +2759,27 @@ class ObstacleYieldTests(unittest.TestCase):
             ),
             self.cfg, wait_elapsed_sec=3.0,
         )
-        self.assertEqual(decision.action, self.movers.ACTION_STOP)
-        self.assertIn('holding', decision.detail)
+        # Either keep holding or leave along the measured room; what must not
+        # happen is the hold being released into the box's sweep.
+        self.assertNotEqual(decision.action, self.movers.ACTION_GO)
 
     def test_a_box_clear_of_the_band_that_is_leaving_still_releases_the_hold(self):
         """The hysteresis must not turn every hold into a 20 s wait: a box
         outside the base's width that is moving away is out of the way."""
         decision = self.movers.decide(
             self.movers.YieldObservation(
-                box_x=0.9, box_y=0.60, box_vx=-0.3, box_vy=0.02, vx=0.001,
-                right_room_m=1.2, box_world_speed_mps=0.10,
+                box_x=0.9, box_y=0.75, box_vx=-0.001, box_vy=0.02,
+                vx=0.001, right_room_m=1.2, box_world_speed_mps=0.02,
                 distance_to_goal_m=6.0, latched=True,
             ),
             self.cfg, wait_elapsed_sec=3.0,
         )
-        self.assertEqual(decision.action, self.movers.ACTION_GO)
+        self.assertNotEqual(decision.action, self.movers.ACTION_STOP)
+        # 0.02 m/s is below the mover floor, so the legacy hysteresis releases
+        # it; a moving box would release through the planner instead.
+        self.assertIn(decision.reason,
+                      (self.movers.REASON_PREDICT_RELEASE,
+                       self.movers.REASON_CLEAR))
 
     def test_a_lane_hold_with_no_room_still_hands_the_leg_back(self):
         """Waiting inside a lane is only safe if the wait can end.
@@ -2416,16 +2792,22 @@ class ObstacleYieldTests(unittest.TestCase):
         than the refusal loop, which at least lets the executor's dead-zone
         escape fire.
         """
-        decision = self.movers.decide(
-            self.movers.YieldObservation(
-                box_x=0.9, box_y=0.0, box_vx=-0.3, box_vy=-0.10, vx=0.001,
-                left_room_m=0.1, right_room_m=0.1, lane_distance_m=0.30,
-                box_world_speed_mps=0.10, distance_to_goal_m=6.0, latched=True,
-            ),
-            self.cfg, wait_elapsed_sec=self.cfg.lane_escape_delay_sec + 1.0,
+        obs = self.movers.YieldObservation(
+            box_x=0.9, box_y=0.0, box_vx=-0.3, box_vy=-0.10, vx=0.001,
+            left_room_m=0.1, right_room_m=0.1, lane_distance_m=0.30,
+            box_world_speed_mps=0.10, distance_to_goal_m=6.0, latched=True,
         )
-        self.assertEqual(decision.action, self.movers.ACTION_GO)
-        self.assertEqual(decision.reason, self.movers.REASON_WAIT_EXPIRED)
+        # The 1 s lane escape used to hand the leg back while the box was still
+        # in it, and the recovery tree backed the base up into the box. The
+        # occupancy planner now keeps the hold: there is no admissible move,
+        # and handing back is what the *budget* is for.
+        waiting = self.movers.decide(
+            obs, self.cfg, wait_elapsed_sec=self.cfg.lane_escape_delay_sec + 1.0)
+        self.assertEqual(waiting.action, self.movers.ACTION_STOP)
+        expired = self.movers.decide(
+            obs, self.cfg, wait_elapsed_sec=self.cfg.wait_budget_sec + 1.0)
+        self.assertNotEqual(expired.action, self.movers.ACTION_STOP)
+        self.assertEqual(expired.reason, self.movers.REASON_WAIT_EXPIRED)
 
     def test_the_hold_clearance_covers_the_base_and_the_box(self):
         """Parking the base centre 0.5 m from a lane saw a 0.22 m box pass
@@ -2520,6 +2902,77 @@ class YieldSpeedLimitTests(unittest.TestCase):
                          [module.YIELD_STOP_SPEED_LIMIT, 0.0])
         self.assertTrue(all(not m.percentage for m in pub.sent))
 
+    def test_cap_from_a_hold_needs_a_continuous_clear_window(self):
+        node = self.node(pub=self.FakePublisher())
+        oy = module.obstacle_yield
+        node._yield_suppress = False
+        node._yield_pause_active = True
+        node._yield_last_update = -math.inf
+        node._yield_latched = True
+        node._yield_wait_since = 0.0
+        node._yield_clear_since = None
+        node._yield_config = oy.YieldConfig(clear_hold_sec=0.5)
+        node._update_yield_episode = lambda *args: None
+        node.get_parameter = lambda name: SimpleNamespace(value=0.0)
+        stop = (oy.YieldDecision('stop', 'wait'), True, None)
+        cap = (oy.YieldDecision('cap', 'predict-slow', speed_mps=0.6), False, None)
+        for now, answer, holds in ((1.0, cap, True), (1.3, stop, True),
+                                   (1.4, cap, True), (1.6, cap, True),
+                                   (2.0, cap, False)):
+            node._yield_step = lambda _, answer=answer: answer
+            with patch.object(module.time, 'monotonic', return_value=now):
+                module.FixedJointPickPlace._tick_yield(node)
+            self.assertEqual(node._yield_decision.holds, holds)
+
+    def test_wait_expiry_is_not_permission_to_resume(self):
+        pub = self.FakePublisher()
+        node = self.node(pub=pub)
+        oy = module.obstacle_yield
+        node._yield_suppress = False
+        node._yield_pause_active = True
+        node._yield_last_update = -math.inf
+        node._yield_latched = True
+        node._yield_wait_since = 0.0
+        node._yield_clear_since = None
+        node._yield_config = oy.YieldConfig()
+        node._update_yield_episode = lambda *args: None
+        node.get_parameter = lambda name: SimpleNamespace(value=0.0)
+        node._yield_step = lambda _: (
+            oy.YieldDecision(oy.ACTION_GO, oy.REASON_WAIT_EXPIRED), False, None)
+        module.FixedJointPickPlace._tick_yield(node)
+        self.assertTrue(node._yield_decision.holds)
+        self.assertEqual(node._yield_decision.reason, oy.REASON_WAIT_EXPIRED)
+        self.assertEqual([m.speed_limit for m in pub.sent],
+                         [module.YIELD_STOP_SPEED_LIMIT])
+
+    def test_trial_staged_resume_restarts_when_the_corridor_closes(self):
+        pub = self.FakePublisher()
+        node = self.node(pub=pub)
+        oy = module.obstacle_yield
+        node._yield_suppress = False
+        node._yield_last_update = -math.inf
+        node._yield_latched = False
+        node._yield_wait_since = None
+        node._yield_clear_since = None
+        node._yield_release_from = None
+        node._yield_release_since = None
+        node._yield_decision = oy.YieldDecision('go', 'clear')
+        node._yield_config = oy.YieldConfig(approach_trial_enabled=True)
+        node._update_yield_episode = lambda *_: None
+        node.get_parameter = lambda name: SimpleNamespace(value=0.0)
+        stop = (oy.YieldDecision('stop', 'wait'), True, None)
+        clear = (oy.YieldDecision('go', 'clear'), False, None)
+        ticks = ((1.0, stop), (1.1, clear), (1.7, clear), (2.3, clear),
+                 (2.4, stop), (2.5, clear), (3.1, clear), (3.7, clear),
+                 (4.2, clear))
+        for now, decision in ticks:
+            node._yield_step = lambda _, value=decision: value
+            with patch.object(module.time, 'monotonic', return_value=now):
+                module.FixedJointPickPlace._tick_yield(node)
+        self.assertEqual([m.speed_limit for m in pub.sent],
+                         [module.YIELD_STOP_SPEED_LIMIT, 0.6, 1.0,
+                          module.YIELD_STOP_SPEED_LIMIT, 0.6, 1.0, 0.0])
+
     def test_a_release_keeps_the_latch_until_the_base_has_actually_moved(self):
         """Only the latch is kept through a release, never the hold.
 
@@ -2575,6 +3028,8 @@ class YieldSpeedLimitTests(unittest.TestCase):
             data=[0] * 100,
         )
         node = SimpleNamespace(_global_costmap=None)
+        node._global_cell_cost = lambda x, y: (
+            module.FixedJointPickPlace._global_cell_cost(node, x, y))
         self.assertIsNone(
             module.FixedJointPickPlace._costmap_clearance_at(node, 0.1, 0.1),
             'no map yet means "no opinion", never "free"')
@@ -2654,6 +3109,275 @@ class YieldWiringTests(unittest.TestCase):
         decision, latched, _ = module.FixedJointPickPlace._yield_step(node, 3.0)
         self.assertEqual(decision.action, module.obstacle_yield.ACTION_GO)
         self.assertFalse(latched)
+        node._yield_latched = False
+        node._yield_wait_since = None
+        decision, latched, arc = module.FixedJointPickPlace._yield_step(node, 3.0)
+        self.assertEqual(decision.action, module.obstacle_yield.ACTION_GO)
+        self.assertFalse(latched)
+        self.assertIsNone(arc)
+
+    def test_arc_safety_checks_keep_latch_in_sync_with_final_decision(self):
+        oy = module.obstacle_yield
+        arc_decision = oy.YieldDecision(oy.ACTION_ARC, oy.REASON_WAIT,
+                                        arc_x=0.8, arc_y=0.5)
+        for scan_clear, costmap, check, rejected in (
+                (False, True, True, True),
+                (True, False, True, True),
+                (True, True, True, False),
+                (True, None, True, False),  # no costmap opinion
+                (True, False, False, False)):  # costmap check disabled
+            with self.subTest(scan_clear=scan_clear, costmap=costmap, check=check):
+                node = SimpleNamespace(
+                    _yield_base_motion=lambda: (0.0, 0.0, 0.0, 1.0, 2.0),
+                    _base_pose=lambda: (1.0, 2.0, 0.0),
+                    _yield_scan_points=lambda yaw: (0.0, []),
+                    _yield_config=oy.YieldConfig(),
+                    _carrying_now=lambda: False,
+                    _yield_tracker=SimpleNamespace(update=Mock(), nearest=Mock(return_value=None)),
+            _mover_cloud_box=lambda: None,
+                    _yield_room=lambda *args: (1.0, 1.0),
+                    _yield_episode_elapsed=lambda now: 2.0,
+                    _yield_arc_attempts=0,
+                    _yield_diag=Mock(), _yield_log_decision=Mock(),
+                    get_parameter=lambda name: SimpleNamespace(value=check),
+                    _costmap_clearance_at=Mock(return_value=costmap),
+                    _yield_arc_path_clear=Mock(return_value=(True, None)),
+                )
+                with patch.object(oy, 'decide', return_value=arc_decision), \
+                     patch.object(oy, 'arc_scan_clear', return_value=scan_clear):
+                    decision, latched, goal = module.FixedJointPickPlace._yield_step(node, 3.0)
+                self.assertEqual(decision.action, oy.ACTION_STOP if rejected else oy.ACTION_ARC)
+                self.assertEqual(latched, rejected)
+                self.assertEqual(node._yield_arc_attempts, int(rejected))
+                if rejected:
+                    self.assertEqual(decision.reason, oy.REASON_WAIT)
+                    self.assertIsNone(goal)
+                else:
+                    self.assertEqual(goal, (1.8, 2.5))
+                self.assertEqual(node._costmap_clearance_at.call_count,
+                                 int(scan_clear and check))
+
+    def test_rejected_arc_latch_survives_lost_scan_in_tick(self):
+        oy = module.obstacle_yield
+        node = SimpleNamespace(
+            _yield_base_motion=lambda: (0.0, 0.0, 0.0, 0.0, 0.0),
+            _base_pose=lambda: (0.0, 0.0, 0.0),
+            _yield_scan_points=Mock(side_effect=[(0.0, []), (math.inf, None)]),
+            _yield_config=oy.YieldConfig(enabled=True),
+            _carrying_now=lambda: False,
+            _yield_tracker=SimpleNamespace(update=Mock(), nearest=Mock(return_value=None)),
+            _mover_cloud_box=lambda: None,
+            _yield_room=lambda *args: (1.0, 1.0),
+            _yield_episode_elapsed=lambda now: 2.0,
+            _yield_arc_attempts=0, _yield_arc_goal=None, _yield_arc_used=False,
+            _yield_diag=Mock(), _yield_log_decision=Mock(),
+            _yield_suppress=False, _yield_last_update=-math.inf,
+            _yield_latched=False, _yield_wait_since=None, _yield_clear_since=None,
+            _yield_release_from=None, _yield_release_since=None,
+            _update_yield_episode=Mock(), _slow_zone_limit=lambda: 0.0,
+            _publish_speed_limit=Mock(),
+            get_parameter=lambda name: SimpleNamespace(value=0.0),
+        )
+        node._yield_step = lambda distance: module.FixedJointPickPlace._yield_step(node, distance)
+        arc = oy.YieldDecision(oy.ACTION_ARC, oy.REASON_WAIT, arc_x=0.8, arc_y=0.5)
+        with patch.object(oy, 'decide', return_value=arc), \
+             patch.object(oy, 'arc_scan_clear', return_value=False):
+            module.FixedJointPickPlace._tick_yield(node, 3.0)
+            self.assertTrue(node._yield_latched)
+            self.assertIsNotNone(node._yield_wait_since)
+            self.assertEqual(node._yield_decision.action, oy.ACTION_STOP)
+            self.assertIsNone(node._yield_arc_goal)
+            module.FixedJointPickPlace._tick_yield(node, 3.0)
+        self.assertTrue(node._yield_latched)
+        self.assertEqual(node._yield_decision.action, oy.ACTION_STOP)
+        self.assertEqual(node._yield_arc_attempts, 1)
+        self.assertTrue(all(call.args[0] == module.YIELD_STOP_SPEED_LIMIT
+                            for call in node._publish_speed_limit.call_args_list))
+
+    def _node_for_rejected_arc_sequence(self):
+        oy = module.obstacle_yield
+        cfg = oy.YieldConfig()
+        track = dict(base_x=0.5, base_y=0.0, rel_vx=0.0, rel_vy=0.0,
+                     world_speed=0.3, x=0.5, y=0.0, vx=0.3, vy=0.0)
+        node = SimpleNamespace(
+            _yield_base_motion=lambda: (0.0, 0.0, 0.0, 0.0, 0.0),
+            _base_pose=lambda: (0.0, 0.0, 0.0),
+            _yield_scan_points=Mock(return_value=(0.0, [])),
+            _yield_config=cfg, _carrying_now=lambda: False,
+            _yield_tracker=SimpleNamespace(update=Mock(), nearest=Mock(return_value=track)),
+            _yield_room=lambda *args: (2.0, 2.0), _patrol_segments=[],
+            _yield_episode_elapsed=lambda now: now - 70.0,
+            _yield_arc_attempts=cfg.max_arc_attempts - 1,
+            _yield_arc_goal=None, _yield_arc_used=False,
+            _yield_diag=Mock(), _yield_log_decision=Mock(),
+            _yield_suppress=False, _yield_last_update=-math.inf,
+            _yield_latched=True, _yield_wait_since=99.9, _yield_clear_since=None,
+            _yield_release_from=None, _yield_release_since=None,
+            _cached_base_position=lambda: (0.0, 0.0),
+            _update_yield_episode=Mock(), _slow_zone_limit=lambda: 0.0,
+            _publish_speed_limit=Mock(),
+            get_parameter=lambda name: SimpleNamespace(value=0.0),
+        )
+        node._yield_step = lambda distance: module.FixedJointPickPlace._yield_step(node, distance)
+        return node
+
+    def test_yield_decision_log_tolerates_a_footprint_only_box(self):
+        """The decision line is inside the control loop, so it may not raise."""
+        logged = []
+        node = SimpleNamespace(
+            _yield_last_log=-1e9,
+            get_logger=lambda: SimpleNamespace(warning=logged.append),
+        )
+        obs = SimpleNamespace(box_x=2.6, box_y=-0.2, box_vx=None, box_vy=None,
+                              box_world_speed_mps=0.20)
+        decision = SimpleNamespace(action='go', reason='clear',
+                                   wait_elapsed_sec=0.0, detail='test')
+        module.FixedJointPickPlace._yield_log_decision(node, decision, obs)
+        self.assertEqual(len(logged), 1)
+        self.assertIn('v=(n/a,n/a)', logged[0])
+
+    def test_mover_cloud_box_is_used_only_while_fresh_and_enabled(self):
+        """The cloud look is a fallback for an empty tracker, never a cache.
+
+        A stale footprint would stage the base for a box that has already
+        driven off, so age is checked on every call.
+        """
+        import time as _time
+
+        node = SimpleNamespace(
+            _mover_cloud=[(3.0, 0.05), (3.01, 0.06), (3.02, 0.04)],
+            _mover_cloud_stamp=_time.monotonic(),
+            _yield_config=SimpleNamespace(half_width_m=0.47),
+            get_parameter=lambda name: SimpleNamespace(value={
+                'yield_mover_cloud_stage': True,
+                'yield_mover_cloud_timeout_sec': 0.35,
+                'yield_mover_cloud_range_m': 6.0,
+                'yield_mover_cloud_band_m': 1.2,
+            }[name]),
+        )
+        box = module.FixedJointPickPlace._mover_cloud_box(node)
+        self.assertIsNotNone(box)
+        self.assertAlmostEqual(box[0], 3.0, places=2)
+
+        node._mover_cloud_stamp = _time.monotonic() - 2.0
+        self.assertIsNone(module.FixedJointPickPlace._mover_cloud_box(node))
+
+        node._mover_cloud_stamp = _time.monotonic()
+        node.get_parameter = lambda name: SimpleNamespace(value={
+            'yield_mover_cloud_stage': False,
+            'yield_mover_cloud_timeout_sec': 0.35,
+            'yield_mover_cloud_range_m': 6.0,
+            'yield_mover_cloud_band_m': 1.2,
+        }[name])
+        self.assertIsNone(module.FixedJointPickPlace._mover_cloud_box(node))
+
+    def test_rejected_arc_at_attempt_ceiling_hands_conflict_to_nav2(self):
+        oy = module.obstacle_yield
+        node = self._node_for_rejected_arc_sequence()
+        clock = [100.0]
+        with patch.object(module.time, 'monotonic', side_effect=lambda: clock[0]), \
+             patch.object(oy, 'arc_scan_clear', return_value=False):
+            module.FixedJointPickPlace._tick_yield(node, 3.0)
+            self.assertEqual(node._yield_decision.action, oy.ACTION_STOP)
+            self.assertTrue(node._yield_latched)
+            self.assertEqual(node._yield_arc_attempts, node._yield_config.max_arc_attempts)
+            self.assertEqual(node._publish_speed_limit.call_args.args[0],
+                             module.YIELD_STOP_SPEED_LIMIT)
+            clock[0] = 100.1
+            module.FixedJointPickPlace._tick_yield(node, 3.0)
+            self.assertEqual((node._yield_decision.action, node._yield_decision.reason),
+                             (oy.ACTION_GO, oy.REASON_WAIT_EXPIRED))
+            # The hold is released, but the release-commit latch survives briefly.
+            self.assertTrue(node._yield_latched)
+            self.assertEqual(node._publish_speed_limit.call_args.args[0], 0.0)
+            clock[0] = 101.0
+            module.FixedJointPickPlace._tick_yield(node, 3.0)
+        self.assertEqual((node._yield_decision.action, node._yield_decision.reason),
+                         (oy.ACTION_GO, oy.REASON_WAIT_EXPIRED))
+        self.assertFalse(node._yield_latched)
+        self.assertEqual(node._publish_speed_limit.call_args.args[0], 0.0)
+        self.assertIsNone(node._yield_arc_goal)
+
+    def test_rejected_arc_then_scan_loss_expires_hold_budget(self):
+        oy = module.obstacle_yield
+        node = self._node_for_rejected_arc_sequence()
+        clock = [100.0]
+        with patch.object(module.time, 'monotonic', side_effect=lambda: clock[0]), \
+             patch.object(oy, 'arc_scan_clear', return_value=False):
+            module.FixedJointPickPlace._tick_yield(node, 3.0)
+            self.assertEqual(node._yield_decision.action, oy.ACTION_STOP)
+            self.assertTrue(node._yield_latched)
+            node._yield_scan_points.return_value = (math.inf, None)
+            clock[0] = 119.8
+            module.FixedJointPickPlace._tick_yield(node, 3.0)
+            self.assertEqual(node._yield_decision.action, oy.ACTION_STOP)
+            self.assertTrue(node._yield_latched)
+            self.assertEqual(node._publish_speed_limit.call_args.args[0],
+                             module.YIELD_STOP_SPEED_LIMIT)
+            clock[0] = 120.0
+            module.FixedJointPickPlace._tick_yield(node, 3.0)
+            self.assertEqual((node._yield_decision.action, node._yield_decision.reason),
+                             (oy.ACTION_GO, oy.REASON_CLEAR))
+            self.assertTrue(node._yield_latched)  # release-commit latch, not a hold
+            self.assertEqual(node._publish_speed_limit.call_args.args[0], 0.0)
+            clock[0] = 121.0
+            module.FixedJointPickPlace._tick_yield(node, 3.0)
+        self.assertEqual((node._yield_decision.action, node._yield_decision.reason),
+                         (oy.ACTION_GO, oy.REASON_CLEAR))
+        self.assertFalse(node._yield_latched)
+        self.assertEqual(node._publish_speed_limit.call_args.args[0], 0.0)
+        self.assertEqual(node._yield_arc_attempts, node._yield_config.max_arc_attempts)
+        self.assertIsNone(node._yield_arc_goal)
+
+    def test_real_missing_or_invalid_scan_through_rejected_arc_hold(self):
+        oy = module.obstacle_yield
+        unusable = (
+            ('missing', None),
+            ('range_max', SimpleNamespace(range_max=0.1, angle_increment=0.1)),
+            ('angle_increment', SimpleNamespace(range_max=10.0, angle_increment=0.0)),
+        )
+        for label, bad_scan in unusable:
+            with self.subTest(scan=label):
+                node = self._node_for_rejected_arc_sequence()
+                node._clock_seconds = lambda: 100.0
+                node._scan = SimpleNamespace(
+                    range_max=10.0, range_min=0.1, angle_increment=0.1,
+                    angle_min=0.0, ranges=[],
+                    header=SimpleNamespace(stamp=SimpleNamespace(sec=100, nanosec=0)))
+                node._yield_scan_points = lambda yaw: (
+                    module.FixedJointPickPlace._yield_scan_points(node, yaw))
+                clock = [100.0]
+                with patch.object(module.time, 'monotonic', side_effect=lambda: clock[0]), \
+                     patch.object(oy, 'arc_scan_clear', return_value=False):
+                    module.FixedJointPickPlace._tick_yield(node, 3.0)
+                    self.assertEqual(node._yield_decision.action, oy.ACTION_STOP)
+                    self.assertTrue(node._yield_latched)
+                    node._scan = bad_scan
+                    self.assertEqual(node._yield_scan_points(0.0), (None, []))
+                    clock[0] = 101.0
+                    module.FixedJointPickPlace._tick_yield(node, 3.0)
+                    self.assertEqual((node._yield_decision.action, node._yield_decision.reason),
+                                     (oy.ACTION_STOP, oy.REASON_WAIT))
+                    self.assertTrue(node._yield_latched)
+                    self.assertEqual(node._publish_speed_limit.call_args.args[0],
+                                     module.YIELD_STOP_SPEED_LIMIT)
+                    clock[0] = 120.0
+                    module.FixedJointPickPlace._tick_yield(node, 3.0)
+                    self.assertEqual((node._yield_decision.action, node._yield_decision.reason),
+                                     (oy.ACTION_GO, oy.REASON_CLEAR))
+                    self.assertTrue(node._yield_latched)  # release-commit, not a hold
+                    self.assertEqual(node._publish_speed_limit.call_args.args[0], 0.0)
+                    clock[0] = 121.0
+                    module.FixedJointPickPlace._tick_yield(node, 3.0)
+                    self.assertFalse(node._yield_latched)
+                    self.assertEqual(node._publish_speed_limit.call_args.args[0], 0.0)
+                    # Missing input with no active latch must not create a hold.
+                    node._yield_wait_since = None
+                    decision, latched, goal = node._yield_step(3.0)
+                    self.assertEqual((decision.action, decision.reason),
+                                     (oy.ACTION_GO, oy.REASON_CLEAR))
+                    self.assertFalse(latched)
+                    self.assertIsNone(goal)
 
     def test_the_executor_profile_pins_the_stacks_time_base(self):
         """The executor is spawned by the state machine, so nothing else sets it.
@@ -2685,6 +3409,10 @@ class YieldWiringTests(unittest.TestCase):
                     'yield_wait_budget_sec', 'yield_lane_hold_clearance_m',
                     'yield_hold_release_margin_m', 'yield_go_commit_sec',
                     'yield_go_commit_m', 'yield_arc_costmap_check',
+                    'yield_arc_path_check', 'yield_arc_path_start_m',
+                    'yield_arc_path_step_m', 'yield_arc_progress_timeout_sec',
+                    'yield_arc_progress_m', 'yield_arc_timeout_sec',
+                    'yield_arc_recovery_hold_sec',
                     'freeze_physics_around_link_services'):
             self.assertIn(key, params)
 
@@ -2786,6 +3514,14 @@ class YieldWiringTests(unittest.TestCase):
         node._update_yield_episode(117.0, latched=False)
         self.assertEqual(node._yield_episode_elapsed(125.0), 0.0)
 
+    @staticmethod
+    def _budget_action(oy, obs, cfg, waited):
+        """Policy with the early detour off: the pre-2026-11-18 ordering."""
+        return oy.decide(
+            obs, cfg.with_overrides(early_detour_enabled=False),
+            wait_elapsed_sec=waited,
+        ).action
+
     def test_a_spent_episode_budget_bounds_a_fresh_stop_too(self):
         """The latch releases on every lull; the budget must not reset with it.
 
@@ -2808,8 +3544,15 @@ class YieldWiringTests(unittest.TestCase):
             box_world_speed_mps=0.16, latched=False)
         self.assertGreater(math.hypot(fresh.box_x, fresh.box_y),
                            cfg.keepout_conflict_m)
-        self.assertEqual(oy.decide(fresh, cfg, wait_elapsed_sec=0.0).action,
+        # This tick used to stop first and take the arc only after the budget.
+        # Since the early detour (2026-11-18) it goes round straight away, and
+        # the budget - not the first action - is what this test is about: the
+        # assertion below keeps the old ordering reproducible with the switch
+        # off, so a regression in the budget still shows up here.
+        self.assertEqual(self._budget_action(oy, fresh, cfg, 0.0),
                          oy.ACTION_STOP)
+        self.assertEqual(oy.decide(fresh, cfg, wait_elapsed_sec=0.0).action,
+                         oy.ACTION_ARC)
         spent = oy.decide(fresh, cfg, wait_elapsed_sec=cfg.wait_budget_sec + 14.0)
         self.assertNotEqual(spent.action, oy.ACTION_STOP,
                             'a spent episode must not stop again')
@@ -2985,42 +3728,40 @@ class YieldWiringTests(unittest.TestCase):
         self.assertLess(skip_at, fail_at,
                         'the fail-closed stop stays the default branch')
 
-    def test_the_escape_reverses_after_the_controller_refused_the_path(self):
-        """Driving forward again re-enters the refusal that stopped the base."""
-        source = (ROOT / 'scripts' / 'fixed_joint_pick_place.py').read_text(
-            encoding='utf-8')
-        self.assertIn("self._last_attempt_failure = 'wedge_refusals'", source)
-        self.assertIn('direction=(-1.0 if self._last_attempt_failure', source)
-        self.assertIn("== 'wedge_refusals' else None)", source)
-        self.assertIn('if direction is None:', source)
-        self.assertIn('direction = self._clearer_axis()', source)
-
     def test_back_off_honours_a_forced_direction(self):
         bind = module.FixedJointPickPlace
-        published = []
-
-        def build():
-            return SimpleNamespace(
-                _clearer_axis=lambda: 1.0,
-                _fine_cmd_pub=SimpleNamespace(publish=published.append),
-                _stop_base=lambda: None,
-                get_logger=lambda: SimpleNamespace(warning=lambda *a: None),
-            )
-
-        def run(node, **kwargs):
-            ticks = iter([0.0, 0.0, 99.0, 99.0, 99.0])
-            with patch.object(module.time, 'monotonic',
-                              side_effect=lambda: next(ticks, 99.0)), \
-                 patch.object(module.rclpy, 'ok', return_value=True), \
-                 patch.object(module.rclpy, 'spin_once', lambda *a, **k: None):
-                bind._back_off(node, 'leg', distance_m=0.7, speed=0.08, **kwargs)
-
-        run(build(), direction=-1.0)
-        self.assertTrue(published, 'the escape must command something')
-        self.assertLess(published[0].linear.x, 0.0)
-        published.clear()
-        run(build())
-        self.assertGreater(published[0].linear.x, 0.0)
+        for direction, axis in ((-1.0, -1.0), (None, 1.0)):
+            with self.subTest(direction=direction):
+                poses = iter(((0.0, 0.0, 0.0), (0.0, 0.0, 0.0),
+                              (axis * 0.05, 0.0, 0.0)))
+                node = SimpleNamespace(
+                    _clearer_axis=Mock(return_value=1.0),
+                    _fine_cmd_pub=SimpleNamespace(publish=Mock()),
+                    _stop_base=Mock(),
+                    _yield_config=SimpleNamespace(enabled=False),
+                    _entry_yield_pending=lambda: False,
+                    _entry_scan_clearance=Mock(return_value=0.8),
+                    _recovery_corridor_clear=Mock(return_value=True),
+                    _recovery_pose=lambda frame: next(poses),
+                    _nav_budget_remaining=lambda limit=math.inf: min(limit, 5.0),
+                    get_parameter=lambda name: SimpleNamespace(value={
+                        'dead_zone_escape_enabled': True,
+                        'entry_recovery_stop_clearance_m': 0.40,
+                    }[name]),
+                    get_logger=Mock(),
+                )
+                with patch.object(module.time, 'monotonic', return_value=10.0), \
+                     patch.object(module.rclpy, 'ok', return_value=True), \
+                     patch.object(module.rclpy, 'spin_once'):
+                    self.assertTrue(bind._back_off(
+                        node, 'leg', distance_m=0.05, speed=0.08,
+                        direction=direction))
+                node._entry_scan_clearance.assert_called_once_with(axis)
+                node._recovery_corridor_clear.assert_called_once_with(axis, 0.10)
+                node._fine_cmd_pub.publish.assert_called_once()
+                self.assertEqual(node._fine_cmd_pub.publish.call_args.args[0].linear.x,
+                                 axis * 0.08)
+                node._stop_base.assert_called_once_with()
 
     def test_the_collision_monitor_no_longer_reads_a_dead_topic(self):
         """It read /cmd_vel_smoothed, which this stack never publishes."""
@@ -3169,27 +3910,6 @@ class YieldWiringTests(unittest.TestCase):
         self.assertIsNone(second)
         self.assertEqual(node._yield_arc_attempts, 1)
 
-    def test_an_arc_retry_does_not_shove_the_base_backwards(self):
-        """The retry after a yield arc must not run the dead-zone escape and the
-        jam break: the leg was abandoned because a moving obstacle owned the
-        lane, not because the base was wedged, and those two would drive a
-        healthy base backwards through the thing it just avoided."""
-        tree = ast.parse(SCRIPT.read_text(encoding='utf-8'))
-        cls = next(n for n in tree.body if isinstance(n, ast.ClassDef)
-                   and n.name == 'FixedJointPickPlace')
-        navigate = next(n for n in cls.body if isinstance(n, ast.FunctionDef)
-                        and n.name == '_navigate_to')
-        calls = [(n.func.attr, n.lineno) for n in ast.walk(navigate)
-                 if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)]
-        arc_line = next(line for name, line in calls
-                        if name == '_pending_yield_arc')
-        escape_line = next(line for name, line in calls
-                           if name == '_enter_dead_zone_escape')
-        back_off_line = next(line for name, line in calls
-                             if name == '_back_off')
-        self.assertLess(arc_line, escape_line)
-        self.assertLess(arc_line, back_off_line)
-
     def test_budget_expired_arc_skips_jam_escape_and_retries_original_goal(self):
         """An arc created at the 20 s hold boundary is not a Nav2 failure.
 
@@ -3207,15 +3927,29 @@ class YieldWiringTests(unittest.TestCase):
             _yield_arc_goal=None, _yield_arc_attempts=0,
             _yield_arc_used=False, _yield_suppress=False,
             get_parameter=lambda name: SimpleNamespace(value={
+                'navigation_timeout_sec': 60.0,
                 'navigation_retry_count': 2, 'yield_arc_goal_radius_m': 0.35,
                 'settle_sec': 0.0,
+                'yield_arc_progress_timeout_sec': 8.0,
+                'yield_arc_progress_m': 0.10,
+                'yield_arc_timeout_sec': 20.0,
+                'yield_arc_recovery_hold_sec': 1.0,
             }[name]),
             get_logger=lambda: logger,
             _log_cube_positions=lambda label: None,
+            # No narrow-entrance recovery configured for this zone: these tests
+            # pin the historical retry ladder, which the recovery only replaces
+            # when a zone opt-in via entry_recovery_* is reached.
+            # No outer pickup route on this ladder: the bypass is
+            # covered by test_pickup_fallback_route.py.
+            _pickup_fallback_route=lambda label: [],
+            _entry_recovery_applies=lambda label: False,
+            # No live link states: the stuck-relax path must stay dormant.
+            _cached_base_position=lambda: None,
             _restore_nominal_geometry=lambda label: None,
             _clear_speed_limit=lambda: None,
             _apply_slow_zones=lambda: None,
-            _clear_costmaps=lambda: True,
+            _clear_costmaps=Mock(),
             _enter_dead_zone_escape=lambda label: events.append(('escape', label)),
             _back_off=lambda *args, **kwargs: events.append(('backoff', args)),
         )
@@ -3223,7 +3957,7 @@ class YieldWiringTests(unittest.TestCase):
             module.FixedJointPickPlace._pending_yield_arc.__get__(node)
         )
 
-        def navigate_once(label, values, *args):
+        def navigate_once(label, values, *args, **kwargs):
             events.append(('nav', label))
             if len([event for event in events if event[0] == 'nav']) == 1:
                 node._yield_arc_goal = (3.0, 4.0)
@@ -3240,10 +3974,283 @@ class YieldWiringTests(unittest.TestCase):
                          ['warehouse A', 'warehouse A yield arc', 'warehouse A'])
         self.assertFalse(any(kind in ('escape', 'backoff') for kind, _ in events))
         self.assertEqual(node._yield_arc_attempts, 1)
+        node._clear_costmaps.assert_not_called()
+
+    def test_a_successful_arc_never_spends_the_last_slot(self):
+        """The arc must not be the END of the leg it just rescued.
+
+        Measured 2026-11-22 (rule 3 round B, blue_cube_5 -> B, cube attached):
+        the yield policy canceled the third of four attempts and granted a
+        sidestep. The sidestep completed at (0.40, -7.79), and the leg still
+        returned False: the canceled attempt had already spent the extra slot
+        that ``attempts += 1`` bought, so the goal was never re-driven. The
+        executor then reported UNSAFE_OBJECT_STATE with the cube attached and
+        the round died at 2/5.
+        """
+        events = []
+        logger = SimpleNamespace(
+            warning=lambda message: events.append(('warning', message)),
+            info=lambda message: events.append(('info', message)),
+        )
+        node = SimpleNamespace(
+            _yield_config=SimpleNamespace(enabled=True, max_arc_attempts=2),
+            # No arc at the start: the policy grants it mid-leg, after the
+            # third ordinary attempt has been canceled.
+            _yield_arc_goal=None, _yield_arc_attempts=0,
+            _yield_arc_used=False, _yield_suppress=False,
+            get_parameter=lambda name: SimpleNamespace(value={
+                'navigation_timeout_sec': 60.0,
+                'navigation_retry_count': 2,
+                'yield_arc_goal_radius_m': 0.35,
+                'settle_sec': 0.0,
+                'yield_arc_progress_timeout_sec': 8.0,
+                'yield_arc_progress_m': 0.10,
+                'yield_arc_timeout_sec': 20.0,
+                'yield_arc_recovery_hold_sec': 1.0,
+                'escape_distance_m': 0.7,
+                'escape_speed_mps': 0.08,
+            }[name]),
+            get_logger=lambda: logger,
+            _log_cube_positions=lambda label: None,
+            _cached_base_position=lambda: None,
+            _restore_nominal_geometry=lambda label: None,
+            _clear_speed_limit=lambda: None,
+            _apply_slow_zones=lambda: None,
+            _clear_costmaps=Mock(),
+            _start_cell_inside_global_band=lambda: False,
+            _global_recovery_cost=lambda: 30,
+            _local_recovery_pose_clear=lambda: True,
+            _relax_global_footprint=Mock(return_value=False),
+            _pickup_fallback_route=lambda label: [],
+            _entry_recovery_applies=lambda label: False,
+            _enter_dead_zone_escape=lambda label: events.append(('escape', label)),
+            _back_off=Mock(return_value=True),
+        )
+        node._pending_yield_arc = (
+            module.FixedJointPickPlace._pending_yield_arc.__get__(node)
+        )
+
+        def navigate_once(label, values, *args, **kwargs):
+            events.append(('nav', label))
+            navs = len([event for event in events if event[0] == 'nav'])
+            if navs == 1:
+                node._last_attempt_failure = 'no_progress'
+                return False  # One unchanged retry from a verified clear pose.
+            if navs == 2:
+                node._last_attempt_failure = 'controller_failure'
+                return False  # One independently verified reverse retreat.
+            if navs == 3:
+                # Late in the leg the policy cancels the goal and grants the arc.
+                node._last_attempt_failure = 'no_progress'
+                node._yield_arc_goal = (3.0, 4.0)
+                return False
+            return True
+
+        node._navigate_once = navigate_once
+        with patch.object(module.time, 'sleep'):
+            result = module.FixedJointPickPlace._navigate_to(
+                node, 'warehouse A', (5.0, 6.0, 0.0)
+            )
+        self.assertTrue(result)
+        self.assertEqual(
+            [value for kind, value in events if kind == 'nav'],
+            ['warehouse A', 'warehouse A', 'warehouse A',
+             'warehouse A yield arc', 'warehouse A'],
+        )
+        node._back_off.assert_called_once_with(
+            'warehouse A', distance_m=0.7, speed=0.08, direction=-1.0)
+        node._clear_costmaps.assert_not_called()
+
+    def test_a_failed_arc_holds_and_retries_the_original_route(self):
+        """A sidestep that cannot be driven must not fail a carried leg.
+
+        On 2026-11-21 (block 4, red_cube_1 -> A) the arc target was clear but
+        the carried envelope could not cross the floor before it: 0.94 m in
+        14.8 s, controller status 6, and the leg returned False with the cube
+        still attached. Hold, then retry the original route on the recovered
+        attempt.
+        """
+        events = []
+        logger = SimpleNamespace(
+            warning=lambda message: events.append(('warning', message)),
+            info=lambda message: events.append(('info', message)),
+            error=lambda message: events.append(('error', message)),
+        )
+        node = SimpleNamespace(
+            _yield_config=SimpleNamespace(enabled=True, max_arc_attempts=2),
+            _yield_arc_goal=(3.0, 4.0), _yield_arc_attempts=0,
+            _yield_arc_used=False, _yield_suppress=False,
+            get_parameter=lambda name: SimpleNamespace(value={
+                'navigation_timeout_sec': 60.0,
+                'navigation_retry_count': 0,
+                'yield_arc_goal_radius_m': 0.35,
+                'settle_sec': 0.0,
+                'yield_arc_progress_timeout_sec': 8.0,
+                'yield_arc_progress_m': 0.10,
+                'yield_arc_timeout_sec': 20.0,
+                'yield_arc_recovery_hold_sec': 1.0,
+                'escape_distance_m': 0.7,
+                'escape_speed_mps': 0.08,
+            }[name]),
+            get_logger=lambda: logger,
+            _log_cube_positions=lambda label: None,
+            _cached_base_position=lambda: None,
+            _restore_nominal_geometry=lambda label: None,
+            _clear_speed_limit=lambda: None,
+            _apply_slow_zones=lambda: None,
+            _clear_costmaps=Mock(),
+            _start_cell_inside_global_band=lambda: False,
+            # Bounded arc recovery is the ladder under test, not the entrance.
+            # No outer pickup route on this ladder: the bypass is
+            # covered by test_pickup_fallback_route.py.
+            _pickup_fallback_route=lambda label: [],
+            _entry_recovery_applies=lambda label: False,
+            _enter_dead_zone_escape=lambda label: events.append(('escape', label)),
+            _back_off=lambda *args, **kwargs: events.append(('backoff', args)),
+        )
+        node._pending_yield_arc = (
+            module.FixedJointPickPlace._pending_yield_arc.__get__(node)
+        )
+
+        def navigate_once(label, values, *args, **kwargs):
+            events.append(('nav', label))
+            # Fail the lateral waypoint, then succeed on the original goal.
+            return 'yield arc' not in label
+
+        node._navigate_once = navigate_once
+        with patch.object(module.time, 'sleep'):
+            result = module.FixedJointPickPlace._navigate_to(
+                node, 'warehouse A', (5.0, 6.0, 0.0)
+            )
+        self.assertTrue(result)
+        self.assertEqual([value for kind, value in events if kind == 'nav'],
+                         ['warehouse A yield arc', 'warehouse A'])
+        self.assertFalse(any(kind in ('escape', 'backoff') for kind, _ in events))
+        self.assertTrue(any(
+            kind == 'warning' and 'retrying the original route' in message
+            for kind, message in events
+        ))
+        self.assertEqual(node._yield_arc_attempts, 2)
+        self.assertIsNone(node._yield_arc_goal)
+
+    def test_a_failed_arc_recovery_is_bounded(self):
+        """The recovery spends the remaining retry budget, not a clear loop."""
+        events = []
+        logger = SimpleNamespace(
+            warning=lambda message: events.append(('warning', message)),
+            info=lambda message: events.append(('info', message)),
+            error=lambda message: events.append(('error', message)),
+        )
+        node = SimpleNamespace(
+            _yield_config=SimpleNamespace(enabled=True, max_arc_attempts=2),
+            _yield_arc_goal=(3.0, 4.0), _yield_arc_attempts=0,
+            _yield_arc_used=False, _yield_suppress=False,
+            get_parameter=lambda name: SimpleNamespace(value={
+                'navigation_timeout_sec': 60.0,
+                'navigation_retry_count': 1,
+                'yield_arc_goal_radius_m': 0.35,
+                'settle_sec': 0.0,
+                'yield_arc_progress_timeout_sec': 8.0,
+                'yield_arc_progress_m': 0.10,
+                'yield_arc_timeout_sec': 20.0,
+                'yield_arc_recovery_hold_sec': 1.0,
+                'escape_distance_m': 0.7,
+                'escape_speed_mps': 0.08,
+            }[name]),
+            get_logger=lambda: logger,
+            _log_cube_positions=lambda label: None,
+            _cached_base_position=lambda: None,
+            _restore_nominal_geometry=lambda label: None,
+            _clear_speed_limit=lambda: None,
+            _apply_slow_zones=lambda: None,
+            _clear_costmaps=Mock(),
+            _start_cell_inside_global_band=lambda: False,
+            _global_recovery_cost=lambda: 30,
+            _local_recovery_pose_clear=lambda: True,
+            _relax_global_footprint=Mock(return_value=False),
+            # Bounded arc recovery is the ladder under test, not the entrance.
+            # No outer pickup route on this ladder: the bypass is
+            # covered by test_pickup_fallback_route.py.
+            _pickup_fallback_route=lambda label: [],
+            _entry_recovery_applies=lambda label: False,
+            _enter_dead_zone_escape=lambda label: events.append(('escape', label)),
+            _back_off=lambda *args, **kwargs: events.append(('backoff', args)),
+        )
+        node._pending_yield_arc = (
+            module.FixedJointPickPlace._pending_yield_arc.__get__(node)
+        )
+
+        def navigate_once(label, values, *args, **kwargs):
+            events.append(('nav', label))
+            return False
+
+        node._navigate_once = navigate_once
+        with patch.object(module.time, 'sleep'):
+            result = module.FixedJointPickPlace._navigate_to(
+                node, 'warehouse A', (5.0, 6.0, 0.0)
+            )
+        self.assertFalse(result)
+        self.assertEqual([value for kind, value in events if kind == 'nav'],
+                         ['warehouse A yield arc', 'warehouse A',
+                          'warehouse A'])
+        self.assertEqual(sum(
+            1 for kind, message in events
+            if kind == 'warning' and 'retrying the original route' in message
+        ), 1)
+        # The remaining configured retry runs in place: no dead-zone escape,
+        # map clear or blind back-off with the cube on board.
+        node._clear_costmaps.assert_not_called()
+        node._relax_global_footprint.assert_not_called()
+        self.assertFalse(any(kind in ('escape', 'backoff') for kind, _ in events))
+
+    def test_arc_path_check_rejects_a_blocked_middle_even_with_a_clear_apex(self):
+        node = SimpleNamespace(
+            get_parameter=lambda name: SimpleNamespace(value={
+                'yield_arc_path_check': True,
+                'yield_arc_path_start_m': 0.20,
+                'yield_arc_path_step_m': 0.10,
+            }[name]),
+            _costmap_clearance_at=lambda x, y: not (1.95 < x < 2.05),
+        )
+        ok, detail = module.FixedJointPickPlace._yield_arc_path_clear(
+            node, (3.0, 0.0), 0.0, 0.0)
+        self.assertFalse(ok)
+        self.assertIn('2.00', detail)
+        # The cell under the base is already occupied by the loaded footprint;
+        # it must not veto every sidestep. Start sampling past it.
+        node.get_parameter = lambda name: SimpleNamespace(value={
+            'yield_arc_path_check': True,
+            'yield_arc_path_start_m': 0.30,
+            'yield_arc_path_step_m': 0.10,
+        }[name])
+        node._costmap_clearance_at = lambda x, y: x >= 0.25
+        ok, detail = module.FixedJointPickPlace._yield_arc_path_clear(
+            node, (3.0, 0.0), 0.0, 0.0)
+        self.assertTrue(ok)
+        self.assertIsNone(detail)
+        # No costmap opinion is not a rejection.
+        node._costmap_clearance_at = lambda x, y: None
+        ok, detail = module.FixedJointPickPlace._yield_arc_path_clear(
+            node, (3.0, 0.0), 0.0, 0.0)
+        self.assertTrue(ok)
+
+    def test_arc_progress_watchdog_restarts_only_on_real_displacement(self):
+        step = module.FixedJointPickPlace._progress_watchdog_step
+        anchor, since, expired = step(None, None, (0.0, 0.0), 0.0, 0.10, 8.0)
+        self.assertEqual((anchor, since, expired), ((0.0, 0.0), 0.0, False))
+        anchor, since, expired = step(anchor, since, (0.05, 0.0), 1.0, 0.10, 8.0)
+        self.assertEqual(anchor, (0.0, 0.0))
+        self.assertFalse(expired)
+        anchor, since, expired = step(anchor, since, (0.05, 0.0), 9.0, 0.10, 8.0)
+        self.assertTrue(expired)
+        anchor, since, expired = step(anchor, since, (0.12, 0.0), 9.0, 0.10, 8.0)
+        self.assertEqual(anchor, (0.12, 0.0))
+        self.assertEqual(since, 9.0)
+        self.assertFalse(expired)
 
     def test_a_hold_that_expires_into_an_arc_does_not_resume_nav2(self):
         source = SCRIPT.read_text(encoding='utf-8')
-        block = source[source.index('if not self._hold_until_clear(label, x, y, deadline):'):]
+        block = source[source.index('not self._hold_until_clear(label, x, y, deadline):'):]
         block = block[:block.index('if self._yield_arc_goal is not None:',
                                    block.index('resumed = self._resume_nav_goal'))]
         self.assertLess(block.index('if self._yield_arc_goal is not None:'),
@@ -3464,12 +4471,16 @@ class ContinuousDetourTests(unittest.TestCase):
         }[(x, y)]
         self.assertEqual(node._chain_progress_target(chain, 12.8, -6.8),
                          (13.65, -6.85))
-        # The last waypoint is never skipped.
-        node._cached_planar_distance_to_point = lambda x, y: {
-            (10.8, -6.65): 4.0, (13.65, -6.85): 3.0, (13.65, -3.0): 0.5,
-        }[(x, y)]
-        self.assertEqual(node._chain_progress_target(chain, 13.6, -3.4),
-                         (13.65, -3.0))
+        # Target the last waypoint until it is reached, then measure
+        # progress against the final pose without revisiting the waypoint.
+        distances = {(10.8, -6.65): 4.0, (13.65, -6.85): 3.0, (13.65, -3.0): 0.8}
+        node._cached_planar_distance_to_point = lambda x, y: distances[(x, y)]
+        self.assertEqual(node._chain_progress_target(chain, 7.0, -6.0), (13.65, -3.0))
+        distances[(13.65, -3.0)] = 0.7
+        self.assertEqual(node._chain_progress_target(chain, 7.0, -6.0), (7.0, -6.0))
+        self.assertIsNone(node._remaining_chain(chain))
+        distances[(13.65, -3.0)] = 1.0
+        self.assertEqual(node._chain_progress_target(chain, 7.0, -6.0), (7.0, -6.0))
         # A plain leg keeps measuring against its own goal.
         node._chain_index = 0
         self.assertEqual(node._chain_progress_target(None, 5.0, 6.0), (5.0, 6.0))
@@ -3551,14 +4562,16 @@ class ContinuousDetourTests(unittest.TestCase):
         """A retry must not undo the waypoints the leg already reached."""
         source = SCRIPT.read_text(encoding='utf-8')
         leg = source[source.index('    def _navigate_to('):]
-        self.assertIn('self._chain_index = 0', leg[:2000],
+        leg = leg[:leg.index('\n    def ', 10)]
+        self.assertIn('self._chain_index = 0', leg[:leg.index('while attempt < attempts:')],
                       'the leg owns chain progress')
         attempt = source[source.index('    def _navigate_once__timed('):]
         attempt = attempt[:attempt.index('\n    def ', 10)]
         self.assertNotIn('self._chain_index = 0', attempt,
                          'an attempt must not reset what the leg reached')
-        resume = source[source.index('resumed = self._resume_nav_goal') - 400:]
-        self.assertIn('self._remaining_chain(chain)', resume[:400],
+        resume = attempt[attempt.index('# Rebuild from the REMAINING waypoints:'):]
+        self.assertIn('self._remaining_chain(chain)',
+                      resume[:resume.index('resumed = self._resume_nav_goal')],
                       'a resume must rebuild the goal from what is left')
 
     def test_the_competition_profile_enables_the_continuous_detour(self):
@@ -3668,6 +4681,8 @@ class DependencySpecLazinessTests(unittest.TestCase):
             _clear_local_client=client([True]),
             _global_costmap_params_client=client([True]),
             _local_costmap_params_client=client([True]),
+            _global_costmap_get_client=client([True]),
+            _local_costmap_get_client=client([True]),
             _set_state_client=client([True]),
         )
 
@@ -3697,6 +4712,22 @@ class DependencySpecLazinessTests(unittest.TestCase):
             ready['clear_global']()
         node._clear_global_client = SimpleNamespace(service_is_ready=lambda: True)
         self.assertTrue(ready['clear_global']())
+
+    def test_geometry_requires_both_get_and_atomic_set_services(self):
+        node = self.build()
+        ready = {key: fn for key, _desc, fn in
+                 module.FixedJointPickPlace._dependency_specs(node)}
+        for side in ('global', 'local'):
+            with self.subTest(side=side):
+                self.assertTrue(ready[f'params_{side}']())
+                setattr(node, f'_{side}_costmap_get_client',
+                        SimpleNamespace(service_is_ready=lambda: False))
+                self.assertFalse(ready[f'params_{side}']())
+                setattr(node, f'_{side}_costmap_get_client',
+                        SimpleNamespace(service_is_ready=lambda: True))
+                setattr(node, f'_{side}_costmap_params_client',
+                        SimpleNamespace(service_is_ready=lambda: False))
+                self.assertFalse(ready[f'params_{side}']())
 
     def test_specs_are_rebuilt_from_current_attributes_each_call(self):
         node = self.build()
@@ -4477,3 +5508,434 @@ class LinkServiceFreezeTests(unittest.TestCase):
         node._link_service_frozen = False
         self.assertEqual(
             module.FixedJointPickPlace._link_service_timeout(node), 10.0)
+
+
+class StuckRelaxTests(unittest.TestCase):
+    """Only a fresh planner-only inscribed band can justify a temporary change."""
+
+    def _node(self, *, cost=99, after_cost=30, local_clear=True,
+              after_local_clear=True, newer=True, radius=0.35, enabled=True,
+              navigation=(), retreat=False, arc=None, budget=20.0):
+        cls = module.FixedJointPickPlace
+        settings = {
+            'navigation_timeout_sec': budget, 'navigation_retry_count': 3,
+            'settle_sec': 0.0, 'stuck_relax_global_radius': enabled,
+            'global_radius_margin_m': 0.10, 'escape_distance_m': 0.25,
+            'escape_speed_mps': 0.08, 'yield_arc_goal_radius_m': 0.25,
+            'yield_arc_progress_timeout_sec': 8.0, 'yield_arc_progress_m': 0.10,
+            'yield_arc_timeout_sec': 20.0, 'yield_arc_recovery_hold_sec': 1.0,
+        }
+        events = []
+        state = SimpleNamespace(cost=cost, local=local_clear, stamp=1, now=0.0)
+        replies = iter(navigation)
+        arcs = iter((arc, None)) if arc is not None else iter(())
+        node = SimpleNamespace(
+            get_parameter=lambda key: SimpleNamespace(value=settings[key]),
+            get_logger=Mock(),
+            get_clock=lambda: SimpleNamespace(now=lambda: SimpleNamespace(nanoseconds=1)),
+            _yield_config=SimpleNamespace(enabled=arc is not None),
+            _yield_arc_goal=None, _pending_yield_arc=lambda: next(arcs, None),
+            _log_cube_positions=Mock(), _clear_speed_limit=Mock(),
+            _entry_recovery_applies=lambda label: False,
+            _entry_yield_pending=lambda: False, _pickup_fallback_route=lambda label: [],
+            _nominal_geometry=(radius, 0.60, 'nominal'), _relaxed_global=False,
+            _global_costmap=object(), _grid_stamp=lambda grid: state.stamp,
+            _global_recovery_cost=lambda: state.cost,
+            _local_recovery_pose_clear=lambda: state.local,
+            _apply_slow_zones=Mock(), _clear_costmaps=Mock(),
+            _enter_dead_zone_escape=Mock(), _op=lambda label: nullcontext(),
+        )
+        for name in ('_nav_budget_remaining', '_start_cell_inside_global_band',
+                     '_relax_global_footprint', '_restore_nominal_geometry',
+                     '_recovery_envelope_radius', '_navigate_once', '_navigation_motion_fault'):
+            setattr(node, name, getattr(cls, name).__get__(node))
+
+        def navigate(label, *args, **kwargs):
+            events.append(('nav', label, node._relaxed_global, node._nav_leg_deadline))
+            reply = next(replies)
+            if reply == 'deadline':
+                state.now = node._nav_leg_deadline
+            node._last_attempt_failure = None if reply is True else reply
+            return reply is True
+
+        def update_geometry(changes, *, expected=None, cleanup=False):
+            events.append(('geometry', changes, expected, cleanup))
+            if not cleanup:
+                state.cost = after_cost
+                state.local = after_local_clear
+                state.stamp += int(newer)
+            return {'global': {'robot_radius': radius + 0.10}}
+
+        node._navigate_once__timed = navigate
+        node._update_costmap_geometry = update_geometry
+        node._back_off = Mock(return_value=retreat)
+        with patch.object(module.time, 'monotonic', side_effect=lambda: state.now), \
+             patch.object(module.time, 'sleep'), \
+             patch.object(module.rclpy, 'ok', return_value=True), \
+             patch.object(module.rclpy, 'spin_once',
+                          side_effect=lambda *a, timeout_sec: setattr(
+                              state, 'now', state.now + timeout_sec)):
+            ok = cls._navigate_to(node, 'leg', (3.0, 4.0, 0.0))
+        node._clear_costmaps.assert_not_called()
+        node._enter_dead_zone_escape.assert_not_called()
+        node._clear_speed_limit.assert_called_once_with()
+        self.assertIsNone(node._nav_leg_deadline)
+        return ok, node, events
+
+    def test_verified_global_band_relaxes_only_global_and_restores(self):
+        ok, node, events = self._node(navigation=(None, True))
+        self.assertTrue(ok)
+        nominal = 0.35 + 0.10
+        self.assertEqual(events, [
+            ('nav', 'leg', False, 20.0),
+            ('geometry', {'global': {'robot_radius': 0.43}},
+             {'global': {'robot_radius': nominal}}, False),
+            ('nav', 'leg', True, 20.0),
+            ('geometry', {'global': {'robot_radius': nominal}}, None, True),
+        ])
+        node._back_off.assert_not_called()
+        self.assertFalse(node._relaxed_global)
+
+    def test_clear_start_only_allows_one_unchanged_retry_after_generic_failure(self):
+        ok, node, events = self._node(cost=30, navigation=(None, None))
+        self.assertFalse(ok)
+        self.assertEqual(events, [('nav', 'leg', False, 20.0)] * 2)
+        node._back_off.assert_not_called()
+
+    def test_lethal_missing_or_locally_blocked_start_cannot_relax_or_retry(self):
+        for cost, local_clear in ((100, True), (None, True), (99, False), (30, False)):
+            with self.subTest(cost=cost, local_clear=local_clear):
+                ok, node, events = self._node(
+                    cost=cost, local_clear=local_clear, navigation=(None,))
+                self.assertFalse(ok)
+                self.assertEqual(events, [('nav', 'leg', False, 20.0)])
+                node._back_off.assert_not_called()
+
+    def test_switch_and_recovery_envelope_can_prevent_relax(self):
+        for overrides in ({'enabled': False}, {'radius': 0.32}):
+            with self.subTest(**overrides):
+                ok, node, events = self._node(navigation=(None,), **overrides)
+                self.assertFalse(ok)
+                self.assertEqual(events, [('nav', 'leg', False, 20.0)])
+                node._back_off.assert_not_called()
+
+    def test_relax_requires_new_map_and_still_clear_local_envelope(self):
+        for overrides in ({'after_cost': 99}, {'after_cost': 100},
+                          {'after_local_clear': False}, {'newer': False, 'budget': 0.2}):
+            with self.subTest(**overrides):
+                ok, node, events = self._node(navigation=(None,), **overrides)
+                self.assertFalse(ok)
+                self.assertEqual([event[0] for event in events],
+                                 ['nav', 'geometry', 'geometry'])
+                self.assertTrue(events[-1][-1], 'unverified change must be rolled back')
+                node._back_off.assert_not_called()
+                self.assertFalse(node._relaxed_global)
+
+    def test_deadline_during_relaxed_goal_restores_without_movement(self):
+        ok, node, events = self._node(navigation=(None, 'deadline'))
+        self.assertFalse(ok)
+        self.assertEqual([event[0] for event in events],
+                         ['nav', 'geometry', 'nav', 'geometry'])
+        self.assertTrue(events[-1][-1])
+        node._back_off.assert_not_called()
+        self.assertFalse(node._relaxed_global)
+
+    def test_only_one_verified_reverse_retreat_after_a_controller_refusal(self):
+        for retreat, replies in ((False, ('wedge_refusals',)),
+                                 (True, ('wedge_refusals', 'controller_failure'))):
+            with self.subTest(retreat=retreat):
+                ok, node, events = self._node(
+                    cost=99, navigation=replies, retreat=retreat)
+                self.assertFalse(ok)
+                self.assertEqual(events, [('nav', 'leg', False, 20.0)] * len(replies))
+                node._back_off.assert_called_once_with(
+                    'leg', distance_m=0.25, speed=0.08, direction=-1.0)
+
+    def test_yield_arc_gets_one_verified_global_retry_then_original_goal(self):
+        ok, node, events = self._node(arc=(2.0, 2.5), navigation=(None, True, True))
+        self.assertTrue(ok)
+        self.assertEqual([(event[1], event[2]) for event in events if event[0] == 'nav'],
+                         [('leg yield arc', False), ('leg yield arc', True),
+                          ('leg', False)])
+        self.assertEqual(sum(event[0] == 'geometry' for event in events), 2)
+        node._back_off.assert_not_called()
+
+    def test_profile_keeps_the_specific_relax_but_not_generic_plan_shrink(self):
+        import yaml
+        for path in (ROOT / 'config' / 'profiles' / 'executor_fast.yaml',
+                     ROOT / 'config' / 'fixed_joint_pick_place.yaml'):
+            with self.subTest(path=path.name):
+                data = yaml.safe_load(path.read_text(encoding='utf-8'))
+                params = data[next(iter(data))]['ros__parameters']
+                self.assertIs(params.get('stuck_relax_global_radius'), True)
+                self.assertNotIn('stuck_relax_on_plan_failure', params)
+                self.assertEqual(params.get('global_radius_margin_m', 0.10), 0.10)
+
+
+class GlobalSoftInflationTests(unittest.TestCase):
+    INFLATION = 'inflation_layer.inflation_radius'
+
+    def _build_geometry(self, floor):
+        settings = {'global_radius_margin_m': .10, 'global_inflation_min_m': floor,
+                    'service_timeout_sec': 5.0, 'stuck_relax_global_radius': True}
+        node = SimpleNamespace(
+            get_parameter=lambda key: SimpleNamespace(value=settings[key]),
+            get_logger=Mock(), _relaxed_global=False,
+            _global_costmap=object(), _grid_stamp=lambda _: 11,
+            get_clock=lambda: SimpleNamespace(now=lambda: SimpleNamespace(nanoseconds=10)),
+            _global_recovery_cost=Mock(side_effect=[99, 98]),
+            _local_recovery_pose_clear=lambda: True,
+            _recovery_envelope_radius=lambda: .43,
+            _entry_yield_pending=lambda: False,
+        )
+        state = {side: {'robot_radius': .20, self.INFLATION: .21}
+                 for side in ('global', 'local')}
+        writes = []
+
+        def complete(response):
+            result = Future()
+            result.set_result(response)
+            return result
+
+        def get(side, request):
+            return complete(SimpleNamespace(values=[module.ParameterValue(
+                type=module.ParameterType.PARAMETER_DOUBLE,
+                double_value=state[side][name]) for name in request.names]))
+
+        def set_atomically(side, request):
+            updates = {param.name: param.value.double_value for param in request.parameters}
+            writes.append((side, updates))
+            state[side].update(updates)
+            return complete(SimpleNamespace(result=SimpleNamespace(successful=True)))
+
+        for side in state:
+            setattr(node, f'_{side}_costmap_get_client',
+                    SimpleNamespace(call_async=lambda req, s=side: get(s, req)))
+            setattr(node, f'_{side}_costmap_params_client',
+                    SimpleNamespace(call_async=lambda req, s=side: set_atomically(s, req)))
+        for name in ('_geometry_call', '_read_map_geometry', '_write_map_geometry',
+                     '_update_costmap_geometry', '_nav_budget_remaining',
+                     '_set_costmap_geometry__timed', '_relax_global_footprint',
+                     '_restore_nominal_geometry'):
+            setattr(node, name, getattr(module.FixedJointPickPlace, name).__get__(node))
+        return node, state, writes
+
+    def test_floor_is_global_only_and_preserved_in_relaxed_retry(self):
+        for floor in (0.0, .80):
+            with self.subTest(floor=floor):
+                node, state, writes = self._build_geometry(floor)
+                with patch.object(module.rclpy, 'spin_until_future_complete'), \
+                     patch.object(module.rclpy, 'ok', return_value=True):
+                    self.assertTrue(node._set_costmap_geometry__timed(.35, .60, 'loaded'))
+                    self.assertAlmostEqual(state['global']['robot_radius'], .45)
+                    self.assertEqual(state['global'][self.INFLATION], max(.60, floor))
+                    self.assertEqual(state['local'], {'robot_radius': .35, self.INFLATION: .60})
+                    self.assertEqual([side for side, _ in writes], ['global', 'local'])
+                    nominal = {side: dict(geometry) for side, geometry in state.items()}
+                    writes.clear()
+                    self.assertTrue(node._relax_global_footprint('leg'))
+                    self.assertEqual(state['global'], {**nominal['global'], 'robot_radius': .43})
+                    self.assertEqual(state['local'], nominal['local'])
+                    node._restore_nominal_geometry('leg')
+                    self.assertEqual(state, nominal)
+                    self.assertEqual(writes, [('global', {'robot_radius': .43}),
+                                              ('global', {'robot_radius': .35 + .10})])
+
+    def test_invalid_floor_sends_no_updates(self):
+        for floor in (-.1, math.nan, math.inf):
+            with self.subTest(floor=floor):
+                node, _state, writes = self._build_geometry(floor)
+                self.assertFalse(node._set_costmap_geometry__timed(.35, .60, 'loaded'))
+                self.assertEqual(writes, [])
+
+
+class PickupFallbackTests(unittest.TestCase):
+    """A failed pickup leg gets ONE verified outer route, then the goal again.
+
+    Measured 2026-11-22 (rule 3, seed 997360): blue_cube_5 spent 426 s of a
+    685 s round on one pickup. The direct leg from warehouse B has to cross the
+    1.10 m mouth at (-4.3, -1.1); a mover parked in it blocked the local
+    costmap, the base inched at the wall tip, and two 45 s progress watchdogs
+    expired before the retry ladder backed off and the state machine re-sent the
+    goal. The route's geometry is checked against room_from_world.pgm by
+    test_pickup_fallback_route.py; these cases pin WHEN and HOW OFTEN the
+    executor drives it, and that a failed bypass cannot authorize blind
+    motion or repeated unchanged retries.
+    """
+
+    GOAL = (-2.988, -11.583, -3.141593)
+    ROUTE = [
+        [-10.6, -3.0, math.pi],
+        [-12.3, -3.4, -2.91],
+        [-12.95, -4.45, -0.2],
+    ]
+    PARAMS = {
+        'navigation_retry_count': 2,
+        'navigation_timeout_sec': 30.0,
+        'settle_sec': 0.0,
+        'escape_distance_m': 0.7,
+        'escape_speed_mps': 0.08,
+        'stuck_relax_global_radius': False,
+        'pickup_fallback_enabled': True,
+        'pickup_fallback_completion_radius_m': 0.35,
+        'blue_cube_5_pickup_fallback_via_1': ROUTE[0],
+        'blue_cube_5_pickup_fallback_via_2': ROUTE[1],
+        'blue_cube_5_pickup_fallback_via_3': ROUTE[2],
+    }
+
+    def _node(self, navigate, position=None, *, failure='no_progress',
+              cost=30, local_clear=True):
+        # The historical failure pose: 0.35 m off the wall mouth, 10.32 m from
+        # the pickup goal, 5.42 m from the first outer waypoint.
+        position = position or (-5.39, -1.52)
+        calls = []
+        decisions = list(navigate)
+        box = {}
+
+        def navigate_once(label, *args, **kwargs):
+            calls.append(('nav', label, args, kwargs))
+            ok = decisions.pop(0)
+            box['node']._last_attempt_failure = None if ok else failure
+            return ok
+
+        values = dict(self.PARAMS)
+        node = SimpleNamespace(
+            get_parameter=lambda name: SimpleNamespace(value=values[name]),
+            has_parameter=lambda name: name in values,
+            _yield_config=SimpleNamespace(enabled=False),
+            _log_cube_positions=lambda label: None,
+            _pending_yield_arc=lambda: None,
+            _entry_recovery_applies=lambda label: False,
+            _cached_base_position=lambda: position,
+            _global_recovery_cost=lambda: cost,
+            _local_recovery_pose_clear=lambda: local_clear,
+            _navigate_once=navigate_once,
+            _clear_costmaps=lambda: calls.append(('clear',)) or True,
+            _stop_base=lambda: calls.append(('stop',)),
+            _restore_nominal_geometry=lambda label: None,
+            _clear_speed_limit=lambda: None,
+            _enter_dead_zone_escape=lambda label: calls.append(('escape',)),
+            _back_off=lambda *args, **kwargs: calls.append(('back_off',)),
+            _set_costmap_geometry=lambda *args, **kwargs: True,
+            _relax_global_footprint=lambda label: False,
+            _last_attempt_failure=None,
+            _pickup_fallback_used=False,
+            _yield_arc_used=False,
+            _yield_suppress=False,
+            _yield_arc_goal=None,
+            get_logger=lambda: SimpleNamespace(
+                info=lambda *a, **k: None,
+                warning=lambda *a, **k: None,
+                error=lambda *a, **k: None),
+        )
+        box['node'] = node
+        # _navigate_to reaches the real helpers through `self`, so bind them the
+        # way a real node would have them.
+        node._double_list = lambda name, length: (
+            module.FixedJointPickPlace._double_list(node, name, length))
+        node._pickup_fallback_route = lambda label: (
+            module.FixedJointPickPlace._pickup_fallback_route(node, label))
+        node._pickup_fallback_needed = lambda route, values: (
+            module.FixedJointPickPlace._pickup_fallback_needed(
+                node, route, values))
+        node._nav_budget_remaining = module.FixedJointPickPlace._nav_budget_remaining.__get__(node)
+        node._drive_pickup_fallback = lambda label, route: (
+            module.FixedJointPickPlace._drive_pickup_fallback(
+                node, label, route))
+        return node, calls
+
+    def nav_calls(self, calls):
+        return [call for call in calls if call[0] == 'nav']
+
+    def test_a_failed_leg_drives_the_route_and_then_the_goal_again(self):
+        node, calls = self._node(navigate=[False, True, True])
+        ok = module.FixedJointPickPlace._navigate_to(
+            node, 'blue_cube_5 visual handoff', self.GOAL)
+        self.assertTrue(ok)
+        labels = [call[1] for call in self.nav_calls(calls)]
+        self.assertEqual(labels, [
+            'blue_cube_5 visual handoff',
+            'blue_cube_5 visual handoff outer route',
+            'blue_cube_5 visual handoff',
+        ])
+        _, _, args, kwargs = self.nav_calls(calls)[1]
+        # The route is driven as ONE NavigateThroughPoses goal that ends on its
+        # last point, so the pickup pose itself is never the outer goal.
+        self.assertEqual(args[0], self.ROUTE[-1])
+        self.assertEqual(kwargs['chain'], self.ROUTE[:-1])
+        self.assertEqual(kwargs['completion_radius_m'], 0.35)
+        kinds = [call[0] for call in calls]
+        self.assertIn('stop', kinds, 'the base must be held after the bypass')
+        self.assertNotIn('escape', kinds, 'the bypass replaces the blind shove')
+        self.assertNotIn('back_off', kinds)
+        self.assertNotIn('clear', kinds, 'the verified bypass must not clear maps')
+
+    def test_cancel_between_bypass_and_direct_retry_does_not_resubmit(self):
+        node, calls = self._node(navigate=[False, True])
+        stop = node._stop_base
+
+        def cancel_on_stop():
+            stop()
+            node._cancel_requested = True
+
+        node._stop_base = cancel_on_stop
+        self.assertFalse(module.FixedJointPickPlace._navigate_to(
+            node, 'blue_cube_5 visual handoff', self.GOAL))
+        self.assertEqual([call[1] for call in self.nav_calls(calls)], [
+            'blue_cube_5 visual handoff', 'blue_cube_5 visual handoff outer route'])
+        self.assertNotIn('clear', [call[0] for call in calls])
+
+    def test_a_failed_route_allows_only_one_unchanged_retry(self):
+        node, calls = self._node(navigate=[False, False, False])
+        ok = module.FixedJointPickPlace._navigate_to(
+            node, 'blue_cube_5 visual handoff', self.GOAL)
+        self.assertFalse(ok)
+        labels = [call[1] for call in self.nav_calls(calls)]
+        self.assertEqual(
+            labels.count('blue_cube_5 visual handoff outer route'), 1,
+            'one outer route per pickup attempt, not one per retry',
+        )
+        self.assertEqual(len(labels), 3)
+        self.assertNotIn('clear', [call[0] for call in calls])
+        self.assertNotIn('escape', [call[0] for call in calls])
+        self.assertNotIn('back_off', [call[0] for call in calls])
+
+    def test_a_leg_already_past_the_mouth_only_retries_unchanged(self):
+        # 1.4 m from the goal, 11 m from the first outer waypoint: driving back
+        # west would be the long way round, so the detour must stand down.
+        node, calls = self._node(
+            navigate=[False, False], position=(-2.6, -10.7))
+        ok = module.FixedJointPickPlace._navigate_to(
+            node, 'blue_cube_5 visual handoff', self.GOAL)
+        self.assertFalse(ok)
+        labels = [call[1] for call in self.nav_calls(calls)]
+        self.assertNotIn('blue_cube_5 visual handoff outer route', labels)
+        self.assertEqual(len(labels), 2)
+        self.assertNotIn('escape', [call[0] for call in calls])
+        self.assertNotIn('back_off', [call[0] for call in calls])
+
+    def test_positive_planner_failure_also_qualifies(self):
+        node, calls = self._node(navigate=[False, True, True], failure='planner_no_path')
+        self.assertTrue(module.FixedJointPickPlace._navigate_to(
+            node, 'blue_cube_5 visual handoff', self.GOAL))
+        self.assertIn('outer route', self.nav_calls(calls)[1][1])
+
+    def test_unverified_or_inapplicable_failures_do_not_authorize_bypass(self):
+        for overrides in ({'failure': None}, {'failure': 'no_motion'},
+                          {'failure': 'controller_failure'}, {'failure': 'wedge_refusals'},
+                          {'failure': 'yield_arc_aborted'}, {'cost': None},
+                          {'cost': 99}, {'cost': 100}, {'local_clear': False}):
+            with self.subTest(**overrides):
+                node, _ = self._node(navigate=[], **overrides)
+                node._last_attempt_failure = overrides.get('failure', 'no_progress')
+                self.assertFalse(node._pickup_fallback_needed(self.ROUTE, self.GOAL))
+
+    def test_only_the_configured_cube_and_label_offers_a_route(self):
+        node, _ = self._node(navigate=[])
+        route = module.FixedJointPickPlace._pickup_fallback_route
+        self.assertEqual(route(node, 'blue_cube_5 visual handoff'), self.ROUTE)
+        self.assertEqual(route(node, 'blue_cube_5 pre-grasp'), self.ROUTE)
+        # The backup pose is the same pickup, so it must not buy a second route.
+        self.assertEqual(route(node, 'blue_cube_5 backup visual handoff'), [])
+        self.assertEqual(route(node, 'blue_cube_1 visual handoff'), [])
+        self.assertEqual(route(node, 'WAREHOUSE B'), [])

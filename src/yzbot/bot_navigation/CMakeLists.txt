@@ -18,6 +18,17 @@ endif()
 # find dependencies
 find_package(ament_cmake REQUIRED)
 find_package(nav2_bringup REQUIRED)
+find_package(nav2_costmap_2d REQUIRED)
+find_package(pluginlib REQUIRED)
+find_package(rclcpp REQUIRED)
+find_package(sensor_msgs REQUIRED)
+find_package(tf2 REQUIRED)
+find_package(tf2_ros REQUIRED)
+add_library(mover_snapshot_layer SHARED src/mover_snapshot_layer.cpp)
+target_compile_features(mover_snapshot_layer PRIVATE cxx_std_17)
+ament_target_dependencies(mover_snapshot_layer nav2_costmap_2d pluginlib rclcpp sensor_msgs tf2 tf2_ros)
+pluginlib_export_plugin_description_file(nav2_costmap_2d mover_snapshot_plugins.xml)
+install(TARGETS mover_snapshot_layer LIBRARY DESTINATION lib)
 install(
   DIRECTORY launch param maps config rviz
   DESTINATION share/${PROJECT_NAME}

@@ -98,16 +98,6 @@ class NavBehaviorTreeResolutionTests(unittest.TestCase):
     def setUpClass(cls):
         cls.nav = _load(NAV_LAUNCH, 'nav_bringup_portable_under_test')
 
-    def includes(self, description):
-        def walk(entities):
-            for entity in entities:
-                yield entity
-                for sub in getattr(entity, 'get_sub_entities', lambda: [])():
-                    yield sub
-        from launch.actions import IncludeLaunchDescription
-        return [a for a in walk(description.entities)
-                if isinstance(a, IncludeLaunchDescription)]
-
     def test_the_path_resolves_to_this_machines_installation(self):
         resolved = self.nav.resolve_nav_bt_xml()
         self.assertTrue(resolved, 'mybot is installed, so a path must resolve')
@@ -151,29 +141,38 @@ class NavBehaviorTreeResolutionTests(unittest.TestCase):
                 self.assertIsNotNone(root.find('.//FollowPath'))
                 self.assertIsNotNone(root.find('.//BackUp'))
 
-    def test_every_nav2_include_gets_the_rewritten_params_file(self):
-        # Six includes: stock bringup, experimental localization, three smoother
-        # experiments, and guarded yield-pause Nav2. Every mode must see the same
-        # BT path rewrite instead of silently switching to Nav2's stock tree.
+    def test_stock_and_experimental_bringup_keep_the_same_bt_rewrite(self):
         from launch import LaunchContext
-        from nav2_common.launch import RewrittenYaml
-        description = self.nav.generate_launch_description()
-        includes = self.includes(description)
-        self.assertEqual(len(includes), 6)
+        from launch.actions import DeclareLaunchArgument, IncludeLaunchDescription, OpaqueFunction
 
-        context = LaunchContext()
-        shipped = Path(self.nav.get_package_share_directory('bot_navigation')) \
-            / 'param' / 'originbot_nav2_2.yaml'
-        context.launch_configurations['params_file'] = str(shipped)
-        for include in includes:
-            arguments = dict(include.launch_arguments)
-            self.assertIn('params_file', arguments)
-            self.assertIsInstance(arguments['params_file'], RewrittenYaml)
-            rewritten = context.perform_substitution(arguments['params_file'])
-            data = yaml.safe_load(Path(rewritten).read_text(encoding='utf-8'))
-            got = data['bt_navigator']['ros__parameters'][
-                'default_nav_to_pose_bt_xml']
-            self.assertTrue(Path(got).is_file(), got)
+        for flag in (None, 'smoother_udp_experiment', 'smoother_trace_experiment',
+                     'smoother_trace_udp_experiment', 'yield_pause_mode'):
+            with self.subTest(flag=flag):
+                description = self.nav.generate_launch_description()
+                context = LaunchContext()
+                if flag:
+                    context.launch_configurations[flag] = 'true'
+                    context.launch_configurations['smoother_trace_file'] = '/tmp/trace.jsonl'
+                for entity in description.entities:
+                    if isinstance(entity, DeclareLaunchArgument):
+                        entity.execute(context)
+                    elif isinstance(entity, OpaqueFunction):
+                        for action in entity.execute(context):
+                            action.execute(context)
+                active = [e for e in description.entities if isinstance(e, IncludeLaunchDescription)
+                          and e.condition.evaluate(context)]
+                self.assertEqual(len(active), 1)
+                if flag:
+                    *arguments, child = active[0].execute(context)
+                    for action in arguments:
+                        action.execute(context)
+                    active = child.entities[0].execute(context)
+                for include in active:
+                    parameters = dict(include.launch_arguments)['params_file']
+                    rewritten = context.perform_substitution(parameters)
+                    data = yaml.safe_load(Path(rewritten).read_text(encoding='utf-8'))
+                    self.assertEqual(data['bt_navigator']['ros__parameters'][
+                        'default_nav_to_pose_bt_xml'], self.nav.resolve_nav_bt_xml())
 
     def test_the_shipped_profiles_leave_the_path_empty(self):
         # Empty is the contract with the launch file: an absolute path here is

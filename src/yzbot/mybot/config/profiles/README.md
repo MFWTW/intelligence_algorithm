@@ -21,5 +21,5 @@ ros2 run mybot start_competition.sh \
   executor_params_file:=$(ros2 pkg prefix mybot)/share/mybot/config/fixed_joint_pick_place.yaml
 ```
 
-> 注意：这三份是**部分覆盖**文件（只含需要改的键），Nav2 其余参数走默认值。
-> 这是实测跑通几十轮的形式，**不要**把它们当成完整配置去和 `originbot_nav2_2.yaml` 逐键对比。
+> 这三份文件分别作为对应 launch 参数的整份输入，不会与旧 YAML 自动合并。
+> `nav_rpp15.yaml` 依赖比赛入口的雷达中继 `/scan_stamped_now`；独立仿真入口默认仍用 MPPI。

@@ -10,10 +10,10 @@
   window together pushed the leg past its wall-clock budget while the base was
   0.14 m from the goal.
 
-  This tree keeps the same structure and retry count but recovers in about
-  4 simulated seconds: clear both costmaps, back up 0.15 m, spin 0.8 rad.
-  The `Wait` action is intentionally dropped: its `wait_duration` port is in
-  milliseconds in this Nav2 version, so the stock "5" is a no-op anyway.
+  This tree keeps the retry count and uses clear both costmaps, back up,
+  then spin as RoundRobin recovery alternatives. The configured BackUp is
+  0.50 m at 0.05 m/s, so a complete traversal takes about 10 simulated
+  seconds. Spin is configured for 0.8 rad; there is no Wait action.
 -->
 <root main_tree_to_execute="MainTree">
   <BehaviorTree ID="MainTree">

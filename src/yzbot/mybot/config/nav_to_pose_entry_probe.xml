@@ -1,0 +1,27 @@
+<!--
+  Plan-only probe for the narrow-entrance recovery: ask the global planner
+  whether a route to {goal} exists, and never command the base.
+
+  Why this exists (2026-11-21, red_cube_1 -> C): the recovery used to infer
+  "the planner refused" from a NavigateToPose that failed within a few seconds.
+  That inference is unsound twice over. A plain goal is NOT side-effect free -
+  both nav_to_pose_short_recovery.xml and nav_to_pose_yield_pause.xml wrap the
+  pipeline in a RecoveryNode that clears BOTH costmaps, then backs up 0.5 m,
+  then spins 0.8 rad - so "a fast failure" can leave the base somewhere else
+  entirely, and the next "planning refusal" is then judged from a pose the base
+  was driven to by Nav2's own recovery. And the same fast failure can come from
+  a behaviour tree that never loaded.
+
+  This tree contains exactly one action: ComputePathToPose. Success means the
+  global planner produced a route from the CURRENT start cell; failure means it
+  did not. Nothing else runs, so the answer is a property of the map and the
+  footprint at that instant, and no motion, clearing or waiting is implied.
+
+  Do not add a recovery node here: the whole point is that a probe failure says
+  "no route exists right now", not "something was tried".
+-->
+<root main_tree_to_execute="MainTree">
+  <BehaviorTree ID="MainTree">
+    <ComputePathToPose goal="{goal}" path="{path}" planner_id="GridBased"/>
+  </BehaviorTree>
+</root>

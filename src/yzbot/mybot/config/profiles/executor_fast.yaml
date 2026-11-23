@@ -37,6 +37,61 @@ fixed_joint_pick_place:
     # A lateral exit is a Nav2 goal: reject it locally if the target cell is
     # already inside the global costmap's inscribed band.
     yield_arc_costmap_check: true
+    # The apex can be outside that band while the floor between the base and
+    # that cell is not. On 2026-11-21 (block 4, red_cube_1 -> A) the arc target
+    # was clear but the carried 0.35 m envelope could not cross the 0.55 m gap:
+    # 0.94 m driven in 14.8 s, controller status 6, and the leg failed with the
+    # cube attached. Vet every cell the sidestep would cross.
+    yield_arc_path_check: true
+    yield_arc_path_start_m: 0.20
+    yield_arc_path_step_m: 0.10
+    # One lateral waypoint is <= ~1 m. Abandon it in seconds, not one 45 s leg
+    # watchdog: measured 0.70 m in 36.9 s before that round died. The total cap
+    # also rejects a slow creep that never quite stops.
+    yield_arc_progress_timeout_sec: 8.0
+    yield_arc_progress_m: 0.10
+    yield_arc_timeout_sec: 20.0
+    # After a refused/failed sidestep, hold briefly and retry the original
+    # route. A failed convenience arc must not make the carried leg terminal.
+    yield_arc_recovery_hold_sec: 1.0
+    # Go round a crossing box instead of parking for it. Movers patrol at
+    # 0.20 m/s, so a hold that waits for one to clear spent 26.75 s / 31.83 s /
+    # 42.02 s in single episodes across the 2026-11-18 rounds while the floor
+    # beside the base was empty. The detour is the same lateral waypoint
+    # `yield_arc_costmap_check` already vets, taken before the budget is spent
+    # rather than after it; a head-on box (closing faster than the value below)
+    # and anything inside the 0.75 m keep-out still stop.
+    yield_early_detour: true
+    # Only detour when driving on would need at least this long to clear the
+    # conflict - if the base clears sooner, driving on is already the answer.
+    yield_early_detour_lead_sec: 0.6
+    # A box closing on the base faster than this is not crossing it.
+    yield_early_detour_head_on_mps: 0.05
+    # Decide further out than the 1.8 m cap range: the offset needs ~0.9 m of
+    # floor beside the path, and that room usually only exists further back
+    # (detour1: the 11.3 s hold had 0.48 m of side room at 1.7 m range).
+    yield_early_detour_range_m: 3.0
+    # Predicted occupancy: at each future tick, compare the base's candidate
+    # path against the mover's predicted path (both as oriented boxes). A stop
+    # order cannot stop a box that sweeps the stop point (r53 rule 2, t=28.6 s:
+    # 0.24 m centre distance while the hold point was inside the sweep), so the
+    # candidates are compared in time and space instead of by distance alone.
+    yield_predict_enabled: true
+    yield_predict_range_m: 4.0
+    yield_predict_horizon_sec: 4.0
+    # Clearance that counts as "will not touch": 0.0 is contact, and 0.15 m is
+    # the margin the tracker and the braking curve cannot promise away.
+    yield_predict_clearance_m: 0.15
+    # The patrol footprints (/movers/obstacles, base_link) are the only way the
+    # yield layer sees a box the lidar cannot: measured detour1/detour2, the box
+    # behind an 11.3 s standstill was first seen by the laser at 1.7 m, already
+    # inside the choke, while the footprints are in view from 6 m. Used only as a
+    # yield observation (never as a costmap source), so the plan-failure storms
+    # that came from putting movers in the global costmap cannot return.
+    yield_mover_cloud_stage: true
+    yield_mover_cloud_range_m: 6.0
+    yield_mover_cloud_band_m: 1.2
+    yield_mover_cloud_timeout_sec: 0.35
     cube_name: red_cube_1
     warehouse: A
     navigation_frame: map
@@ -137,6 +192,29 @@ fixed_joint_pick_place:
     - 0.0
     - 3.141593
     red_cube_2_pickup_via_1: []
+    # blue_cube_5 is the one cube whose only approach from warehouse B runs
+    # through the 1.10 m mouth at (-4.3, -1.1). A mover parked in that mouth
+    # made the rule 3 round spend 426 s (62 %) on this single pickup: two 45 s
+    # stalls at the wall tip before the retry ladder backed off. This outer
+    # route leaves B westwards, rounds the wall at y ~ -4.4 through the 1.5 m
+    # gap at x ~ -12.9, and rejoins the goal from the west. Verified on
+    # room_from_world.pgm: waypoint clearance 1.40 / 1.01 / 0.75 m and
+    # 0.85 / 1.00 / 0.58 m straight-chord clearance. Driven at most once per
+    # pickup, only after a failed attempt, and the last leg to the pickup pose
+    # is left to the planner as usual.
+    blue_cube_5_pickup_fallback_via_1:
+    - -10.6
+    - -3.0
+    - 3.141593
+    blue_cube_5_pickup_fallback_via_2:
+    - -12.3
+    - -3.4
+    - -2.91
+    blue_cube_5_pickup_fallback_via_3:
+    - -12.95
+    - -4.45
+    - -0.2
+    pickup_fallback_enabled: true
     blue_cube_1_warehouse_b_via_1:
     - -7.321
     - -3.018
@@ -209,7 +287,12 @@ fixed_joint_pick_place:
     # costs the round.
     dock_creep_attempts: 2
     dock_creep_align_distance_m: 0.25
-    escape_distance_m: 0.7
+    # The executor owns recovery: no hidden clear/spin/back-up in Nav2.
+    guarded_navigation_recovery: false
+    escape_distance_m: 0.25
+    # Only a verified global-only inscribed start may relax. Never change local
+    # geometry or use an ordinary planner abort as a reason to shrink it.
+    stuck_relax_global_radius: true
     # 2026-11-17 A/B 结论：把无进展判据压到 25 s 并把重试预算压到 1，两轮 rule1
     # 全部 FAILED（abaz1 2/5、abaz2 0/5）——它砍掉的是“控制器零指令 45 s 后靠逃逸
     # 重试救回来”的那条路，而不是纯粹浪费的尾巴。故保持 45 s 与 retry=2 不变。
@@ -291,6 +374,14 @@ fixed_joint_pick_place:
     placement_settle_sec: 0.5
     stabilize_release: true
     arm_motion_sec: 0.6
+    # Placement-only arm timing. 0.0 means "use arm_motion_sec" and keeps the
+    # previous behaviour; only pre-place, lower, retreat and return-home use it.
+    # Measured in two isolated simulations 2026-11-18 with 0.5: 5.333 s and
+    # 5.341 s mean placement wall time (5.744 s baseline), 10/10 placements
+    # inside the zone limits, gripper timing/settle/verification unchanged.
+    # Simulation evidence only: set back to 0.0 if the real arm ever aborts a
+    # placement trajectory at this timing.
+    place_arm_motion_sec: 0.5
     gripper_motion_sec: 0.5
     settle_sec: 0.2
     home_joints:
@@ -355,6 +446,10 @@ fixed_joint_pick_place:
     # 总时长仍被交通停顿和控制器零指令卡死掩盖，所以看"在走"的均速，不看单轮总时长。
     # 同期 5 次尝试里 2 次启动失败（TF/DDS 发现）、2 次 45 s 零指令卡死，均与本改动无关。
     # 真窄口（历史 0.318 m 弦宽、现净空 0.58 m）仍在 0.8 m 半径内被 0.9 m/s 压着。
+    # 0.40 m outer shoulder: 1.50 -> 1.20 -> existing 0.90 m/s cap.
+    # The inner cap still takes effect at the original pre-brake boundary.
+    slow_zone_approach_width_m: 0.40
+    slow_zone_approach_cruise_mps: 1.50
     slow_zones:
     - 12.78
     - -3.7

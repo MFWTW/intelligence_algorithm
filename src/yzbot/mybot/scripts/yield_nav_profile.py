@@ -91,3 +91,26 @@ def guarded_profile(source):
     ) as output:
         yaml.safe_dump(params, output, sort_keys=False)
         return output.name
+
+
+def merged_executor_profile(source, overlay):
+    """Merge an executor overlay onto a profile, in a temporary file.
+
+    Used by the opt-in C-zone entrance recovery: the scored profile
+    (config/profiles/executor_fast.yaml) is loaded by
+    competition_bringup.launch.py INSTEAD OF config/fixed_joint_pick_place.yaml,
+    so enabling the recovery through the base file alone would leave a scored
+    run with the feature off while the log looked configured. The overlay is a
+    separate YAML whose keys replace the profile's, so neither file is edited.
+    """
+    params = yaml.safe_load(Path(source).read_text(encoding='utf-8'))
+    extra = yaml.safe_load(Path(overlay).read_text(encoding='utf-8'))
+    executor = params['fixed_joint_pick_place']['ros__parameters']
+    overrides = extra['fixed_joint_pick_place']['ros__parameters']
+    executor.update(overrides)
+    with tempfile.NamedTemporaryFile(
+        mode='w', encoding='utf-8', suffix='.yaml',
+        prefix='mybot_entry_recovery_executor_', delete=False,
+    ) as output:
+        yaml.safe_dump(params, output, sort_keys=False)
+        return output.name
