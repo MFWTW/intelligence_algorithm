@@ -172,6 +172,25 @@ if [ "${START_DELAY:-0}" -gt 0 ]; then
     say "holding the start gate for ${START_DELAY}s to shift mover phase"
     sleep "${START_DELAY}"
 fi
+if [ "${NO_START:-0}" = 1 ]; then
+    say "NO_START=1: gate stays closed; parking the base in a mover lane"
+    timeout 300 python3 "$ROOT/tools/park_in_lane.py" \
+        --out "$OUT/park_lane.jsonl" \
+        --mover "${PARK_MOVER:-mover_1}" \
+        --ahead "${PARK_AHEAD:-0.9}" \
+        --phase-a "${PARK_PHASE_A:-45}" \
+        --phase-b "${PARK_PHASE_B:-30}" \
+        --no-park \
+        ${PARK_GUARD_OFF:+--guard-off-phase} \
+        > "$OUT/park_lane.log" 2>&1
+    say "lane park experiment finished (rc=$?)"
+    grep -E 'PARK_SUMMARY|guard|blew up|inside the footprint' "$OUT/park_lane.log" | tail -20
+    kill -INT -"$STACK_PID" 2>/dev/null
+    sleep 5
+    kill -TERM -"$STACK_PID" 2>/dev/null
+    exit 0
+fi
+
 say "publishing /competition/start"
 timeout 30 python3 "$ROOT/tools/press_start.py" --seconds 10 \
     > "$OUT/start_pub.log" 2>&1

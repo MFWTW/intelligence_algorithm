@@ -369,13 +369,18 @@ def generate_launch_description():
     # avoidance is exercised while it fetches and delivers. Off by default so
     # timed rounds are unchanged; the matching world variant is
     # offic_room_movers.world (select it with MYBOT_WORLD_NAME).
+    # Diagnostic hook for tools/park_in_lane.py: a box can be sent down a lane
+    # that crosses the base's parked pose, so the contact guard is exercised
+    # for real. Empty keeps the competition lanes.
+    mover_patrols = os.environ.get('MYBOT_MOVER_PATROLS', '').strip()
     moving_obstacles_node = Node(
         package='mybot',
         executable='moving_obstacles.py',
         name='moving_obstacles',
         output='screen',
         condition=IfCondition(moving_obstacles),
-        parameters=[{'use_sim_time': True}],
+        parameters=[{'use_sim_time': True}]
+        + ([{'patrols': mover_patrols}] if mover_patrols else []),
     )
 
     # Rule sheet section 三: the judges' layout reads the task, progress and
