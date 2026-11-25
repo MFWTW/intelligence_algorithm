@@ -167,6 +167,21 @@ if [ "${COLLISION_PROBE:-0}" = 1 ]; then
         --max-duration 1500 --after-terminal 10 > "$OUT/probe.log" 2>&1 &
     PROBE_PID=$!
 fi
+# External supervisor: the car code decides "this leg failed" on elapsed time,
+# which cannot tell a slow but progressing base from one that is jammed. This
+# watches motion from the outside and, when the base stands still for
+# WATCH_STALL_SEC, records why and stops the round right there.
+WATCH_PID=""
+if [ "${WATCH:-0}" = 1 ]; then
+    WATCH_KILL_FLAG="--kill"
+    [ "${WATCH_KILL:-1}" = 0 ] && WATCH_KILL_FLAG=""
+    say "starting external stall watcher (stall ${WATCH_STALL_SEC:-15}s, ${WATCH_KILL_FLAG:-observe only})"
+    python3 "$ROOT/tools/watcher.py" --run-dir "$OUT" \
+        --stall-sec "${WATCH_STALL_SEC:-15}" \
+        --kill-after "${WATCH_KILL_AFTER:-30}" $WATCH_KILL_FLAG \
+        > "$OUT/watcher.log" 2>&1 &
+    WATCH_PID=$!
+fi
 sleep 4
 if [ "${START_DELAY:-0}" -gt 0 ]; then
     say "holding the start gate for ${START_DELAY}s to shift mover phase"
@@ -224,6 +239,10 @@ for i in $(seq 1 700); do
     if grep -qE 'State -> (COMPLETED|FAILED|ABORTED)' "$OUT/stack.log"; then
         DONE=1; break
     fi
+    if ! kill -0 "$STACK_PID" 2>/dev/null; then
+        say "stack exited before a terminal state (watcher intervention?)"
+        break
+    fi
     if ! kill -0 "$REC_PID" 2>/dev/null; then
         say "recorder stopped early"
         break
@@ -255,7 +274,7 @@ if pgrep -f "$PATTERN" >/dev/null 2>&1; then
     pkill -9 -f 'task_state_machin[e]' 2>/dev/null
     pkill -9 -f 'task_parse[r]' 2>/dev/null
 fi
-for pid in "$REC_PID" "$PROBE_PID"; do
+for pid in "$REC_PID" "$PROBE_PID" "$WATCH_PID"; do
     [ -n "$pid" ] && kill -INT "$pid" 2>/dev/null && wait "$pid" 2>/dev/null || true
 done
 pgrep -a -f "$PATTERN" | grep -v start_competition > "$OUT/leftovers_after.txt" || true
@@ -263,5 +282,8 @@ say "leftovers after: $(wc -l < "$OUT/leftovers_after.txt")"
 
 # ------------------------------------------------------------ 8. summary
 say "TIMING lines: $(grep -c 'TIMING ' "$OUT/stack.log" || true)   resident goals: $(grep -c 'Resident goal' "$OUT/stack.log" || true)   exec results: $(grep -c 'Executor result' "$OUT/stack.log" || true)   YIELD: $(grep -cE 'YIELD (go|cap|arc|stop)' "$OUT/stack.log" || true)"
+if [ -n "$WATCH_PID" ]; then
+    say "watcher: $(grep -c 'STALL #' "$OUT/watcher.log" 2>/dev/null || echo 0) stall(s), see $OUT/watcher/"
+fi
 say "events: $(wc -l < "$OUT/events.jsonl" 2>/dev/null || echo 0) lines"
 say "done"

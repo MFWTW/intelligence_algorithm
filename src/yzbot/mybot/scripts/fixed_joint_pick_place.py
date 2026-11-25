@@ -818,6 +818,18 @@ class FixedJointPickPlace(Node):
         self.declare_parameter('yield_obstacle_half_width_m', 0.11)
         self.declare_parameter('yield_detection_range_m', 2.5)
         self.declare_parameter('yield_track_range_m', 4.0)
+        # The whole mover policy: one circle around the base centre. Inside it
+        # the base waits, outside it the base drives on. 0.0 restores the old
+        # band/prediction/arc policy (kept for comparison, not for races).
+        self.declare_parameter('yield_simple_radius_m', 1.5)
+        # Only the half of that circle in front of the base is a reason to wait:
+        # a box behind cannot be driven into. False restores the literal circle.
+        self.declare_parameter('yield_simple_front_only', True)
+        # Width of the cone ahead that counts as "in the way": +/-50 deg (100
+        # total). A box grazing the rim of the half circle no longer stops the
+        # base, while the 50-60 deg corner that cost one 1.1 cm overlap at +/-45
+        # is still covered (2026-11-25). 180 restores the whole front half.
+        self.declare_parameter('yield_simple_fov_deg', 100.0)
         self.declare_parameter('yield_cap_range_m', 1.8)
         self.declare_parameter('yield_stop_range_m', 1.2)
         self.declare_parameter('yield_cap_speed_mps', 0.8)
@@ -846,7 +858,8 @@ class FixedJointPickPlace(Node):
         # How much time must be left between "the base is past" and "the box
         # enters the corridor": the sensing/control latency of this stack.
         self.declare_parameter('yield_clear_margin_sec', 0.3)
-        self.declare_parameter('yield_wait_budget_sec', 20.0)
+        # 15 s matches the external stall watchdog (2026-11-25).
+        self.declare_parameter('yield_wait_budget_sec', 15.0)
         self.declare_parameter('yield_arc_offset_m', 0.55)
         self.declare_parameter('yield_arc_apex_m', 0.8)
         self.declare_parameter('yield_arc_goal_radius_m', 0.35)
@@ -1209,6 +1222,12 @@ class FixedJointPickPlace(Node):
             detection_range_m=float(
                 self.get_parameter('yield_detection_range_m').value),
             track_range_m=float(self.get_parameter('yield_track_range_m').value),
+            simple_radius_m=float(
+                self.get_parameter('yield_simple_radius_m').value),
+            simple_radius_front_only=bool(
+                self.get_parameter('yield_simple_front_only').value),
+            simple_radius_fov_deg=float(
+                self.get_parameter('yield_simple_fov_deg').value),
             cap_range_m=float(self.get_parameter('yield_cap_range_m').value),
             stop_range_m=float(self.get_parameter('yield_stop_range_m').value),
             cap_speed_mps=float(
@@ -2920,6 +2939,23 @@ class FixedJointPickPlace(Node):
             return False
         return True
 
+    def _hold_outcome_text(self) -> str:
+        """Describe why a traffic hold ended the way it did.
+
+        A hold whose release is never verified used to fail the leg with no
+        explanation at all: the only trace was a TIMING line. These four fields
+        separate the cases that look identical from outside - the policy never
+        released (holds=True), it released but the corridor was never verified
+        (holds=False, cleared=False), or it gave up on its own budget
+        (reason='timed out waiting for the corridor').
+        """
+        report = getattr(self, '_last_hold_report', None)
+        if report is None:
+            return 'held_for=? holds=? cleared=? reason=?'
+        held_for, cleared, holds, reason = report
+        return (f'held_for={held_for:.1f}s holds={holds} cleared={cleared} '
+                f'reason={reason!r}')
+
     def _hold_until_clear_retained(
         self, label, x, y, deadline, goal_handle, result_future, response_timeout,
     ) -> bool:
@@ -2961,6 +2997,14 @@ class FixedJointPickPlace(Node):
                         self._yield_decision.reason == obstacle_yield.REASON_WAIT_EXPIRED):
                     break
             held_for = time.monotonic() - started
+            self._last_hold_report = (
+                held_for,
+                bool(not self._yield_decision.holds
+                     and not getattr(self, '_cancel_requested', False)
+                     and rclpy.ok()),
+                bool(self._yield_decision.holds),
+                str(self._yield_decision.reason),
+            )
             if (getattr(self, '_cancel_requested', False) or not rclpy.ok()
                     or time.monotonic() >= hold_deadline or result_future.done()
                     or self._yield_decision.holds or self._yield_arc_goal is not None):
@@ -3069,6 +3113,9 @@ class FixedJointPickPlace(Node):
         cleared = (rclpy.ok()
                    and not getattr(self, '_cancel_requested', False)
                    and not self._yield_decision.holds)
+        self._last_hold_report = (
+            held_for, bool(cleared), bool(self._yield_decision.holds),
+            str(self._yield_decision.reason))
         if cleared and held_for > 0.0:
             leg_deadline = getattr(self, '_nav_leg_deadline', None)
             if leg_deadline is not None:
@@ -3093,6 +3140,8 @@ class FixedJointPickPlace(Node):
             deadline = leg_deadline if deadline is None else min(leg_deadline, deadline)
         if deadline is not None and time.monotonic() >= deadline:
             self._last_attempt_failure = 'deadline'
+            self.get_logger().warning(
+                f'{label}: resume refused, the leg deadline is already spent.')
             return None
         if getattr(self, '_cancel_requested', False):
             self._stop_base()
@@ -3439,6 +3488,11 @@ class FixedJointPickPlace(Node):
                         label, x, y, deadline, goal_handle, result_future,
                         response_timeout,
                     ):
+                        self.get_logger().warning(
+                            f'{label}: the retained hold never confirmed a '
+                            'clear corridor; failing the attempt '
+                            f'({self._hold_outcome_text()}).'
+                        )
                         deadline_expired()
                         return False
                     # A cleared hold gave the waiting time back to the leg;
@@ -3457,6 +3511,10 @@ class FixedJointPickPlace(Node):
                     min(5.0, response_timeout), deadline=deadline,
                 )
                 if not self._hold_until_clear(label, x, y, deadline):
+                    self.get_logger().warning(
+                        f'{label}: the hold never confirmed a clear corridor '
+                        f'({self._hold_outcome_text()}); failing the attempt.'
+                    )
                     deadline_expired()
                     return False
                 # A cleared hold gives the waiting time back to the leg (see
@@ -3470,13 +3528,18 @@ class FixedJointPickPlace(Node):
                     # is already cancelled; hand the pending arc to _navigate_to
                     # instead of resuming a goal just to cancel it immediately.
                     self.get_logger().warning(
-                        f'{label}: mover hold budget spent; taking the yield arc.'
+                        f'{label}: mover hold budget spent; taking the yield '
+                        f'arc ({self._hold_outcome_text()}).'
                     )
                     return False
                 # Rebuild from the REMAINING waypoints: the base may have
                 # reached one or two of them while it was held, and re-sending
                 # the whole chain would send it back to the first one.
                 if deadline_expired():
+                    self.get_logger().warning(
+                        f'{label}: leg deadline expired while resuming after a '
+                        f'hold; failing the attempt ({self._hold_outcome_text()}).'
+                    )
                     return False
                 goal, client = self._nav_goal(
                     values, self._remaining_chain(chain), behavior_tree=behavior_tree,
@@ -3485,6 +3548,11 @@ class FixedJointPickPlace(Node):
                     label, goal, response_timeout, client, deadline=deadline,
                 )
                 if resumed is None:
+                    self.get_logger().warning(
+                        f'{label}: could not resume the goal after a hold '
+                        f'(failure={self._last_attempt_failure!r}, '
+                        f'{self._hold_outcome_text()}); failing the attempt.'
+                    )
                     return False
                 goal_handle, result_future = resumed
                 # A deliberate yield is not evidence of a navigation stall.
@@ -4042,7 +4110,16 @@ class FixedJointPickPlace(Node):
                     break
                 clearance = self._entry_scan_clearance(axis)
                 if clearance is None or clearance <= min_scan + 0.10:
-                    reason = 'scan clearance not verified'
+                    # Name the measured room, not just the verdict: on the
+                    # 2026-11-25 rule-3 round both band-escape attempts reported
+                    # this line while a patrol box stood 0.20 m off the flank, so
+                    # "not verified" and "there really is no room on that side"
+                    # were indistinguishable in the log.
+                    reason = (
+                        'scan clearance not verified'
+                        if clearance is None else
+                        f'scan clearance {clearance:.2f} m <= '
+                        f'{min_scan + 0.10:.2f} m along the retreat axis')
                     break
                 if not self._recovery_corridor_clear(axis, 0.10):
                     # A footprint inside an inscribed band makes the swept
@@ -4146,6 +4223,30 @@ class FixedJointPickPlace(Node):
             return True
         return self._yield_arc_goal is not None
 
+    def _note_scan_refusal(self, reason: str) -> None:
+        """Say why a lidar-verified move was refused instead of refusing silently.
+
+        Measured 2026-11-25 (runs/2026-11-25_1545_rule3_holdlog): every retreat
+        reported "scan clearance not verified" while YIELD_DIAG showed
+        scan_age=0.00 s and 360 points, so the sweep itself was arriving and one
+        of the preconditions below was failing. Without this line the operator
+        cannot tell a missing sweep from a stamp that is a second into the
+        future, and the whole recovery path looks like it simply did nothing.
+        Throttled: the retreat polls this at 20 Hz.
+        """
+        now = time.monotonic()
+        if now - getattr(self, '_scan_refusal_logged_at', 0.0) < 1.0:
+            return
+        self._scan_refusal_logged_at = now
+        self.get_logger().warning(
+            f'lidar clearance not verified ({reason}); refusing to move on it.')
+
+    def _stamp_age_sec(self, msg) -> float | None:
+        stamp = self._grid_stamp(msg)
+        if stamp is None:
+            return None
+        return (self.get_clock().now().nanoseconds - stamp) * 1e-9
+
     def _entry_scan_clearance(self, direction: float) -> float | None:
         """Travel-direction clearance from a fresh scan, or None when unknown.
 
@@ -4155,15 +4256,28 @@ class FixedJointPickPlace(Node):
         """
         scan = self._scan
         if scan is None:
+            self._note_scan_refusal('no sweep received yet')
             return None
         max_age = max(0.05, float(
             self.get_parameter('entry_recovery_scan_max_age_sec').value))
         if self._scan_received_at is None:
+            self._note_scan_refusal('no arrival time recorded')
             return None
-        if (time.monotonic() - self._scan_received_at > max_age
-                or not self._recovery_stamp_fresh(scan, 0.5)
-                or not math.isfinite(scan.range_min) or scan.range_min < 0.0
-                or not math.isfinite(scan.range_max) or scan.range_max <= scan.range_min):
+        arrival_age = time.monotonic() - self._scan_received_at
+        if arrival_age > max_age:
+            self._note_scan_refusal(
+                f'arrival age {arrival_age:.2f} s > {max_age:.2f} s')
+            return None
+        if not self._recovery_stamp_fresh(scan, 0.5):
+            self._note_scan_refusal(
+                f'header stamp age {self._stamp_age_sec(scan)} s outside '
+                '[-1.00, 0.50] s')
+            return None
+        if (not math.isfinite(scan.range_min) or scan.range_min < 0.0
+                or not math.isfinite(scan.range_max)
+                or scan.range_max <= scan.range_min):
+            self._note_scan_refusal(
+                f'range bounds min={scan.range_min} max={scan.range_max}')
             return None
         return travel_clearance(
             scan.ranges, scan.angle_min, scan.angle_increment,
@@ -4712,6 +4826,72 @@ class FixedJointPickPlace(Node):
             f'{label}: leaving the band at the start pose', 0.25, 0.08, -1.0,
             leave_band=True)
 
+    def _wedged_retreat(self, label: str) -> bool:
+        """One lidar-verified retreat for a base the costgrid calls clear.
+
+        `_ensure_start_pose_outside_band` only runs when a leg starts, and it
+        only moves the base when the published grid agrees the pose is bad.
+        Measured 2026-11-25 (runs/2026-11-25_watch_rule3, loaded leg to
+        warehouse B): the leg started from a clear pose, the base drove 1 m
+        into the inflated band beside the west wall, and from there every
+        GridBased request aborted for 18 s while the behavior server answered
+        "Collision Ahead" to every backup and spin - so the leg died as
+        status=6, the executor reported "no verified recovery", and the round
+        ended with 3/5 delivered and a cube attached. The local costmap had
+        lethal cells 0.02 m from the base centre at that moment.
+        Clearance from the scan does not depend on that grid: retreat against
+        what the lidar actually sees and let the leg plan again from there.
+        """
+        if not bool(self.get_parameter('start_band_escape_enabled').value):
+            return False
+        if getattr(self, '_wedged_retreat_used', False):
+            return False
+        best_axis, best_room = -1.0, None
+        for candidate in (-1.0, 1.0):
+            try:
+                room = self._entry_scan_clearance(candidate)
+            except Exception:  # noqa: BLE001 - diagnostics must never break a leg
+                room = None
+            if room is not None and (best_room is None or room > best_room):
+                best_axis, best_room = candidate, room
+        if best_room is None or best_room < 0.35:
+            # A retreat the scan already refuses must not be attempted: that
+            # refusal is what keeps a base in a band for the rest of the round.
+            self.get_logger().warning(
+                f'{label}: the leg gave up with no verified recovery, but the '
+                'scan allows no 0.35 m retreat '
+                f'(best {best_room if best_room is not None else float("nan"):.2f} m); '
+                'not shoving the base.')
+            return False
+        self._wedged_retreat_used = True
+        self.get_logger().warning(
+            f'{label}: the leg gave up with no verified recovery; retreating '
+            f'0.25 m on lidar clearance ({best_room:.2f} m) before one last '
+            'attempt.')
+        return self._back_off(
+            f'{label}: wedged start pose', 0.25, 0.08, best_axis,
+            leave_band=True)
+
+    def _wedged_retry(self, label, values, visual_handoff_cube,
+                      completion_radius_m, chain) -> bool:
+        """Retreat on lidar clearance, then run the leg once more.
+
+        Bounded twice: `_wedged_retreat` spends its one retreat per leg, and
+        the re-entry is flagged so the second pass cannot retreat again.
+        """
+        if getattr(self, '_wedged_retry_active', False):
+            return False
+        if getattr(self, '_cancel_requested', False):
+            return False
+        if not self._wedged_retreat(label):
+            return False
+        self._wedged_retry_active = True
+        try:
+            return self._navigate_to(label, values, visual_handoff_cube,
+                                     completion_radius_m, chain)
+        finally:
+            self._wedged_retry_active = False
+
     def _navigate_once(self, label, *a, **k):
         previous = getattr(self, '_nav_leg_deadline', None)
         maximum = k.get('max_duration_sec')
@@ -5062,7 +5242,14 @@ class FixedJointPickPlace(Node):
         if stamp is None:
             return False
         age = (self.get_clock().now().nanoseconds - stamp) * 1e-9
-        return -0.05 <= age <= max_age
+        # A negative age means the sample is stamped slightly in the future,
+        # which for a monotonically increasing odom/TF stream can only be the
+        # newest sample plus clock skew -- it is not stale data.  The 50 ms
+        # window this replaces rejected exactly those samples: the 2026-11-25
+        # rule-3 runs logged "guarded retreat measured 0.00 m; stop: stale
+        # odometry" three times in a row on ages of -0.1 s to -0.28 s, so the
+        # robot never left the costmap inscribed band and the leg was aborted.
+        return -1.0 <= age <= max_age
 
     def _recovery_pose(self, frame: str):
         base = str(self.get_parameter('robot_base_link').value).lstrip('/')
@@ -5942,6 +6129,13 @@ class FixedJointPickPlace(Node):
         # resume re-sending the full chain).
         self._chain_index = 0
         self._relax_used = False
+        if not getattr(self, '_wedged_retry_active', False):
+            # One lidar-verified retreat per leg: the retry that consumes it
+            # re-enters here and must not arm a second one.
+            self._wedged_retreat_used = False
+            # Drop the previous leg's hold report so a leg that fails without
+            # any hold cannot quote the leg before it.
+            self._last_hold_report = None
         try:
             self._log_cube_positions(f'before:{label}')
             attempt = 0
@@ -6191,6 +6385,16 @@ class FixedJointPickPlace(Node):
                 # One unchanged retry may ride out a transient refusal. A
                 # generic Nav2 abort is not evidence for a geometry change.
                 unchanged_retry_used = True
+            # Every configured attempt is spent. The grid cannot be trusted
+            # here - this is exactly the state where NavFn refuses to start and
+            # Nav2 refuses to back out - so ask the scan instead, free the pose
+            # and give the leg one more pass before the round is lost.
+            # (getattr: the unit-test stubs bind only the methods they exercise.)
+            wedged_retry = getattr(self, '_wedged_retry', None)
+            if (wedged_retry is not None
+                    and wedged_retry(label, values, visual_handoff_cube,
+                                     completion_radius_m, chain)):
+                return True
             return False
         finally:
             self._nav_leg_deadline = previous_deadline

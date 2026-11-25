@@ -1,0 +1,16 @@
+round,run,obj,zone,attempt,delivered,total,nav,creep,vision,arm
+r1,2026-11-25_1113_rule1,red_cube_1,C,1,True,54.9,30.8,6.4,8.0,9.5
+r1,2026-11-25_1113_rule1,red_cube_5,C,1,True,46.0,24.9,5.6,5.9,9.5
+r1,2026-11-25_1113_rule1,blue_cube_3,A,1,True,43.2,23.9,4.1,5.7,9.5
+r1,2026-11-25_1113_rule1,blue_cube_4,A,1,True,63.0,40.2,7.4,5.8,9.5
+r1,2026-11-25_1113_rule1,blue_cube_5,A,1,True,69.6,47.9,6.5,5.5,9.5
+r2,2026-11-25_1113_rule2,blue_cube_1,B,1,True,44.2,25.0,3.9,5.6,9.5
+r2,2026-11-25_1113_rule2,blue_cube_2,B,1,True,63.4,43.6,4.1,6.2,9.5
+r2,2026-11-25_1113_rule2,red_cube_1,A,1,True,56.0,33.8,6.5,6.1,9.5
+r2,2026-11-25_1113_rule2,red_cube_2,A,1,True,50.0,27.0,7.7,5.7,9.5
+r2,2026-11-25_1113_rule2,red_cube_5,A,1,True,98.2,57.8,25.1,5.8,9.5
+r3,2026-11-25_1143_rule3_slimshell,red_cube_1,C,1,True,52.3,28.9,6.2,7.6,9.5
+r3,2026-11-25_1143_rule3_slimshell,blue_cube_1,B,1,True,45.5,26.8,3.4,5.7,9.5
+r3,2026-11-25_1143_rule3_slimshell,blue_cube_2,B,1,True,48.4,29.3,3.8,5.7,9.5
+r3,2026-11-25_1143_rule3_slimshell,blue_cube_5,B,1,True,59.8,40.1,4.5,5.7,9.5
+r3,2026-11-25_1143_rule3_slimshell,blue_cube_3,B,1,True,54.4,36.4,2.5,5.9,9.5

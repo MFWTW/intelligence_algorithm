@@ -78,6 +78,32 @@ class YieldConfig:
     detection_range_m: float = 2.5
     # A tracked obstacle beyond this is somebody else's problem.
     track_range_m: float = 4.0
+    # 2026-11-25 operator rule: a single circle around the base centre. A box
+    # inside it means "wait", a box outside it means "drive on and ignore it" -
+    # no swept band, no prediction, no lane test, no arc. Those rules each
+    # answered a narrower question ("is it in my planned path") and their sum
+    # was unpredictable: measured 2026-11-25
+    # (runs/2026-11-25_1552_rule3_scandiag) a box stopped dead 0.40 m away still
+    # produced a 19.8 s hold, the carrying leg expired, and the round ended 3/5
+    # without the box ever moving again.
+    # 0.0 here is the *library* default so the band/prediction policy below stays
+    # tested as the reference implementation; the competition node declares this
+    # as 1.5 m (``yield_simple_radius_m`` in fixed_joint_pick_place.py), so the
+    # base that runs a round uses the circle.
+    simple_radius_m: float = 0.0
+    # Only the front half of that circle counts. A box behind the base cannot be
+    # driven into, so it must not stop the base; 2026-11-25 measured a third of
+    # the circle's stops going to boxes behind (see ``simple_radius_m``).
+    # False is the literal full circle the operator first described.
+    simple_radius_front_only: bool = True
+    # Width of the cone ahead, in degrees, that counts as "in the way": the
+    # operator asked for +/-50 degrees on 2026-11-25. The front half alone
+    # stopped the base for a box at nearly 90 degrees to the side (a patrol box
+    # grazing the rim while the base drove past it), and +/-45 measured one
+    # 1.1 cm corner overlap in three rounds (runs/2026-11-25_1748_cone_m1,
+    # mover_4 at 50-60 degrees off the nose), so the cone was widened to
+    # +/-50/100. 180 restores the literal front half.
+    simple_radius_fov_deg: float = 100.0
     # Predict at most this far ahead. The base covers 2.25 m at 1.5 m/s, but a
     # box that only clears the corridor in 6 s is still outside the base's
     # braking window: the decision can be revised every control tick.
@@ -693,6 +719,55 @@ def decide(
                              detail=f'scan age {obs.scan_age_sec:.2f} s')
 
     rng = obs.range_m()
+    if cfg.simple_radius_m > 0.0:
+        # The whole mover policy in one line: a circle of ``simple_radius_m``
+        # around the base centre, and (by default) only its front half. A box
+        # inside the front semicircle means "wait"; anything else means "drive
+        # on". No velocity, no prediction, no lane test, no arc.
+        # The front half is not decoration: measured 2026-11-25 over three
+        # rounds of the full circle (runs/2026-11-25_1640_circle_m1..m3, all
+        # 5/5) 15/45/29 of the 43/107/118 stops were for boxes *behind* the
+        # base, and the three rounds cost 305/391/369 s of object time against
+        # 299/315/264 s before the circle existed. A box behind cannot be
+        # driven into, so it must not cost a stop.
+        # Stale scans are handled above, so this never freezes the base on old
+        # evidence: the box's own motion decides when it leaves the circle.
+        # The cone is the same argument one step further: a box outside
+        # +/-fov/2 cannot be driven into either, so a box grazing the rim of the
+        # half circle must not cost a stop (operator observation, 2026-11-25).
+        # It only narrows the front-half rule; asking for the literal full circle
+        # (``simple_radius_front_only=False``) still means every direction.
+        bearing_deg = math.degrees(math.atan2(obs.box_y, obs.box_x))
+        if cfg.simple_radius_front_only:
+            ahead = obs.box_x > 0.0
+            in_cone = (abs(bearing_deg) <= 0.5 * cfg.simple_radius_fov_deg
+                       if 0.0 < cfg.simple_radius_fov_deg < 180.0 else True)
+        else:
+            ahead = in_cone = True
+        if ahead and in_cone and rng <= cfg.simple_radius_m:
+            return YieldDecision(
+                ACTION_STOP, REASON_WAIT,
+                detail=(f'mover at {rng:.2f} m, bearing {bearing_deg:+.0f} deg, '
+                        f'inside the {cfg.simple_radius_m:.2f} m circle and the '
+                        f'{cfg.simple_radius_fov_deg:.0f} deg cone ahead; '
+                        'waiting for it to clear'),
+            )
+        if rng <= cfg.simple_radius_m:
+            if ahead:
+                why = (f'outside the {cfg.simple_radius_fov_deg:.0f} deg cone '
+                       f'(bearing {bearing_deg:+.0f} deg)')
+            else:
+                why = f'behind the base (x={obs.box_x:+.2f} m)'
+            return YieldDecision(
+                ACTION_GO, REASON_CLEAR,
+                detail=(f'mover at {rng:.2f} m inside the circle but {why}; '
+                        'driving on'),
+            )
+        return YieldDecision(
+            ACTION_GO, REASON_CLEAR,
+            detail=(f'mover at {rng:.2f} m outside the '
+                    f'{cfg.simple_radius_m:.2f} m circle'),
+        )
     if (cfg.approach_trial_enabled
             and (obs.box_vx is None or obs.box_vy is None)):
         if obs.box_x < 0.0 or rng > 4.0:

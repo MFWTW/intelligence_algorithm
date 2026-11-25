@@ -1,0 +1,18 @@
+--- a/src/yzbot/mybot/scripts/fixed_joint_pick_place.py	2026-11-25 11:32:06.470941965 +0800
++++ b/src/yzbot/mybot/scripts/fixed_joint_pick_place.py	2026-11-25 11:32:06.484940985 +0800
+@@ -5062,7 +5062,14 @@
+         if stamp is None:
+             return False
+         age = (self.get_clock().now().nanoseconds - stamp) * 1e-9
+-        return -0.05 <= age <= max_age
++        # A negative age means the sample is stamped slightly in the future,
++        # which for a monotonically increasing odom/TF stream can only be the
++        # newest sample plus clock skew -- it is not stale data.  The 50 ms
++        # window this replaces rejected exactly those samples: the 2026-11-25
++        # rule-3 runs logged "guarded retreat measured 0.00 m; stop: stale
++        # odometry" three times in a row on ages of -0.1 s to -0.28 s, so the
++        # robot never left the costmap inscribed band and the leg was aborted.
++        return -1.0 <= age <= max_age
+ 
+     def _recovery_pose(self, frame: str):
+         base = str(self.get_parameter('robot_base_link').value).lstrip('/')

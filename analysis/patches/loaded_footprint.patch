@@ -1,0 +1,20 @@
+--- a/src/yzbot/mybot/config/fixed_joint_pick_place.yaml	2026-11-25 11:40:23.813706564 +0800
++++ b/src/yzbot/mybot/config/fixed_joint_pick_place.yaml	2026-11-25 11:42:39.793864695 +0800
+@@ -134,9 +134,15 @@
+     robot_base_link: base_footprint
+     empty_robot_radius_m: 0.32
+     empty_inflation_radius_m: 0.55
++    # 2026-11-25: the loaded shell used to be 0.35 control / 0.45 planning,
++    # 27% fatter than the real chassis (0.41 x 0.37 m box -> 0.276 m half
++    # diagonal).  rule 3 stalled 18 s at (-3.10,-0.36) where the nearest
++    # occupied cell is 0.36 m away: 153 RPP collision refusals, then the
++    # escape's swept check refused too, and the round died 3/5.  The shell is
++    # now 0.30 control / 0.35 planning, still 8% above the real half diagonal.
+     global_radius_margin_m: 0.10
+-    loaded_robot_radius_m: 0.35
+-    loaded_inflation_radius_m: 0.6
++    loaded_robot_radius_m: 0.28
++    loaded_inflation_radius_m: 0.45
+     robot_attach_link: link6
+     cube_link: link
+     require_system_ready: true

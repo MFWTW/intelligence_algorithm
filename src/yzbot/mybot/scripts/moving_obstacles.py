@@ -267,14 +267,21 @@ class MovingObstacles(Node):
         # 130 s trace (run_logs/yield3_131041) and deadlocked the base in front
         # of it.
         self.declare_parameter('robot_clearance_m', DEFAULT_CLEARANCE_M)
-        # Hard limit: the box is not served a pose that would put it inside this
-        # distance of the base origin. 0.42 m = base circle 0.20 m + box half
-        # diagonal sqrt(2)*0.11 = 0.156 m + a 6 cm margin, i.e. the box stops
-        # just before the surfaces touch. Contact between the kinematic box and
-        # the dynamic base is what blew the simulation up on 2026-11-23 (see
-        # _contact_guard_holds); unlike robot_clearance_m this one does gate the
-        # motion, but only in the last few centimetres.
-        self.declare_parameter('contact_guard_m', 0.42)
+        # Off by default since 2026-11-25 (operator decision): the patrol boxes
+        # are the VENUE's obstacles, so they must never be made to wait for this
+        # robot. A guard that rewinds the box every tick below this distance
+        # turned into a mutual deadlock instead of a safety net - measured that
+        # day on runs/2026-11-25_1552_rule3_scandiag, warehouse B: mover_4 was
+        # held at 0.40 m (guard 0.42 m) for 18 s while the base waited 19.8 s
+        # inside an inscribed band it could not retreat out of, so the carrying
+        # leg expired and the round ended 3/5 with the box never moving again.
+        # If a box does shove the base, that is the base's problem to avoid: the
+        # honest outcome (a shove, a lost leg) is worth more than a deadlock
+        # that cannot happen in the real venue, where the boxes keep patrolling.
+        # Set this to 0.42 m again only to reproduce the old physics blow-up
+        # (2026-11-23 ..._holdfix1: 0.17-0.26 m overlap for 2.5 s, base flung at
+        # 3.4 m/s).
+        self.declare_parameter('contact_guard_m', 0.0)
         self.declare_parameter('spawn_on_start', True)
         # The first box is requested while Gazebo is still inserting the robot
         # and its plugins, and that request loses the race ("Entity pushed to
@@ -446,22 +453,25 @@ class MovingObstacles(Node):
             self._publish_obstacle_cloud()
 
     def _contact_guard_holds(self, patrol, previous):
-        """Stop one step short of touching the base, and put the box back.
+        """Freeze the box one step short of the base - DISABLED by default now.
 
-        A kinematic box is an infinite-mass body, and its pose is served every
-        tick, so when it is driven into the dynamic base it keeps advancing
-        regardless of the contact. Measured 2026-11-23 on ..._holdfix1: a box
-        was 0.17-0.26 m from the base origin (the surfaces overlapped) for
-        2.5 s and Gazebo then blew up - the base reached 3.4 m/s, yaw spun, and
-        the round was lost. Two other rounds in the same series (probe,
-        round3_rule3) show the same "mover next to the base, then explosion"
-        pattern, so the box must never be teleported into the base.
+        Kept because the physics is real: a kinematic box is an infinite-mass
+        body served every tick, so when it is driven into the dynamic base it
+        keeps advancing regardless of the contact. Measured 2026-11-23 on
+        ..._holdfix1: a box 0.17-0.26 m from the base origin (surfaces
+        overlapping) for 2.5 s and Gazebo blew up - the base reached 3.4 m/s,
+        yaw spun, round lost.
 
-        This is NOT the old 0.75 m "yield to the base" bubble that deadlocked
-        the base (run_logs/yield3_131041): the box only pauses in the last
-        ``contact_guard_m`` before a collision, which is well inside the range
-        where the base is already yielding or refusing, and it resumes as soon
-        as the base is clear.
+        But it is NOT a traffic rule, and "it resumes as soon as the base is
+        clear" assumed the base would clear. Measured 2026-11-25 on
+        runs/2026-11-25_1552_rule3_scandiag (warehouse B): the base stood inside
+        an inscribed band it could not retreat out of, the guard held mover_4 at
+        0.40 m for 18 s, the base waited 19.8 s for a box that would never move
+        again, the carrying leg failed and the round ended 3/5. The venue's
+        boxes patrol on their own schedule, so this robot must never be the
+        reason one stops: ``contact_guard_m`` now defaults to 0.0 and the box
+        keeps going. If it shoves the base, that is the outcome to design
+        against (get out of the lane), not one to hide behind a deadlock.
         """
         guard = max(0.0, float(self.get_parameter('contact_guard_m').value))
         if guard <= 0.0 or self._robot_xy is None:

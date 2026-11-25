@@ -20,7 +20,13 @@ fixed_joint_pick_place:
     yield_clear_margin_sec: 0.3
     # Detect the 0.08 m/s patrols but exclude measured 0.86+ m/s phantom tracks.
     yield_max_mover_speed_mps: 0.6
-    yield_wait_budget_sec: 20.0
+    # 2026-11-25 operator decision: one wait budget, 15 s, unchanged - the
+    # same number as the external stall watchdog, so "held too long" means
+    # one thing in both places. Measured cost of the old 20 s with the
+    # 1.5 m circle (runs/2026-11-25_1700_front_m2): a box patrolling into
+    # its lane end kept the base inside the circle for exactly 20.0 s, the
+    # carrying leg failed, and the round ended 1/5.
+    yield_wait_budget_sec: 15.0
     # Pinned for the same reason as the three above. These decide where a hold
     # is allowed to park and when it may end, measured against mover_3 on
     # 2026-11-15: at 0.5 m the base held 0.72 m from the box, the box still
@@ -246,14 +252,18 @@ fixed_joint_pick_place:
     # 全局规划额外余量：0.0 时 NavFn 会贴着车体半径（内切带 253）走，RPP 的
     # 前向投影弧随即拒绝，表现为墙角静止 18 s + 后退重试。受控试验量化后取 0.10。
     global_radius_margin_m: 0.10
-    loaded_robot_radius_m: 0.35
-    loaded_inflation_radius_m: 0.6
+    loaded_robot_radius_m: 0.28
+    loaded_inflation_radius_m: 0.45
     robot_attach_link: link6
     cube_link: link
     require_system_ready: true
     ready_timeout_sec: 180.0
     action_timeout_sec: 30.0
-    navigation_timeout_sec: 300.0
+    # Backstop only, not a verdict: a leg must not fail because it took long
+    # (2026-11-25 decision). The real stall authority is the external watcher
+    # (tools/watcher.py, 15 s inside a 0.5 m box); this number only keeps a
+    # leg from running for ever when nothing else is watching.
+    navigation_timeout_sec: 1800.0
     navigation_accept_radius_m: 0.22
     navigation_accept_yaw_rad: 0.79
     navigation_accept_hold_sec: 1.0
