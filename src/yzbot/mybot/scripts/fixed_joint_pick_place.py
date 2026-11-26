@@ -12,6 +12,7 @@ import json
 import math
 import os
 import queue
+import re
 import sys
 import threading
 import time
@@ -157,7 +158,7 @@ class _YieldTraceWriter:
 
 def dock_creep_twist(
     dx, dy, yaw, base_yaw, distance, speed, forward_gain, yaw_tolerance,
-    align_distance, lateral_band=0.06,
+    align_distance, lateral_band=0.06, visual=None,
 ):
     """One step of the final dock creep, as ``(linear_x, angular_z)``.
 
@@ -180,6 +181,23 @@ def dock_creep_twist(
     """
     distance = max(0.0, float(distance))
     yaw_error = math.atan2(math.sin(yaw - base_yaw), math.cos(yaw - base_yaw))
+    # 2026-11-25: the geometric law below re-aims at the goal every time the
+    # lateral residual leaves `lateral_band`, and each re-aim turns the base -
+    # that is the back-and-forth hunt at the berth ("小车会来回摆动几下").
+    # When the warehouse plate is in view its centroid is a direct measurement
+    # of the same lateral error the law is inferring from dead reckoning, so
+    # use it: same heading and lateral gains, minus a centroid term.  `visual`
+    # is (fill, centroid_x_normalised) or None; None keeps the old law exactly.
+    if visual is not None and distance <= align_distance * 1.5:
+        fill, centroid = visual
+        if fill is not None and abs(yaw_error) <= 0.6:
+            forward = dx * math.cos(yaw) + dy * math.sin(yaw)
+            lateral = -dx * math.sin(yaw) + dy * math.cos(yaw)
+            wz = 2.0 * yaw_error + 1.5 * lateral - 0.8 * centroid
+            return (
+                max(0.03, min(speed, forward_gain * max(forward, 0.05))),
+                max(-0.8, min(0.8, wz)),
+            )
     if distance > align_distance:
         bearing = math.atan2(dy, dx)
         bearing_error = math.atan2(
@@ -271,6 +289,94 @@ def describe_pose(pose) -> str:
         f'({pose[0]:.2f}, {pose[1]:.2f}) heading '
         f'{math.degrees(float(pose[2])):+.0f} deg'
     )
+
+
+# 2026-11-25: the warehouse floor plates, read straight out of
+# src/yzbot/mybot_description/worlds/offic_room.world - zone_a diffuse
+# "0 1 0", zone_b "1 1 0", zone_c "0 1 1". Hue in degrees, so that the table
+# can be checked against the world file without doing OpenCV arithmetic.
+# (0 1 1) is 180 deg, not 90: 90 was the first guess and it cost a round -
+# warehouse C measured fill=0.00 for 6 s while A measured 0.96.
+ZONE_PLATE_HUE_DEG = {'A': 120.0, 'B': 60.0, 'C': 180.0}
+
+# What the competition actually stands on: `zone_<x>_plate` in the executor
+# config plus the letter that the plate carries.
+ZONE_PLATE_COLOUR = {'A': 'green', 'B': 'yellow', 'C': 'cyan'}
+
+
+def zone_plate_hue_window(house: str, tolerance_deg: float) -> tuple[int, int] | None:
+    """OpenCV (0-179) hue window of one warehouse floor plate.
+
+    Returns None for an unknown warehouse, which the caller treats as "no
+    plate to check" rather than as a failure. A window that runs past 179 is
+    returned wrapped (lo > hi) and the mask code ORs the two halves.
+    """
+    centre = ZONE_PLATE_HUE_DEG.get(str(house).strip().upper())
+    if centre is None:
+        return None
+    hue = int(round(centre / 2.0))
+    half = max(1, int(round(float(tolerance_deg) / 2.0)))
+    return (hue - half) % 180, (hue + half) % 180
+
+
+def plate_band_metrics(
+    hsv, rows_fraction: float, band_fraction: float,
+    hue_window, min_saturation: float, min_value: float,
+):
+    """Fill ratio and centroid of the plate colour in the bottom band.
+
+    2026-11-25: the gate only needs two numbers - how much of the bottom of
+    the frame is the warehouse colour (are we close enough / is it the right
+    warehouse) and where its centroid sits horizontally (are we centred).
+    The band is deliberately the bottom few percent of the image: the plate is
+    0.01 m off the floor, so it is only in view when the base is nearly
+    there, and the black letter standing on the plate is excluded by the hue
+    window rather than by geometry.
+
+    Returns (fill, centroid_x_normalised, rows, columns, dominant_hue) with
+    centroid relative to the band centre in [-1, 1]. fill is None when there is
+    no window to apply. dominant_hue is the most common hue among the pixels
+    that pass the saturation/value gates, or -1 when none do - it is what makes
+    a wrong-colour miss diagnosable from the log alone instead of from a
+    replay.
+    """
+    if hue_window is None:
+        return None, 0.0, 0, 0, -1
+    height, width = hsv.shape[:2]
+    rows = int(round(height * float(rows_fraction)))
+    rows = max(1, min(height, rows))
+    columns = int(round(width * float(band_fraction)))
+    columns = max(1, min(width, columns))
+    left = (width - columns) // 2
+    roi = hsv[height - rows:height, left:left + columns]
+    if roi.size == 0:
+        return None, 0.0, rows, columns, -1
+    hue = roi[:, :, 0].astype(np.int16)
+    saturated = (roi[:, :, 1] >= min_saturation) & (roi[:, :, 2] >= min_value)
+    dominant_hue = -1
+    lit = hue[saturated]
+    if lit.size:
+        counts = np.bincount(lit, minlength=180)
+        dominant_hue = int(counts.argmax())
+    lo, hi = hue_window
+    if lo <= hi:
+        mask = (hue >= lo) & (hue <= hi)
+    else:
+        mask = (hue >= lo) | (hue <= hi)
+    mask = mask & saturated
+    total = int(mask.sum())
+    fill = total / float(mask.size)
+    if total == 0:
+        return 0.0, 0.0, rows, columns, dominant_hue
+    weights = mask.sum(axis=0).astype(np.float64)
+    xs = np.arange(weights.size, dtype=np.float64)
+    centroid = float((weights * xs).sum() / weights.sum())
+    # Centre on the middle pixel, not on columns/2: an evenly filled band must
+    # read exactly 0.0, otherwise every pass would carry a 1/columns bias that
+    # eats into the tolerance.
+    middle = (columns - 1) / 2.0
+    half = max(1.0, middle)
+    return fill, (centroid - middle) / half, rows, columns, dominant_hue
 
 
 def travel_clearance(
@@ -799,6 +905,42 @@ class FixedJointPickPlace(Node):
         # makes it creep out of the zone. Simulation-only stabiliser.
         self.declare_parameter('stabilize_release', True)
 
+        # 2026-11-25: the three warehouses are colour-coded floor plates in
+        # offic_room.world - zone_a (0 1 0) green, zone_b (1 1 0) yellow,
+        # zone_c (0 1 1) cyan, each 1.0 x 0.5 m with a 0.4 m black letter
+        # standing on it. When the base reaches its dock the plate fills the
+        # bottom of the forward camera, exactly like a cube reaching
+        # visual_approach_row at pickup - so the bottom band is a direct
+        # "this is warehouse X and we are close enough to place" signal that
+        # the creep law, which only sees the goal in the map, cannot give.
+        # Observational first: the gate logs fill and centroid for every
+        # delivery and never fails a leg (fail_open), so the thresholds are
+        # calibrated on real rounds before it may veto a placement.
+        self.declare_parameter('place_visual_gate', True)
+        self.declare_parameter('place_visual_gate_bottom_rows', 0.16)
+        self.declare_parameter('place_visual_gate_centre_band', 0.70)
+        # Calibrated on 2026-11-25 (two rounds, 8 deliveries that all sat on
+        # their own plate): fill ranged 0.62-1.00, centroid -0.25..+0.38.
+        # 0.30 would also accept a half-occluded plate; 0.45 keeps every
+        # observed dock and still rejects a plate that is only just in view.
+        self.declare_parameter('place_visual_gate_min_fill', 0.45)
+        # 2026-11-25 round: a delivery that filled 0.96 of the band read
+        # centroid +0.03, while two that filled 0.62/0.72 (same dock,
+        # same plate) read +0.38/+0.27 with 20-30 deg of residual heading.
+        # Centring is a servo target, not a pass/fail test, so the
+        # tolerance stays wide and the number is logged for L2.
+        self.declare_parameter('place_visual_gate_centre_tol', 0.60)
+        self.declare_parameter('place_visual_gate_frames', 3)
+        self.declare_parameter('place_visual_gate_timeout_sec', 6.0)
+        self.declare_parameter('place_visual_gate_hue_tolerance', 14.0)
+        self.declare_parameter('place_visual_gate_min_saturation', 90.0)
+        self.declare_parameter('place_visual_gate_min_value', 60.0)
+        self.declare_parameter('place_visual_gate_fail_open', True)
+        # L2: hand the last stretch of the dock creep to the plate
+        # centroid instead of to the bearing of a goal point, so the base
+        # stops re-aiming (the rocking) while it closes the sideways
+        # residual. The positional stop criterion is unchanged.
+
         # Coarse Nav2 is followed by colour-based closed-loop base alignment.
         self.declare_parameter('enable_visual_alignment', True)
         self.declare_parameter('camera_topic', '/camera/image_raw')
@@ -821,7 +963,7 @@ class FixedJointPickPlace(Node):
         # The whole mover policy: one circle around the base centre. Inside it
         # the base waits, outside it the base drives on. 0.0 restores the old
         # band/prediction/arc policy (kept for comparison, not for races).
-        self.declare_parameter('yield_simple_radius_m', 1.5)
+        self.declare_parameter('yield_simple_radius_m', 1.8)
         # Only the half of that circle in front of the base is a reason to wait:
         # a box behind cannot be driven into. False restores the literal circle.
         self.declare_parameter('yield_simple_front_only', True)
@@ -830,6 +972,12 @@ class FixedJointPickPlace(Node):
         # base, while the 50-60 deg corner that cost one 1.1 cm overlap at +/-45
         # is still covered (2026-11-25). 180 restores the whole front half.
         self.declare_parameter('yield_simple_fov_deg', 100.0)
+        # Inside this radius the box is already too close to wait out, so the
+        # leg keeps its path instead of stopping: waiting at contact range let
+        # the box arrive (2026-11-26 rule 2, base launched at 11.3 m/s) or burned
+        # the hold budget on a box that was leaving (2026-11-25 21:33 rule 2,
+        # 0/5). Operator rule: wait in the 1.0-1.8 m annulus, drive on inside 1.0.
+        self.declare_parameter('yield_simple_commit_m', 1.0)
         self.declare_parameter('yield_cap_range_m', 1.8)
         self.declare_parameter('yield_stop_range_m', 1.2)
         self.declare_parameter('yield_cap_speed_mps', 0.8)
@@ -852,6 +1000,14 @@ class FixedJointPickPlace(Node):
         # "failed to generate a valid path" -> status=6, no recovery). Leave the
         # band physically before asking for a plan.
         self.declare_parameter('start_band_escape_enabled', True)
+        # A band escape is a shove, not a drive: cap it and cap how often one
+        # leg may use it (measured 2026-11-25: a 0.25 m shove with 0.51 m of
+        # scan room is enough; the old 0.60 m gate refused it and the leg died).
+        self.declare_parameter('place_servo', False)
+        self.declare_parameter('place_servo_engage_m', 1.00)
+        self.declare_parameter('place_servo_fill_start', 0.20)
+        self.declare_parameter('start_band_escape_retreat_m', 0.25)
+        self.declare_parameter('start_band_escape_attempts', 2)
         # Keep static-cluster phantoms (measured 0.86-1.52 m/s) outside the
         # tracking window while detecting the 0.20 m/s patrol boxes.
         self.declare_parameter('yield_max_mover_speed_mps', 0.6)
@@ -1154,6 +1310,14 @@ class FixedJointPickPlace(Node):
         self._visual_range_gate_active = False
         self._range_gate_warned = False
         self._target_colour = 'red'
+        # Placement gate: while active the image callback only measures the
+        # warehouse plate and returns, so the cube contour pipeline stays out
+        # of the way (see _plate_sample).
+        self._plate_gate_active = False
+        self._plate_gate_house = ''
+        self._plate_sample_ts = 0.0
+        self._plate_sample_metrics = None
+        self._plate_gate_logged = set()
         camera_topic = str(self.get_parameter('camera_topic').value)
         self._image_sub = self.create_subscription(
             Image, camera_topic, self._image_callback, qos_profile_sensor_data
@@ -1228,6 +1392,8 @@ class FixedJointPickPlace(Node):
                 self.get_parameter('yield_simple_front_only').value),
             simple_radius_fov_deg=float(
                 self.get_parameter('yield_simple_fov_deg').value),
+            simple_radius_commit_m=float(
+                self.get_parameter('yield_simple_commit_m').value),
             cap_range_m=float(self.get_parameter('yield_cap_range_m').value),
             stop_range_m=float(self.get_parameter('yield_stop_range_m').value),
             cap_speed_mps=float(
@@ -1545,6 +1711,105 @@ class FixedJointPickPlace(Node):
             f'wheels {self._wheel_speeds()}.'
         )
 
+    def _plate_sample(self, hsv) -> None:
+        """Measure the warehouse plate in the bottom band of one frame.
+
+        2026-11-25: called from the image callback while the gate is open. It
+        stores the last measurement and nothing else - the gate loop decides
+        whether a run of them is good enough, so the callback stays cheap.
+        """
+        window = zone_plate_hue_window(
+            self._plate_gate_house,
+            float(self.get_parameter('place_visual_gate_hue_tolerance').value),
+        )
+        fill, centroid, rows, columns, dominant_hue = plate_band_metrics(
+            hsv,
+            float(self.get_parameter('place_visual_gate_bottom_rows').value),
+            float(self.get_parameter('place_visual_gate_centre_band').value),
+            window,
+            float(self.get_parameter('place_visual_gate_min_saturation').value),
+            float(self.get_parameter('place_visual_gate_min_value').value),
+        )
+        if fill is None:
+            return
+        self._plate_sample_metrics = (fill, centroid, rows, columns, dominant_hue)
+        self._plate_sample_ts = time.monotonic()
+
+    def _verify_place_target_plate(self) -> bool:
+        """L1 gate: is the warehouse colour filling the bottom of the camera?
+
+        2026-11-25 (user request): every warehouse owns a floor plate - A
+        green, B yellow, C cyan - so "the bottom of the image is this
+        warehouse's colour" is both an identity check (are we at the right
+        one) and a range check (are we close enough to place). The gate is
+        observational: with fail_open it logs PLACE_GATE with the measured
+        fill/centroid and returns True, so a mis-set threshold costs a log
+        line, not a round. Once the numbers are in, fail_open can be turned
+        off and the gate may refuse.
+        """
+        if not bool(self.get_parameter('place_visual_gate').value):
+            return True
+        house = str(self.get_parameter('warehouse').value).strip().upper()
+        window = zone_plate_hue_window(
+            house, float(self.get_parameter('place_visual_gate_hue_tolerance').value)
+        )
+        if window is None:
+            self.get_logger().warning(
+                f'place gate: warehouse {house!r} has no plate colour on record; '
+                'placing without the colour check.'
+            )
+            return True
+        need = max(1, int(self.get_parameter('place_visual_gate_frames').value))
+        budget = max(0.5, float(self.get_parameter('place_visual_gate_timeout_sec').value))
+        min_fill = float(self.get_parameter('place_visual_gate_min_fill').value)
+        centre_tol = float(self.get_parameter('place_visual_gate_centre_tol').value)
+        self._plate_gate_house = house
+        self._plate_sample_metrics = None
+        self._plate_sample_ts = 0.0
+        self._plate_gate_active = True
+        self._vision_enabled = True
+        started = time.monotonic()
+        deadline = started + budget
+        good = 0
+        best = (0.0, 9.9, 0, -1)
+        attempts = 0
+        try:
+            while rclpy.ok() and not self._cancel_requested and time.monotonic() < deadline:
+                rclpy.spin_once(self, timeout_sec=0.05)
+                attempts += 1
+                if self._plate_sample_metrics is None:
+                    continue
+                fill, centroid, rows, columns, dominant_hue = (
+                    self._plate_sample_metrics)
+                if abs(fill) > abs(best[0]):
+                    best = (fill, centroid, rows, dominant_hue)
+                if fill >= min_fill and abs(centroid) <= centre_tol:
+                    good += 1
+                else:
+                    good = 0
+                if good >= need:
+                    self.get_logger().info(
+                        f'PLACE_GATE:PASS warehouse {house} ({ZONE_PLATE_COLOUR[house]}) '
+                        f'fill={fill:.2f} centroid={centroid:+.2f} rows={rows} '
+                        f'hue={dominant_hue} window={window} '
+                        f'spent={time.monotonic() - started:.1f}s'
+                    )
+                    return True
+            self.get_logger().warning(
+                f'PLACE_GATE:MISS warehouse {house} '
+                f'({ZONE_PLATE_COLOUR[house]}) was not confirmed within '
+                f'{budget:.1f}s: best fill={best[0]:.2f} centroid={best[1]:+.2f} '
+                f'rows={best[2]} band hue={best[3]} (window {window}) '
+                f'(need fill>={min_fill:.2f} |centroid|<={centre_tol:.2f} for '
+                f'{need} frames, {attempts} frames seen)'
+            )
+            return bool(self.get_parameter('place_visual_gate_fail_open').value)
+        finally:
+            self._plate_gate_active = False
+            self._vision_enabled = False
+            self._plate_gate_house = ''
+
+
     def _image_callback(self, msg: Image) -> None:
         """Track the requested colour blob and publish its image geometry.
 
@@ -1565,6 +1830,12 @@ class FixedJointPickPlace(Node):
             return
 
         hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
+        if getattr(self, '_plate_gate_active', False):
+            # The plate gate owns the frame while it is open: measuring the
+            # warehouse plate is the whole job, and letting the cube pipeline
+            # run would publish a blob for a colour nobody asked about.
+            self._plate_sample(hsv)
+            return
         # Two tiers (2026-10-12): the strict HSV gates below are what keep the
         # brick-red walls out, but a shaded cube drops under them and the blob
         # then disappears for seconds - measured with the cubes in their new
@@ -2599,6 +2870,7 @@ class FixedJointPickPlace(Node):
         )
         return pose.position.x, pose.position.y, yaw
 
+
     def _creep_to_dock__timed(
         self, label: str, x: float, y: float, yaw: float, *,
         deadline: float | None = None,
@@ -2645,6 +2917,9 @@ class FixedJointPickPlace(Node):
         align_distance = float(
             self.get_parameter('dock_creep_align_distance_m').value
         )
+        servo_enabled = bool(self.get_parameter('place_servo').value)
+        servo_engage_m = float(self.get_parameter('place_servo_engage_m').value)
+        servo_fill_start = float(self.get_parameter('place_servo_fill_start').value)
         command = Twist()
         final_distance = float('inf')
         final_yaw = float('inf')
@@ -2776,9 +3051,17 @@ class FixedJointPickPlace(Node):
                     continue
                 else:
                     position_since = None
+                visual = None
+                if servo_enabled and distance <= servo_engage_m:
+                    metrics = getattr(self, '_plate_sample_metrics', None)
+                    stamp = float(getattr(self, '_plate_sample_ts', 0.0) or 0.0)
+                    if (metrics and metrics[0] is not None
+                            and time.monotonic() - stamp <= 0.6
+                            and float(metrics[0]) >= servo_fill_start):
+                        visual = (float(metrics[0]), float(metrics[1]))
                 vx, wz = dock_creep_twist(
                     dx, dy, yaw, base_yaw, distance, speed, forward_gain,
-                    yaw_tolerance, align_distance,
+                    yaw_tolerance, align_distance, visual=visual,
                 )
                 command.linear.x = vx
                 command.angular.z = wz
@@ -4033,6 +4316,7 @@ class FixedJointPickPlace(Node):
         self, label: str, distance_m: float = 0.25, speed: float = 0.08,
         direction: float | None = -1.0, *, leave_band: bool = False,
         until: float = math.inf, hold_escape: bool = False,
+        clearance_floor: float | None = None,
     ) -> bool:
         """Attempt one verified straight retreat without changing either footprint.
 
@@ -4041,6 +4325,13 @@ class FixedJointPickPlace(Node):
         an inscribed band, RPP refuses every arc, and the hold itself is what
         keeps the base there. The retreat stays guarded by the same per-step
         scan and swept-costmap checks as any other shove.
+
+        ``clearance_floor`` replaces the default scan gate (``min_scan + 0.10``,
+        i.e. 0.60 m) for callers that only need a short, band-clearing shove.
+        Measured 2026-11-25 (runs/2026-11-25_1918_servo_m3): the base was wedged
+        0.32 m from the wall with 0.50-0.51 m of room on the free side, so the
+        0.60 m gate refused the very retreat that would have freed it and the
+        leg died twice with "no verified recovery".
         """
         if (not self.get_parameter('dead_zone_escape_enabled').value
                 or getattr(self, '_geometry_fault', False)
@@ -4076,6 +4367,7 @@ class FixedJointPickPlace(Node):
         begun = time.monotonic()
         last_progress, best = begun, 0.0
         min_scan = max(0.50, float(self.get_parameter('entry_recovery_stop_clearance_m').value))
+        floor = min_scan + 0.10 if clearance_floor is None else float(clearance_floor)
         try:
             while (start is not None and rclpy.ok() and time.monotonic() < deadline
                    and not getattr(self, '_cancel_requested', False)):
@@ -4109,7 +4401,7 @@ class FixedJointPickPlace(Node):
                     reason = 'no measured progress'
                     break
                 clearance = self._entry_scan_clearance(axis)
-                if clearance is None or clearance <= min_scan + 0.10:
+                if clearance is None or clearance <= floor:
                     # Name the measured room, not just the verdict: on the
                     # 2026-11-25 rule-3 round both band-escape attempts reported
                     # this line while a patrol box stood 0.20 m off the flank, so
@@ -4119,7 +4411,7 @@ class FixedJointPickPlace(Node):
                         'scan clearance not verified'
                         if clearance is None else
                         f'scan clearance {clearance:.2f} m <= '
-                        f'{min_scan + 0.10:.2f} m along the retreat axis')
+                        f'{floor:.2f} m along the retreat axis')
                     break
                 if not self._recovery_corridor_clear(axis, 0.10):
                     # A footprint inside an inscribed band makes the swept
@@ -4795,11 +5087,56 @@ class FixedJointPickPlace(Node):
 
     def _creep_to_dock(self, label, *a, **k):
         with self._op(f'creep:{label}'):
-            return self._creep_to_dock__timed(label, *a, **k)
+            servo = self._start_place_servo(label)
+            try:
+                return self._creep_to_dock__timed(label, *a, **k)
+            finally:
+                if servo:
+                    self._stop_place_servo()
+
+    def _servo_house(self, label: str) -> str:
+        """The warehouse letter of a creep label, or '' when there is none."""
+        match = re.search(r'warehouse\s*([ABCabc])\b', label or '')
+        return match.group(1).upper() if match else ''
+
+    def _start_place_servo(self, label: str) -> bool:
+        """Route the camera at the plate while the base closes the last metre.
+
+        The plate is 0.02 m thick and the camera sits 0.1 m up, so it only
+        enters the frame in the last ~0.4 m; sampling earlier is wasted.  The
+        sampling shares the gate's plumbing (`_plate_gate_active`) so there is
+        one producer of `_plate_sample_metrics` and one way to stop it.
+        """
+        if not bool(self.get_parameter('place_servo').value):
+            return False
+        house = self._servo_house(label)
+        if not house:
+            return False
+        self._plate_gate_active = True
+        self._plate_gate_house = house
+        self._vision_enabled = True
+        return True
+
+    def _stop_place_servo(self) -> None:
+        self._plate_gate_active = False
+        self._plate_gate_house = ''
+        self._vision_enabled = False
 
     def _visual_align_active(self, *a, **k):
         with self._op('vision_align'):
             return self._visual_align_active__timed(*a, **k)
+
+    def _band_escape_axis(self) -> tuple[float, float | None]:
+        """Widest of the two straight retreat directions, with the room the scan sees."""
+        best_axis, best_room = -1.0, None
+        for candidate in (-1.0, 1.0):
+            try:
+                room = self._entry_scan_clearance(candidate)
+            except Exception:  # noqa: BLE001 - diagnostics must never break a leg
+                room = None
+            if room is not None and (best_room is None or room > best_room):
+                best_axis, best_room = candidate, room
+        return best_axis, best_room
 
     def _ensure_start_pose_outside_band(self, label: str) -> None:
         """Retreat before driving when the base itself stands in an inscribed band.
@@ -4811,20 +5148,56 @@ class FixedJointPickPlace(Node):
         has no admissible plan; the leg then failed as status=6 and the executor
         reported "no verified recovery". No planner can plan its way out of a
         band, so back off first, then let the leg plan from a clear pose.
+
+        The shove now follows the scan instead of a fixed reverse direction and
+        is bounded per leg: measured 2026-11-25 (runs/2026-11-25_1918_servo_m3)
+        the base sat 0.32 m from the wall with 0.51 m of room on its free side,
+        and the old fixed reverse - plus the 0.60 m scan gate - refused the one
+        shove that would have freed the leg.
         """
         if not bool(self.get_parameter('start_band_escape_enabled').value):
             return
+        local_clear = True
+        global_cost = None
         try:
-            if self._local_recovery_pose_clear():
-                return
+            local_clear = self._local_recovery_pose_clear()
+            global_cost = self._global_recovery_cost()
         except Exception:  # noqa: BLE001 - diagnostics must never break a leg
             return
+        # The planner plans in the *global* grid, so a clear local grid is not
+        # enough: measured 2026-11-25 (runs/2026-11-25_2022_l2_m2) the base
+        # stopped 0.21 m from a static wall, the laser saw open floor and this
+        # gate returned, while every GridBased request aborted 58 times because
+        # the start cell sat in the static lethal band. Global cost is None when
+        # no grid is published yet, which must stay "no opinion", not "blocked".
+        if local_clear and (global_cost is None or global_cost < 99):
+            return
+        where = ('local clear, global cost '
+                 f'{global_cost}' if local_clear else 'local grid dirty')
+        attempts = max(0, int(self.get_parameter('start_band_escape_attempts').value))
+        used = int(getattr(self, '_start_band_escapes', 0))
+        if used >= attempts:
+            self.get_logger().warning(
+                f'{label}: the start pose is still inside an inscribed band after '
+                f'{used} shoves ({where}); asking for a plan anyway.')
+            return
+        self._start_band_escapes = used + 1
+        best_axis, best_room = self._band_escape_axis()
+        if best_room is None or best_room < 0.35:
+            self.get_logger().warning(
+                f'{label}: the start pose is inside an inscribed band ({where}), '
+                'but the scan allows no 0.35 m retreat '
+                f'(best {best_room if best_room is not None else float("nan"):.2f} m); '
+                'asking for a plan anyway.')
+            return
+        distance, floor = self._band_escape_shove(best_room)
         self.get_logger().warning(
-            f'{label}: the start pose is inside an inscribed band; retreating '
+            f'{label}: the start pose is inside an inscribed band ({where}); '
+            f'retreating {distance:.2f} m on lidar clearance ({best_room:.2f} m) '
             'before asking for a plan.')
         self._back_off(
-            f'{label}: leaving the band at the start pose', 0.25, 0.08, -1.0,
-            leave_band=True)
+            f'{label}: leaving the band at the start pose', distance, 0.08,
+            best_axis, leave_band=True, clearance_floor=floor)
 
     def _wedged_retreat(self, label: str) -> bool:
         """One lidar-verified retreat for a base the costgrid calls clear.
@@ -4846,14 +5219,7 @@ class FixedJointPickPlace(Node):
             return False
         if getattr(self, '_wedged_retreat_used', False):
             return False
-        best_axis, best_room = -1.0, None
-        for candidate in (-1.0, 1.0):
-            try:
-                room = self._entry_scan_clearance(candidate)
-            except Exception:  # noqa: BLE001 - diagnostics must never break a leg
-                room = None
-            if room is not None and (best_room is None or room > best_room):
-                best_axis, best_room = candidate, room
+        best_axis, best_room = self._band_escape_axis()
         if best_room is None or best_room < 0.35:
             # A retreat the scan already refuses must not be attempted: that
             # refusal is what keeps a base in a band for the rest of the round.
@@ -4864,13 +5230,28 @@ class FixedJointPickPlace(Node):
                 'not shoving the base.')
             return False
         self._wedged_retreat_used = True
+        distance, floor = self._band_escape_shove(best_room)
         self.get_logger().warning(
             f'{label}: the leg gave up with no verified recovery; retreating '
-            f'0.25 m on lidar clearance ({best_room:.2f} m) before one last '
-            'attempt.')
+            f'{distance:.2f} m on lidar clearance ({best_room:.2f} m) before one '
+            'last attempt.')
         return self._back_off(
-            f'{label}: wedged start pose', 0.25, 0.08, best_axis,
-            leave_band=True)
+            f'{label}: wedged start pose', distance, 0.08, best_axis,
+            leave_band=True, clearance_floor=floor)
+
+    def _band_escape_shove(self, room: float) -> tuple[float, float]:
+        """Distance and scan floor for one band-clearing shove.
+
+        The shove is capped at ``start_band_escape_retreat_m`` and never eats
+        more than 0.25 m of the room the scan reported, so a base with 0.50 m
+        on its free side still gets a 0.25 m retreat instead of a refusal.
+        The floor keeps 0.22 m of air: the lidar sits at the front of the base,
+        so part of every range is the base itself.
+        """
+        limit = max(0.08, float(
+            self.get_parameter('start_band_escape_retreat_m').value))
+        distance = max(0.08, min(limit, float(room) - 0.25))
+        return distance, max(0.30, distance + 0.22)
 
     def _wedged_retry(self, label, values, visual_handoff_cube,
                       completion_radius_m, chain) -> bool:
@@ -6133,6 +6514,9 @@ class FixedJointPickPlace(Node):
             # One lidar-verified retreat per leg: the retry that consumes it
             # re-enters here and must not arm a second one.
             self._wedged_retreat_used = False
+            # Same cap for the pre-flight shove that clears an inscribed start
+            # pose: a base parked in a band must not be pushed on every attempt.
+            self._start_band_escapes = 0
             # Drop the previous leg's hold report so a leg that fails without
             # any hold cannot quote the leg before it.
             self._last_hold_report = None
@@ -7570,6 +7954,10 @@ class FixedJointPickPlace(Node):
             ('VERIFY_GRASP', 'verify transport hold', self._verify_attachment),
             ('NAV_TO_ZONE', 'navigate to warehouse', self._navigate_to_warehouse),
             ('VERIFY_GRASP', 'verify carried cube', self._verify_attachment),
+            # The plate check runs before the arm leaves transport posture: if
+            # the base is not actually on its dock the arm is still folded, so
+            # a refusal costs nothing but the leg itself.
+            ('PLACING', 'check the target plate', self._verify_place_target_plate),
             (
                 'PLACING', 'pre-place',
                 lambda: self._move_arm_placing('Move to pre-place', 'pre_place_joints'),

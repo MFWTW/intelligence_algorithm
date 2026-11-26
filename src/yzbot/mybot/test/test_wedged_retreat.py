@@ -101,13 +101,24 @@ class WedgedRetreatRuntimeTests(unittest.TestCase):
         def cone(direction):
             return readings.get(direction)
 
-        return SimpleNamespace(
-            get_parameter=lambda name: SimpleNamespace(
-                value={'start_band_escape_enabled': enabled}[name]),
+        values = {
+            'start_band_escape_enabled': enabled,
+            # The shove sizing asks for these two; a stub that only serves the
+            # switch would raise KeyError instead of exercising the retreat.
+            'start_band_escape_attempts': 2,
+            'start_band_escape_retreat_m': 0.25,
+        }
+        node = SimpleNamespace(
+            get_parameter=lambda name: SimpleNamespace(value=values[name]),
             _entry_scan_clearance=Mock(side_effect=cone),
             _back_off=Mock(return_value=True),
             get_logger=Mock(),
         )
+        # The retreat now shares its axis choice and shove sizing with the
+        # pre-flight escape; bind them the way the node has them.
+        node._band_escape_axis = self.executor._band_escape_axis.__get__(node)
+        node._band_escape_shove = self.executor._band_escape_shove.__get__(node)
+        return node
 
     def test_retreats_towards_the_wider_side_of_the_scan(self):
         node = self.node(front=0.90, rear=0.40)
@@ -215,6 +226,91 @@ class WedgedRetreatNavigationTests(unittest.TestCase):
         node._cancel_requested = True
         self.assertFalse(self.executor._navigate_to(node, LABEL, (-2.8, -11.6, 0.0)))
         node._wedged_retreat.assert_not_called()
+
+
+class BandEscapeShoveTests(unittest.TestCase):
+    """The pre-flight shove follows the scan, not a fixed reverse direction.
+
+    Measured 2026-11-25 (runs/2026-11-25_1918_servo_m3): the base stood 0.32 m
+    from the wall with 0.51 m on its free side. The old code always reversed,
+    demanded 0.60 m of scan clearance, and so refused the only shove that could
+    have freed the leg; both legs then died with "no verified recovery".
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.module = load_executor()
+        cls.executor = cls.module.FixedJointPickPlace
+
+    def node(self, front=0.90, rear=0.40, attempts=2, retreat=0.25,
+             band=True, global_cost=50):
+        values = {
+            'start_band_escape_enabled': True,
+            'start_band_escape_attempts': attempts,
+            'start_band_escape_retreat_m': retreat,
+        }
+        readings = {1.0: front, -1.0: rear}
+        node = SimpleNamespace(
+            get_parameter=lambda name: SimpleNamespace(value=values[name]),
+            _local_recovery_pose_clear=Mock(return_value=not band),
+            _global_recovery_cost=Mock(return_value=global_cost),
+            _entry_scan_clearance=Mock(side_effect=lambda d: readings.get(d)),
+            _back_off=Mock(return_value=True),
+            get_logger=Mock(),
+        )
+        node._band_escape_axis = self.executor._band_escape_axis.__get__(node)
+        node._band_escape_shove = self.executor._band_escape_shove.__get__(node)
+        return node
+
+    def test_the_shove_keeps_a_quarter_metre_of_the_room_it_verified(self):
+        node = self.node()
+        for room, expected in ((0.90, (0.25, 0.47)), (0.51, (0.25, 0.47)),
+                               (0.40, (0.15, 0.37))):
+            distance, floor = self.executor._band_escape_shove(node, room)
+            self.assertAlmostEqual(distance, expected[0], msg=room)
+            self.assertAlmostEqual(floor, expected[1], msg=room)
+
+    def test_a_band_escape_retreats_on_the_wider_side(self):
+        node = self.node(front=0.51, rear=0.60)
+        self.executor._ensure_start_pose_outside_band(node, LABEL)
+        node._back_off.assert_called_once()
+        args, kwargs = node._back_off.call_args
+        self.assertIn('leaving the band', args[0])
+        self.assertEqual(args[1:], (0.25, 0.08, -1.0))
+        self.assertIs(kwargs['leave_band'], True)
+        self.assertAlmostEqual(kwargs['clearance_floor'], 0.47)
+
+    def test_the_scan_floor_now_admits_a_051_m_side(self):
+        # The regression this guards: a 0.51 m side used to be refused by the
+        # 0.60 m gate the generic retreat uses.
+        node = self.node(front=0.51, rear=0.30)
+        self.executor._ensure_start_pose_outside_band(node, LABEL)
+        node._back_off.assert_called_once()
+
+    def test_the_pre_flight_shove_is_capped_per_leg(self):
+        node = self.node(attempts=1)
+        self.executor._ensure_start_pose_outside_band(node, LABEL)
+        self.executor._ensure_start_pose_outside_band(node, LABEL)
+        node._back_off.assert_called_once()
+
+    def test_a_clear_start_pose_is_left_alone(self):
+        node = self.node(band=False)
+        self.executor._ensure_start_pose_outside_band(node, LABEL)
+        node._back_off.assert_not_called()
+
+    def test_a_lethal_global_start_cell_shoves_even_when_the_local_grid_is_clean(self):
+        # Measured 2026-11-25 (runs/2026-11-25_2022_l2_m2): the base stopped
+        # 0.21 m from a static wall, the laser saw open floor, and 58 GridBased
+        # requests aborted because the start cell was lethal in the static layer.
+        # The local grid alone must not be able to veto the shove.
+        node = self.node(band=False, global_cost=99)
+        self.executor._ensure_start_pose_outside_band(node, LABEL)
+        node._back_off.assert_called_once()
+
+    def test_an_unpublished_global_grid_is_not_a_veto(self):
+        node = self.node(band=False, global_cost=None)
+        self.executor._ensure_start_pose_outside_band(node, LABEL)
+        node._back_off.assert_not_called()
 
 
 if __name__ == '__main__':

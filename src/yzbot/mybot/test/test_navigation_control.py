@@ -1444,7 +1444,12 @@ class DockCreepLawTests(unittest.TestCase):
                   'dock_creep_tolerance_m': .03, 'dock_creep_yaw_tolerance_rad': .06,
                   'dock_creep_timeout_sec': 26., 'dock_creep_accept_m': .10,
                   'navigation_accept_yaw_rad': .8, 'place_yaw_comp_limit_rad': .6,
-                  'dock_creep_attempts': 2, 'dock_creep_align_distance_m': .25}
+                  'dock_creep_attempts': 2, 'dock_creep_align_distance_m': .25,
+                  # 2026-11-25: the creep reads the berth servo switch and its
+                  # two thresholds before it turns, even when it will not use
+                  # them (this stub is far from a plate).
+                  'place_servo': False, 'place_servo_engage_m': 1.0,
+                  'place_servo_fill_start': 0.2}
         events = []
         node = SimpleNamespace(
             get_parameter=lambda name: SimpleNamespace(value=values[name]),

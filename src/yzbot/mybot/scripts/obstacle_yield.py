@@ -104,6 +104,15 @@ class YieldConfig:
     # mover_4 at 50-60 degrees off the nose), so the cone was widened to
     # +/-50/100. 180 restores the literal front half.
     simple_radius_fov_deg: float = 100.0
+    # Inner commit radius: a box that is already this close cannot be waited
+    # out any more, so the base keeps its path instead. Operator rule,
+    # 2026-11-26: "wait while the box is 1.0-1.8 m out; inside 1.0 m ignore it
+    # and drive on". Waiting at contact range was measured losing the round
+    # twice: the box either reached the base while it stood still
+    # (base covered ground 11.3 m/s, simulation blew up) or the 15 s budget ran
+    # out on a box that was already receding (warehouse B, 0/5). 0.0 keeps the
+    # old "inside the circle means wait" behaviour.
+    simple_radius_commit_m: float = 0.0
     # Predict at most this far ahead. The base covers 2.25 m at 1.5 m/s, but a
     # box that only clears the corridor in 6 s is still outside the base's
     # braking window: the decision can be revised every control tick.
@@ -745,6 +754,17 @@ def decide(
         else:
             ahead = in_cone = True
         if ahead and in_cone and rng <= cfg.simple_radius_m:
+            commit_m = float(cfg.simple_radius_commit_m)
+            if 0.0 < commit_m and rng <= commit_m:
+                # Too close to wait out: stopping here only invites the box to
+                # arrive, and the leg would then burn its hold budget standing
+                # still. Commit to the path instead - the box passes behind.
+                return YieldDecision(
+                    ACTION_GO, REASON_CLEAR,
+                    detail=(f'mover at {rng:.2f} m, bearing {bearing_deg:+.0f} deg, '
+                            f'inside the {commit_m:.2f} m commit radius; too close to '
+                            'wait out, so the leg keeps its path'),
+                )
             return YieldDecision(
                 ACTION_STOP, REASON_WAIT,
                 detail=(f'mover at {rng:.2f} m, bearing {bearing_deg:+.0f} deg, '

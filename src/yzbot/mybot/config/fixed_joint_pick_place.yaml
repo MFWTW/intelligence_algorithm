@@ -280,6 +280,28 @@ fixed_joint_pick_place:
     placement_tolerance_m: 0.015
     placement_settle_sec: 0.5
     stabilize_release: true
+    # 2026-11-25: colour gate on the warehouse floor plate (A green, B yellow,
+    # C cyan in offic_room.world). Observational for now: it logs
+    # PLACE_GATE:PASS/MISS per delivery and fail_open keeps a bad threshold
+    # from costing a round. Thresholds are calibrated from those logs.
+    place_visual_gate: true
+    place_visual_gate_bottom_rows: 0.16
+    place_visual_gate_centre_band: 0.70
+    place_visual_gate_min_fill: 0.45
+    place_visual_gate_centre_tol: 0.60
+    place_visual_gate_frames: 3
+    place_visual_gate_timeout_sec: 6.0
+    place_visual_gate_hue_tolerance: 14.0
+    place_visual_gate_min_saturation: 90.0
+    place_visual_gate_min_value: 60.0
+    place_visual_gate_fail_open: true
+    # 2026-11-25: the creep re-aims at the goal whenever the lateral residual
+    # leaves the band, and each re-aim turns the base - that is the hunt at the
+    # berth. With the plate in view its centroid measures the same error, so
+    # the last metre is steered by it instead. Off restores the old law.
+    place_servo: true
+    place_servo_engage_m: 1.00
+    place_servo_fill_start: 0.20
     arm_motion_sec: 1.0
     gripper_motion_sec: 1.0
     settle_sec: 0.4

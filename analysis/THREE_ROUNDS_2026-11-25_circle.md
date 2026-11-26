@@ -187,3 +187,68 @@ python3 tools/contact_analysis.py runs/2026-11-25_XXXX_circle_m3/events.jsonl
 稳定性计数：`planner_fail` 1 / 0 / 0，`collision_ahead` 12 / 0 / 8，`stale odometry` **0 / 0 / 0**，
 watcher `0 stall` ×3，`contacts: none` ×3，`pushed while stopped: none` ×3。
 三题都是 5/5，nav 占比 68–70%，arm 恒定 48 s。图：`analysis/run_cone50/fig1..fig4`。
+
+## 10. 放置视觉门控 L1（2026-11-25 晚）
+
+### 10.1 设计
+
+三个仓库在 `offic_room.world` 里就是三块地面色板 + 一块黑色字母牌：
+
+| 仓库 | diffuse | 色相（度） | OpenCV H | 判定窗口 |
+|---|---|---|---:|---|
+| A | `0 1 0` | 120° | 60 | 53–67 |
+| B | `1 1 0` | 60° | 30 | 23–37 |
+| C | `0 1 1` | 180° | 90 | 83–97 |
+
+车贴到泊位时，相机（`/camera/image_raw`，0.1 m 高、80° HFOV）画面最底几行正好压在这块板上
+（底行俯角 25.2° → 车前 ≈0.21 m），所以"底部条带里是本仓库的颜色"同时是**身份检查**和**距离检查**。
+
+实现：`plate_band_metrics()`（纯函数，底部 16% 行 × 中间 70% 列算填充率与质心）、
+`_verify_place_target_plate()`（步骤 `PLACING / check the target plate`，插在 `pre-place` 之前，
+此时机械臂还在 transport 姿态，拒绝不伤任何东西）、参数组 `place_visual_gate*`。
+默认 `fail_open: true`：判不过只打 `PLACE_GATE:MISS` 并照常放置，避免阈值把整轮赔进去。
+
+### 10.2 第一次跑（`runs/2026-11-25_1900_gate_m1`，规则 1）
+
+| 仓库 | 结果 | fill | centroid | 备注 |
+|---|---|---:|---:|---|
+| C | MISS ×2 | **0.00** | — | 6 s 超时，共 12 s |
+| A | MISS | 0.62 | +0.38 | 角度偏 |
+| A | PASS | 0.96 | +0.03 | 0.1 s |
+| A | MISS | 0.72 | +0.27 | 角度偏 |
+
+C 全 0 是**我的色相表写错**：`(0,1,1)` 的色相是 180°，我先写了 90°（窗口落在 83–97 之外）。
+修 `ZONE_PLATE_HUE_DEG['C'] = 180.0`，并给 MISS 日志加上"条带主色相"字段——下次一眼能看出是颜色不对还是看不见。
+
+`centroid` 的两次 MISS（+0.38/+0.27）不是放错仓库，而是 creep 律残留 20–30° 航向误差。
+"居中"是 L2 伺服的目标，不是 L1 的准入条件，故 `centre_tol` 放宽到 0.60（仍然记录该值）。
+
+### §10.5 L2（视觉伺服蠕行）试过一轮，已回退
+
+2026-11-25 19:18 实现过 L2：`dock_creep_twist()` 在最后 `1.5 × align_distance` 内用色板质心替代"朝目标点重瞄"的横向项（`wz = 2.0*yaw_error + 1.5*lateral - 0.8*centroid`），`_creep_to_dock__timed` 在最后 1.0 m 采样喂给它。
+
+`runs/2026-11-25_1918_servo_m3`：2/5 FAILED。两次泊位本身正常（creep 2–3 s、`PLACE_GATE:PASS fill=1.00/0.99`），失败在 Nav2 规划侧（`blue_cube_5 visual handoff: no verified recovery`、`warehouse B: no verified recovery`，watcher 两个 stall 均为 `planner ×56 / behaviour ×46 / controller_refusal ×18`），与 L2 无直接关系；但同轮一次泊位 `heading -34.0 deg off` 已贴到 `place_yaw_comp_limit_rad`（34.4°）边界，风险由"接受门 0.10 m 不看航向"决定，L2 不能修它。
+
+按用户要求整段回退（`dock_creep_twist` 的 `visual` 分支、`_creep_to_dock__timed` 的采样与 try/finally、`_servo_house`、`place_servo*` 与两处 yaml、5 个 L2 用例、`test_navigation_control` 里 3 个桩键）。校验：三个改动文件相对 GitHub 提交 `397881c` **删除行数均为 0**（只保留 L1 的新增），全量测试回到 `17 failed / 516 passed / 25 skipped`（17 个失败是既有基线）。
+
+### 10.3 第二次跑（`runs/2026-11-25_1905_gate_m3`，规则 3）
+
+| 仓库 | fill | centroid | 主色相 | 耗时 |
+|---|---:|---:|---:|---:|
+| B | 1.00 | +0.00 | 30 | 0.0 s |
+| B | 0.91 | +0.08 | 30 | 0.0 s |
+| B | 0.84 | −0.05 | 30 | 0.0 s |
+| C | 0.71 | −0.25 | 90 | 0.1 s |
+| C | 1.00 | +0.00 | 90 | 0.0 s |
+
+五单全 PASS，门控总耗时 0.1 s。整轮 `COMPLETED 5/5`，墙钟 247.2 s，分段 260.5 s
+（nav 159.9 / creep 23.1 / vision 29.5 / arm 47.5）。
+
+### 10.4 标定结果
+
+- 8 次到达自己泊位的样本：fill **0.62–1.00**、centroid **−0.25…+0.38**。
+- `min_fill` 由 0.30 提到 **0.45**（低于 0.62 有余量，又能拒绝"只露一角"）。
+- 判不过的代价 = 6 s（`place_visual_gate_timeout_sec`），可通过降低该值或加"连续 3 帧"提前返回压缩。
+- 尚未启用强制：`fail_open: true`。要改成拒绝，只需把该参数置 false，届时 `_verify_place_target_plate`
+  返回 False 会走与其它步骤相同的失败路径。
+

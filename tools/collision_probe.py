@@ -88,6 +88,7 @@ class CollisionProbe(Node):
         self._last_movers = -1e9
         self._last_voxel = -1e9
         self._last_costmap = -1e9
+        self._last_global_costmap = -1e9
         self._last_footprint = -1e9
         self._last_plan = -1e9
         self._last_local_plan = -1e9
@@ -114,6 +115,13 @@ class CollisionProbe(Node):
         self.create_subscription(
             OccupancyGrid, '/local_costmap/costmap', self._on_costmap,
             make_qos(2, reliable=True))
+        # The global grid is what the planner actually starts from, so a leg
+        # that dies with "failed to create plan" is only explained by this one:
+        # the local grid is built from the laser and can call a pose clear while
+        # the static layer still has the base inside a lethal band.
+        self.create_subscription(
+            OccupancyGrid, '/global_costmap/costmap', self._on_global_costmap,
+            make_qos(1, reliable=True))
         self.create_subscription(
             PolygonStamped, '/local_costmap/published_footprint',
             self._on_footprint, make_qos(2, reliable=True))
@@ -196,6 +204,20 @@ class CollisionProbe(Node):
         self._last_costmap = now
         raw = bytes((int(v) & 0xFF) for v in msg.data)
         self._emit('costmap', {
+            'frame': msg.header.frame_id, 'stamp': stamp_of(msg),
+            'res': round(msg.info.resolution, 4),
+            'w': msg.info.width, 'h': msg.info.height,
+            'ox': round(msg.info.origin.position.x, 4),
+            'oy': round(msg.info.origin.position.y, 4),
+            'data': base64.b64encode(zlib.compress(raw, 6)).decode('ascii')})
+
+    def _on_global_costmap(self, msg):
+        now = time.monotonic()
+        if now - self._last_global_costmap < 1.0 / max(0.1, self._args.global_costmap_rate):
+            return
+        self._last_global_costmap = now
+        raw = bytes((int(v) & 0xFF) for v in msg.data)
+        self._emit('global_costmap', {
             'frame': msg.header.frame_id, 'stamp': stamp_of(msg),
             'res': round(msg.info.resolution, 4),
             'w': msg.info.width, 'h': msg.info.height,
@@ -339,6 +361,7 @@ def main():
     ap.add_argument('--max-duration', type=float, default=1500.0)
     ap.add_argument('--after-terminal', type=float, default=10.0)
     ap.add_argument('--costmap-rate', type=float, default=2.0)
+    ap.add_argument('--global-costmap-rate', type=float, default=1.0)
     ap.add_argument('--scan-rate', type=float, default=5.0)
     ap.add_argument('--movers-rate', type=float, default=5.0)
     ap.add_argument('--voxel-rate', type=float, default=1.0)

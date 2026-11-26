@@ -115,7 +115,7 @@ class SimpleRadiusTests(unittest.TestCase):
         # never be active in a race.
         source = (pathlib.Path(__file__).resolve().parents[1]
                   / 'scripts' / 'fixed_joint_pick_place.py').read_text()
-        self.assertIn("declare_parameter('yield_simple_radius_m', 1.5)", source)
+        self.assertIn("declare_parameter('yield_simple_radius_m', 1.8)", source)
         self.assertIn("self.get_parameter('yield_simple_radius_m')", source)
 
     def test_the_competition_node_asks_for_the_ninety_degree_cone(self):
@@ -123,6 +123,57 @@ class SimpleRadiusTests(unittest.TestCase):
                   / 'scripts' / 'fixed_joint_pick_place.py').read_text()
         self.assertIn("declare_parameter('yield_simple_fov_deg', 100.0)", source)
         self.assertIn("self.get_parameter('yield_simple_fov_deg')", source)
+
+
+class CommitRadiusTests(unittest.TestCase):
+    """The 2026-11-26 operator rule: wait only in the annulus, commit inside it.
+
+    "If a box is 1.0-1.8 m out, stop; once it is inside 1.0 m, ignore it and
+    drive on along the original path." Waiting at contact range lost a rule 2
+    round twice: the box arrived while the base stood still (11.3 m/s launch) or
+    the 15 s budget ran out on a box that was already leaving.
+    """
+
+    def config(self, **kwargs):
+        return obstacle_yield.YieldConfig(simple_radius_m=1.8, **kwargs)
+
+    def test_a_box_in_the_annulus_stops_the_base(self):
+        decision = obstacle_yield.decide(
+            observation(1.4, 0.0, vx=-0.2), self.config(simple_radius_commit_m=1.0))
+        self.assertEqual(decision.action, obstacle_yield.ACTION_STOP)
+        self.assertTrue(decision.holds)
+        self.assertIn('inside the 1.80 m circle', decision.detail)
+
+    def test_a_box_inside_the_commit_radius_does_not_stop_the_base(self):
+        decision = obstacle_yield.decide(
+            observation(0.8, 0.0, vx=-0.2), self.config(simple_radius_commit_m=1.0))
+        self.assertEqual(decision.action, obstacle_yield.ACTION_GO)
+        self.assertFalse(decision.holds)
+        self.assertIn('commit radius', decision.detail)
+        self.assertIn('keeps its path', decision.detail)
+
+    def test_the_commit_edge_is_at_the_configured_metres(self):
+        cfg = self.config(simple_radius_commit_m=1.0)
+        self.assertFalse(obstacle_yield.decide(observation(0.99, 0.0), cfg).holds)
+        self.assertTrue(obstacle_yield.decide(observation(1.01, 0.0), cfg).holds)
+
+    def test_a_commit_radius_of_zero_keeps_the_circle_rule(self):
+        decision = obstacle_yield.decide(
+            observation(0.8, 0.0), self.config(simple_radius_commit_m=0.0))
+        self.assertEqual(decision.action, obstacle_yield.ACTION_STOP)
+
+    def test_the_commit_radius_only_applies_inside_the_cone_ahead(self):
+        # A box behind the base is ignored whatever the commit radius is.
+        decision = obstacle_yield.decide(
+            observation(-0.6, 0.0), self.config(simple_radius_commit_m=1.0))
+        self.assertEqual(decision.action, obstacle_yield.ACTION_GO)
+        self.assertNotIn('commit radius', decision.detail)
+
+    def test_the_competition_node_asks_for_the_commit_radius(self):
+        source = (pathlib.Path(__file__).resolve().parents[1]
+                  / 'scripts' / 'fixed_joint_pick_place.py').read_text()
+        self.assertIn("declare_parameter('yield_simple_commit_m', 1.0)", source)
+        self.assertIn("self.get_parameter('yield_simple_commit_m')", source)
 
 
 if __name__ == '__main__':
