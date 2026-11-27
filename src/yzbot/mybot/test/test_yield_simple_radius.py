@@ -125,14 +125,8 @@ class SimpleRadiusTests(unittest.TestCase):
         self.assertIn("self.get_parameter('yield_simple_fov_deg')", source)
 
 
-class CommitRadiusTests(unittest.TestCase):
-    """The 2026-11-26 operator rule: wait only in the annulus, commit inside it.
-
-    "If a box is 1.0-1.8 m out, stop; once it is inside 1.0 m, ignore it and
-    drive on along the original path." Waiting at contact range lost a rule 2
-    round twice: the box arrived while the base stood still (11.3 m/s launch) or
-    the 15 s budget ran out on a box that was already leaving.
-    """
+class ClosePathRadiusTests(unittest.TestCase):
+    """Check the path inside 1 m; keep the ordinary outer-cone stop rule."""
 
     def config(self, **kwargs):
         return obstacle_yield.YieldConfig(simple_radius_m=1.8, **kwargs)
@@ -144,30 +138,32 @@ class CommitRadiusTests(unittest.TestCase):
         self.assertTrue(decision.holds)
         self.assertIn('inside the 1.80 m circle', decision.detail)
 
-    def test_a_box_inside_the_commit_radius_does_not_stop_the_base(self):
-        decision = obstacle_yield.decide(
-            observation(0.8, 0.0, vx=-0.2), self.config(simple_radius_commit_m=1.0))
-        self.assertEqual(decision.action, obstacle_yield.ACTION_GO)
-        self.assertFalse(decision.holds)
-        self.assertIn('commit radius', decision.detail)
-        self.assertIn('keeps its path', decision.detail)
-
-    def test_the_commit_edge_is_at_the_configured_metres(self):
+    def test_a_box_inside_one_metre_requires_verified_clearance(self):
         cfg = self.config(simple_radius_commit_m=1.0)
-        self.assertFalse(obstacle_yield.decide(observation(0.99, 0.0), cfg).holds)
-        self.assertTrue(obstacle_yield.decide(observation(1.01, 0.0), cfg).holds)
+        obs = observation(0.8, 0.0, vx=-0.2)
+        self.assertTrue(obstacle_yield.decide(obs, cfg).holds)
+        self.assertFalse(obstacle_yield.decide(obs, cfg, close_path_clear=True).holds)
+
+    def test_exactly_one_metre_is_a_path_check_not_an_automatic_release(self):
+        cfg = self.config(simple_radius_commit_m=1.0)
+        self.assertTrue(obstacle_yield.decide(observation(1.0, 0.0), cfg).holds)
+        self.assertFalse(obstacle_yield.decide(
+            observation(1.0, 0.0), cfg, close_path_clear=True).holds)
+        self.assertTrue(obstacle_yield.decide(
+            observation(1.01, 0.0), cfg, close_path_clear=True).holds)
 
     def test_a_commit_radius_of_zero_keeps_the_circle_rule(self):
         decision = obstacle_yield.decide(
             observation(0.8, 0.0), self.config(simple_radius_commit_m=0.0))
         self.assertEqual(decision.action, obstacle_yield.ACTION_STOP)
 
-    def test_the_commit_radius_only_applies_inside_the_cone_ahead(self):
-        # A box behind the base is ignored whatever the commit radius is.
-        decision = obstacle_yield.decide(
-            observation(-0.6, 0.0), self.config(simple_radius_commit_m=1.0))
-        self.assertEqual(decision.action, obstacle_yield.ACTION_GO)
-        self.assertNotIn('commit radius', decision.detail)
+    def test_close_oblique_or_rear_box_can_conflict_with_a_turn(self):
+        cfg = self.config(simple_radius_commit_m=1.0)
+        for xy in [(0.3, 0.85), (-0.6, 0.0)]:
+            with self.subTest(xy=xy):
+                self.assertTrue(obstacle_yield.decide(observation(*xy), cfg).holds)
+                self.assertFalse(obstacle_yield.decide(
+                    observation(*xy), cfg, close_path_clear=True).holds)
 
     def test_the_competition_node_asks_for_the_commit_radius(self):
         source = (pathlib.Path(__file__).resolve().parents[1]

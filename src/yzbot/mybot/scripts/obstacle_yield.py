@@ -104,14 +104,9 @@ class YieldConfig:
     # mover_4 at 50-60 degrees off the nose), so the cone was widened to
     # +/-50/100. 180 restores the literal front half.
     simple_radius_fov_deg: float = 100.0
-    # Inner commit radius: a box that is already this close cannot be waited
-    # out any more, so the base keeps its path instead. Operator rule,
-    # 2026-11-26: "wait while the box is 1.0-1.8 m out; inside 1.0 m ignore it
-    # and drive on". Waiting at contact range was measured losing the round
-    # twice: the box either reached the base while it stood still
-    # (base covered ground 11.3 m/s, simulation blew up) or the 15 s budget ran
-    # out on a box that was already receding (warehouse B, 0/5). 0.0 keeps the
-    # old "inside the circle means wait" behaviour.
+    # Inner path-check radius: passing a close mover requires verified path
+    # clearance regardless of bearing. 0.0 keeps the ordinary circle rule.
+    # The parameter name is retained for existing launch configurations.
     simple_radius_commit_m: float = 0.0
     # Predict at most this far ahead. The base covers 2.25 m at 1.5 m/s, but a
     # box that only clears the corridor in 6 s is still outside the base's
@@ -429,6 +424,50 @@ class YieldDecision:
         return self.action == ACTION_STOP
 
 
+def _project_to_segment(point, start, end):
+    dx, dy = end[0] - start[0], end[1] - start[1]
+    length_sq = dx * dx + dy * dy
+    t = (min(1.0, max(0.0, ((point[0] - start[0]) * dx
+                             + (point[1] - start[1]) * dy) / length_sq))
+         if length_sq else 0.0)
+    return start[0] + t * dx, start[1] + t * dy
+
+
+def near_path_clearance(path, footprint, *, lookahead_m=1.5, max_join_m=0.55):
+    """Minimum footprint-to-path distance, in the base frame; None if unknown.
+
+    Project the base onto the cached route, discard traveled segments, then
+    measure along the remaining polyline (including the join from the base).
+    ``footprint`` contains samples of the occupied box area, so compare with
+    a robot radius plus margin, not an additional box radius. An empty valid cloud is
+    clear; unavailable path/cloud should be supplied as None.
+    """
+    if not path or footprint is None:
+        return None
+    origin = (0.0, 0.0)
+    segments = list(zip(path, path[1:])) or [(path[0], path[0])]
+    joins = [_project_to_segment(origin, a, b) for a, b in segments]
+    index = min(range(len(joins)), key=lambda i: math.hypot(*joins[i]))
+    join = joins[index]
+    if math.hypot(*join) > max_join_m:
+        return None
+    prefix = [origin]
+    remaining = lookahead_m
+    for point in [join, *path[index + 1:]]:
+        x, y = prefix[-1]
+        dx, dy = point[0] - x, point[1] - y
+        length = math.hypot(dx, dy)
+        if length > remaining:
+            prefix.append((x + dx * remaining / length, y + dy * remaining / length))
+            break
+        prefix.append(point)
+        remaining -= length
+    if not footprint:
+        return math.inf
+    return min(math.dist(point, _project_to_segment(point, a, b))
+               for point in footprint for a, b in zip(prefix, prefix[1:]))
+
+
 def parse_patrol_segments(text) -> list[tuple[float, float, float, float]]:
     """Patrol centre lines as ``[(x0, y0, x1, y1), ...]``.
 
@@ -713,6 +752,7 @@ def decide(
     wait_elapsed_sec: float = 0.0,
     arc_attempts: int = 0,
     continuous_hold_sec: float = 0.0,
+    close_path_clear: bool = False,
 ) -> YieldDecision:
     """Pick the yield action for the current control tick.
 
@@ -729,23 +769,21 @@ def decide(
 
     rng = obs.range_m()
     if cfg.simple_radius_m > 0.0:
-        # The whole mover policy in one line: a circle of ``simple_radius_m``
-        # around the base centre, and (by default) only its front half. A box
-        # inside the front semicircle means "wait"; anything else means "drive
-        # on". No velocity, no prediction, no lane test, no arc.
-        # The front half is not decoration: measured 2026-11-25 over three
-        # rounds of the full circle (runs/2026-11-25_1640_circle_m1..m3, all
-        # 5/5) 15/45/29 of the 43/107/118 stops were for boxes *behind* the
-        # base, and the three rounds cost 305/391/369 s of object time against
-        # 299/315/264 s before the circle existed. A box behind cannot be
-        # driven into, so it must not cost a stop.
-        # Stale scans are handled above, so this never freezes the base on old
-        # evidence: the box's own motion decides when it leaves the circle.
-        # The cone is the same argument one step further: a box outside
-        # +/-fov/2 cannot be driven into either, so a box grazing the rim of the
-        # half circle must not cost a stop (operator observation, 2026-11-25).
-        # It only narrows the front-half rule; asking for the literal full circle
-        # (``simple_radius_front_only=False``) still means every direction.
+        # A close mover can cross the route from either side, particularly
+        # before a turn. Unlike the outer circle, this check ignores bearing.
+        close_m = min(cfg.simple_radius_commit_m, cfg.simple_radius_m)
+        if 0.0 < close_m and rng <= close_m:
+            return YieldDecision(
+                ACTION_GO if close_path_clear else ACTION_STOP,
+                REASON_CLEAR if close_path_clear else REASON_WAIT,
+                wait_elapsed_sec=wait_elapsed_sec,
+                detail=(f'mover at {rng:.2f} m inside the {close_m:.2f} m path-check '
+                        f'radius; near path {"verified" if close_path_clear else "not verified"}'),
+            )
+        # The outer circle still means wait for traffic in the forward cone.
+        # In the outer band the forward cone avoids stops for traffic merely
+        # grazing the side or behind us. Full-circle mode still waits in all
+        # directions when simple_radius_front_only=False.
         bearing_deg = math.degrees(math.atan2(obs.box_y, obs.box_x))
         if cfg.simple_radius_front_only:
             ahead = obs.box_x > 0.0
@@ -754,17 +792,6 @@ def decide(
         else:
             ahead = in_cone = True
         if ahead and in_cone and rng <= cfg.simple_radius_m:
-            commit_m = float(cfg.simple_radius_commit_m)
-            if 0.0 < commit_m and rng <= commit_m:
-                # Too close to wait out: stopping here only invites the box to
-                # arrive, and the leg would then burn its hold budget standing
-                # still. Commit to the path instead - the box passes behind.
-                return YieldDecision(
-                    ACTION_GO, REASON_CLEAR,
-                    detail=(f'mover at {rng:.2f} m, bearing {bearing_deg:+.0f} deg, '
-                            f'inside the {commit_m:.2f} m commit radius; too close to '
-                            'wait out, so the leg keeps its path'),
-                )
             return YieldDecision(
                 ACTION_STOP, REASON_WAIT,
                 detail=(f'mover at {rng:.2f} m, bearing {bearing_deg:+.0f} deg, '
@@ -929,6 +956,26 @@ def decide(
         return YieldDecision(
             ACTION_STOP, REASON_WAIT, wait_elapsed_sec=wait_elapsed_sec,
             detail=conflict.why,
+        )
+
+    # 3b. A box that is driving AT the base is not "passing", whatever the
+    #     predictor says. Prediction is only trusted while the base is moving
+    #     (`min_speed_mps`), so a base that has already stopped reads an
+    #     oncoming box as "it will clear" and drives into it - the one geometry
+    #     where standing still is free and driving is not. Give the closing
+    #     component its own stop band inside `cap_range_m`; the caller's wait
+    #     budget still turns a hold that never clears into a lateral exit.
+    closing_mps = -forward_world_component
+    if (closing_mps > cfg.early_detour_head_on_mps
+            and rng <= cfg.cap_range_m
+            and not obs.lane_end_closing
+            and (obs.distance_to_goal_m is None
+                 or obs.distance_to_goal_m > cfg.wait_goal_margin_m)
+            and wait_elapsed_sec < cfg.wait_budget_sec):
+        return YieldDecision(
+            ACTION_STOP, REASON_WAIT, wait_elapsed_sec=wait_elapsed_sec,
+            detail=f'oncoming box closing at {closing_mps:.2f} m/s, '
+                   f'{rng:.2f} m out; holding instead of passing',
         )
 
     if planned is not None:

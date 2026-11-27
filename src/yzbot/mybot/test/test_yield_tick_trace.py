@@ -19,13 +19,18 @@ tree = ast.parse((SCRIPTS / 'fixed_joint_pick_place.py').read_text())
 cls = next(n for n in tree.body if isinstance(n, ast.ClassDef)
            and n.name == 'FixedJointPickPlace')
 names = {'_yield_step', '_yield_trace_capture', '_yield_trace_emit',
-         '_tick_yield', '_yield_episode_elapsed', '_update_yield_episode'}
+         '_tick_yield', '_yield_episode_elapsed', '_update_yield_episode',
+         '_recent_yield_path', '_fresh_yield_path_cloud', '_yield_cloud_near',
+         '_yield_close_path_clearance', '_yield_path_clearance_at_cloud',
+         '_mover_cloud_box'}
 methods = [n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name in names]
 trace_functions = [n for n in tree.body if isinstance(n, (ast.FunctionDef, ast.ClassDef))
                    and n.name in {'_yield_trace_json', '_YieldTraceWriter'}]
 namespace = {'obstacle_yield': obstacle_yield, 'math': math, 'time': time,
              'json': json, 'queue': queue, 'YIELD_STOP_SPEED_LIMIT': 0.001,
-             'CLOCK_MISMATCH_SEC': 1.0e6}
+             'CLOCK_MISMATCH_SEC': 1.0e6,
+             'Time': SimpleNamespace(from_msg=lambda stamp: stamp),
+             'TransformException': LookupError}
 import threading
 from dataclasses import fields, is_dataclass
 namespace.update(threading=threading, fields=fields, is_dataclass=is_dataclass)
@@ -48,7 +53,7 @@ class TraceTests(unittest.TestCase):
         node._yield_room = lambda *a: (None, None)
         node._carrying_now = lambda: False
         node._patrol_segments = []
-        node._mover_cloud_box = lambda: None
+        node._clock_seconds = lambda: 10.0
         node._yield_diag = lambda *a, **kw: None
         node._yield_log_decision = lambda *a: None
         node.get_clock = lambda: SimpleNamespace(clock_type='ROS_TIME')
@@ -61,6 +66,7 @@ class TraceTests(unittest.TestCase):
         node.outputs = []
         node._publish_speed_limit = lambda *a: node.outputs.append(a)
         node._yield_suppress = False
+        node._yield_pause_active = False
         node._yield_last_update = 0.0
         node._yield_decision = obstacle_yield.YieldDecision(
             obstacle_yield.ACTION_GO, obstacle_yield.REASON_CLEAR)
@@ -77,6 +83,113 @@ class TraceTests(unittest.TestCase):
         node._yield_arc_watch_speed = None
         node._yield_watch_last = 0.0
         return node
+
+    def close_node(self):
+        node = self.node(None)
+        node._yield_config = obstacle_yield.YieldConfig(
+            simple_radius_m=1.8, simple_radius_commit_m=1.0, hold_release_margin_m=0.12)
+        params = {'yield_path_release_enabled': False, 'empty_robot_radius_m': 0.32,
+                  'yield_mover_cloud_timeout_sec': 0.35}
+        node.get_parameter = lambda name: SimpleNamespace(value=params.get(name, 0.0))
+        node._yield_path_goal = (3.0, 0.0)
+        node._yield_path_sample = (time.monotonic(), 'map', [(0.0, 0.0), (3.0, 0.0)])
+        node._yield_release_path = None
+        node._clock_seconds = lambda: 10.0
+        transform = SimpleNamespace(
+            translation=SimpleNamespace(x=0.0, y=0.0),
+            rotation=SimpleNamespace(x=0.0, y=0.0, z=0.0, w=1.0))
+        node._recovery_tf = SimpleNamespace(
+            lookup_transform=lambda *args: SimpleNamespace(transform=transform))
+        return node
+
+    def set_cloud(self, node, y, *, x=0.4, stamp_sec=10, stamp_nsec=0, wall_age=0.0):
+        node._mover_release_cloud = (time.monotonic() - wall_age,
+                                     SimpleNamespace(sec=stamp_sec, nanosec=stamp_nsec),
+                                     [(x, y)])
+
+    def test_active_nav_blocks_oblique_mover_within_its_motion_envelope(self):
+        node = self.close_node()
+        # Outside the old cone, but less than 1 m from the origin. A static
+        # 0.70 m clearance would pass; plausible motion consumes 0.30 m.
+        self.set_cloud(node, 0.70)
+        decision = node._yield_step(3.0)[0]
+        self.assertTrue(decision.holds)
+        self.assertIn('predicted near-path clearance', decision.detail)
+        self.set_cloud(node, 0.80)
+        self.assertFalse(node._yield_step(3.0)[0].holds)
+        self.set_cloud(node, 0.80, stamp_sec=9, stamp_nsec=700_000_000)
+        self.assertTrue(node._yield_step(3.0)[0].holds)
+
+    def test_close_path_missing_stale_or_wrong_goal_and_recovery_are_not_clear(self):
+        node = self.close_node()
+        self.set_cloud(node, 0.80)
+        self.assertTrue(node._yield_step(None)[0].holds)  # no Nav2 path for recovery
+        good = node._yield_path_sample
+        for sample in [None, (good[0] - 3.0, *good[1:]),
+                       (*good[:2], [(0, 0), (5, 0)])]:
+            with self.subTest(sample=sample):
+                node._yield_path_sample = sample
+                self.assertTrue(node._yield_step(3.0)[0].holds)
+        node._yield_path_sample = good
+        self.set_cloud(node, 0.80, wall_age=0.5)
+        self.assertTrue(node._yield_step(3.0)[0].holds)
+        self.set_cloud(node, 0.80)
+
+        def no_transform(*args):
+            raise LookupError
+
+        node._recovery_tf.lookup_transform = no_transform
+        self.assertTrue(node._yield_step(3.0)[0].holds)
+
+    def test_path_hold_cannot_release_on_obstacle_data_loss(self):
+        node = self.close_node()
+        self.set_cloud(node, 0.60)
+        self.assertTrue(node._yield_step(3.0)[0].holds)
+        node._yield_pause_active = True
+        node._yield_release_path = node._yield_path_sample[1:]
+        node._yield_path_sample = None  # frozen route only while paused
+        node._mover_release_cloud = None
+        self.assertTrue(node._yield_step(3.0)[0].holds)
+        self.set_cloud(node, 0.82)
+        self.assertFalse(node._yield_step(3.0)[0].holds)
+
+    def test_unconfirmed_lidar_track_neither_holds_nor_checks_path(self):
+        node = self.close_node()
+        node._yield_path_sample = None
+        node._yield_tracker.nearest = lambda *a, **k: {
+            'base_x': 0.6, 'base_y': 0.0, 'world_speed': 0.5}
+        node._yield_close_path_clearance = lambda *a: self.fail('unconfirmed mover checked')
+        for x, wall_age, stamp_sec in [(3.0, 0.0, 10), (0.6, 0.5, 10), (0.6, 0.0, 9)]:
+            with self.subTest(x=x, wall_age=wall_age, stamp_sec=stamp_sec):
+                self.set_cloud(node, 0.0, x=x, wall_age=wall_age, stamp_sec=stamp_sec)
+                decision = node._yield_step(3.0)[0]
+                self.assertEqual(decision.action, obstacle_yield.ACTION_GO)
+                self.assertFalse(node._yield_close_path_hold)
+        node._mover_release_cloud = None
+        self.assertEqual(node._yield_step(3.0)[0].action, obstacle_yield.ACTION_GO)
+
+    def test_confirmed_track_keeps_outer_cone_hold(self):
+        node = self.close_node()
+        node._yield_tracker.nearest = lambda *a, **k: {
+            'base_x': 1.4, 'base_y': 0.0, 'world_speed': 0.2,
+            'x': 1.4, 'y': 0.0, 'rel_vx': -0.2, 'rel_vy': 0.0, 'vx': -0.2, 'vy': 0.0}
+        self.set_cloud(node, 0.0, x=1.4)
+        self.assertTrue(node._yield_step(3.0)[0].holds)
+
+    def test_other_hold_keeps_opt_in_release_check(self):
+        node = self.close_node()
+        params = {'yield_path_release_enabled': True, 'empty_robot_radius_m': 0.32}
+        node.get_parameter = lambda name: SimpleNamespace(value=params.get(name, 0.0))
+        node._yield_path_release_clearance = lambda _: self.fail('checked outside actual hold')
+        self.assertFalse(node._yield_step(3.0)[0].holds)
+        node._yield_pause_active = True
+        for clearance, holds in [(None, True), (0.30, True), (0.44, True), (0.45, False)]:
+            with self.subTest(clearance=clearance):
+                node._yield_path_release_clearance = lambda _, c=clearance: c
+                self.assertEqual(node._yield_step(3.0)[0].holds, holds)
+        params['yield_path_release_enabled'] = False
+        node._yield_path_release_clearance = lambda _: self.fail('checked with opt-in disabled')
+        self.assertFalse(node._yield_step(3.0)[0].holds)
 
     def test_default_parameter_is_false(self):
         declarations = [n for n in ast.walk(cls) if isinstance(n, ast.Call)
@@ -133,6 +246,9 @@ class TraceTests(unittest.TestCase):
         node = self.node(SimpleNamespace(submit=records.append))
         node._yield_latched = True
         node._yield_wait_since = time.monotonic()
+        node.get_parameter = lambda name: SimpleNamespace(
+            value=0.35 if name == 'yield_mover_cloud_timeout_sec' else 0.0)
+        self.set_cloud(node, 0.5, x=1.0)
         node._yield_tracker.nearest = lambda *a, **k: {
             'born': 10.0, 't': 10.1, 'x': 1.0, 'y': 0.5,
             'vx': 0.1, 'vy': 0.0, 'base_x': 1.0, 'base_y': 0.5,
@@ -166,7 +282,9 @@ class TraceTests(unittest.TestCase):
             node._yield_config = replace(node._yield_config,
                                          approach_trial_enabled=enabled)
             clock = SimpleNamespace(t=100.0)
-            node._mover_cloud_box = lambda: (3.85, 0.60) if clock.t < 101.0 else None
+            node._mover_cloud_box = lambda cloud: (3.85, 0.60) if clock.t < 101.0 else None
+            node._fresh_yield_path_cloud = lambda now: (
+                now, None, [(0.95, -0.20 + 0.20 * (clock.t - 101.0))])
             # Prescribed approach speed until the first stop tick, stationary after.
             speed = lambda: 1.0 if clock.t <= 101.0 else 0.0
             node._yield_base_motion = lambda: (speed(), 0.0, 0.0, 0.0, 0.0)

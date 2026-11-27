@@ -129,6 +129,14 @@ controller_server:
       desired_linear_vel: 1.5
       lookahead_dist: 0.6
       min_lookahead_dist: 0.3
+      # 0.7 was tried on 2026-11-26 and reverted: rule 3 and rule 2 both died
+      # (1/5 in 87 s, 3/5 in 222 s), and neither failure was anywhere near the
+      # corner the change was meant to protect - the base ended up on a 99 cell
+      # at (-5.04,-0.77) (0.35 m) and (2.51,-10.08) (0.16 m). Measuring every
+      # round with tools/band_exposure.py also shows the corner-cut signature
+      # (time inside the inscribed circle while faster than 0.6 m/s) is only
+      # 2-4 s per round, while the time spent *standing* inside it is tens of
+      # seconds: the entry is not the problem, the escape is. Keep 0.9.
       max_lookahead_dist: 0.9
       lookahead_time: 1.5
       use_velocity_scaled_lookahead_dist: true

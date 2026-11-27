@@ -35,7 +35,7 @@ from std_srvs.srv import Empty
 from nav2_msgs.action import NavigateThroughPoses, NavigateToPose
 from nav2_msgs.msg import SpeedLimit
 from nav2_msgs.srv import ClearEntireCostmap
-from nav_msgs.msg import OccupancyGrid, Odometry
+from nav_msgs.msg import OccupancyGrid, Odometry, Path
 from rcl_interfaces.msg import (
     Parameter,
     ParameterDescriptor,
@@ -689,6 +689,12 @@ class FixedJointPickPlace(Node):
         self.declare_parameter('global_radius_margin_m', 0.25)
         # Opt-in soft planning costs only. Zero preserves the per-leg inflation.
         self.declare_parameter('global_inflation_min_m', 0.0)
+        # A retreat may only report "out of the band" once the base is
+        # this far past the global inscribed radius. One cell clear is not
+        # out: the leg asks for a plan a second later, after the base has
+        # turned toward the goal, and that turn moves base_link by up to
+        # 0.18 m (measured 2026-11-26 18:59 rule 3).
+        self.declare_parameter('band_escape_margin_m', 0.10)
         # link6 is a real Gazebo link. grasping_frame is a MoveIt/TF frame and
         # may be collapsed by Gazebo's fixed-joint reduction.
         self.declare_parameter('robot_attach_link', 'link6')
@@ -708,6 +714,15 @@ class FixedJointPickPlace(Node):
         # 0 disables the watchdog.
         self.declare_parameter('navigation_stall_timeout_sec', 45.0)
         self.declare_parameter('navigation_stall_progress_m', 0.15)
+        # 2026-11-26 14:39 (rule 2, ann3_m2): the base carried 1.31 m/s through a
+        # 27 deg kink, drifted 0.35 m to the inside and stopped in a cell whose
+        # global cost is 99 (inscribed). NavFn then refused to plan from it for
+        # 12.6 s, Nav2's own backup/spin were refused by the collision monitor
+        # (the body really is 0.25 m from the wall) and the loaded leg died with
+        # the cube attached. Waiting the full stall timeout buys nothing here -
+        # the start cell has to be cleared first - so fail the attempt early and
+        # let the wedged retry back the base out.
+        self.declare_parameter('navigation_band_stall_grace_sec', 3.0)
         # Hard "the base has simply stopped" limit, independent of the goal: if
         # the base does not move this far within this long, the attempt is
         # abandoned. The progress check above can be satisfied by a base that is
@@ -972,12 +987,12 @@ class FixedJointPickPlace(Node):
         # base, while the 50-60 deg corner that cost one 1.1 cm overlap at +/-45
         # is still covered (2026-11-25). 180 restores the whole front half.
         self.declare_parameter('yield_simple_fov_deg', 100.0)
-        # Inside this radius the box is already too close to wait out, so the
-        # leg keeps its path instead of stopping: waiting at contact range let
-        # the box arrive (2026-11-26 rule 2, base launched at 11.3 m/s) or burned
-        # the hold budget on a box that was leaving (2026-11-25 21:33 rule 2,
-        # 0/5). Operator rule: wait in the 1.0-1.8 m annulus, drive on inside 1.0.
+        # Inside this radius require verified near-path clearance, even for a
+        # mover to the side of the forward cone. Keep the existing ROS key.
         self.declare_parameter('yield_simple_commit_m', 1.0)
+        # Optional path check for other simple-radius holds. The close-path
+        # check above does not depend on this flag.
+        self.declare_parameter('yield_path_release_enabled', False)
         self.declare_parameter('yield_cap_range_m', 1.8)
         self.declare_parameter('yield_stop_range_m', 1.2)
         self.declare_parameter('yield_cap_speed_mps', 0.8)
@@ -1008,6 +1023,13 @@ class FixedJointPickPlace(Node):
         self.declare_parameter('place_servo_fill_start', 0.20)
         self.declare_parameter('start_band_escape_retreat_m', 0.25)
         self.declare_parameter('start_band_escape_attempts', 2)
+        # Which way out of a band is a geometry question, not a hull question:
+        # the escape search below sweeps 36 headings and logs the one that ends
+        # on a legal start cell.  Log-only until real runs agree with the
+        # offline replay (tools/escape_segment.py).
+        self.declare_parameter('escape_segment_log_only', True)
+        self.declare_parameter('escape_segment_max_m', 0.60)
+        self.declare_parameter('escape_segment_half_width_m', 0.35)
         # Keep static-cluster phantoms (measured 0.86-1.52 m/s) outside the
         # tracking window while detecting the 0.20 m/s patrol boxes.
         self.declare_parameter('yield_max_mover_speed_mps', 0.6)
@@ -1086,12 +1108,9 @@ class FixedJointPickPlace(Node):
         # inside the box's lane", and a base parked in a lane is trapped: the box
         # returns every few seconds (measured 2026-10-13, 18 s frozen).
         self.declare_parameter('mover_patrols_topic', '/movers/patrols')
-        # The patrol boxes publish their own footprints in base_link, so this
-        # node can see a box the lidar cannot yet (occlusion at a doorway).
-        # Measured detour1/detour2: the yield layer first saw the box that cost
-        # an 11.3 s standstill at 1.7 m of range, already inside the choke.
-        # Used only as an extra yield observation, never as costmap input, so it
-        # cannot re-introduce the plan-failure storms.
+        # The patrol boxes publish their own footprints in base_link. Only
+        # these confirmed movers participate in this executor's yield policy;
+        # unassociated lidar returns still go to Nav2's normal costmaps.
         self.declare_parameter('mover_cloud_topic', '/movers/obstacles')
         self.declare_parameter('yield_mover_cloud_stage', True)
         self.declare_parameter('yield_mover_cloud_range_m', 6.0)
@@ -1189,6 +1208,19 @@ class FixedJointPickPlace(Node):
         # fresh detection. Measured cost of the old behaviour: 72 s of silence in
         # run_logs/speed_rpp15_trial1_20261010-143655.
         self.declare_parameter('visual_research_after_sec', 3.0)
+        # 2026-11-26 (run 2026-11-26_1539_A9_r1_2, blue_cube_5): the base parked
+        # 0.25 m from a shelf, the centring turn swung it 79 deg, and while it
+        # rotated at 1.4 rad/s the skid-steer chassis slid 0.18 m towards the
+        # shelf (odom and Gazebo truth agree, so it is not a pose estimate).
+        # The cell under the wheel crossed cost 80 -> 99 and the warehouse leg
+        # then had no legal start pose. The drift is not geometric, so it cannot
+        # be predicted from the sweep: watch the cell the base actually stands on
+        # while it aligns, and step back the moment it enters the band.
+        self.declare_parameter('align_band_guard', True)
+        self.declare_parameter('align_band_retreat_m', 0.28)
+        self.declare_parameter('align_band_retreat_max_m', 0.60)
+        self.declare_parameter('align_band_retreat_speed_mps', 0.08)
+        self.declare_parameter('align_band_guard_attempts', 2)
         self.declare_parameter('proximity_timeout_sec', 5.0)
         # One missed /gazebo/link_states window used to end the whole round:
         # measured 2026-10-12 (official_run3 and vision_stab1), the run stopped at
@@ -1368,8 +1400,12 @@ class FixedJointPickPlace(Node):
             String, str(self.get_parameter('mover_patrols_topic').value),
             self._patrols_callback, patrols_qos
         )
-        self._mover_cloud = None
-        self._mover_cloud_stamp = 0.0
+        self._mover_release_cloud = None
+        self._yield_path_sample = None
+        self._yield_path_goal = None
+        self._yield_release_path = None
+        self._yield_close_path_hold = False
+        self.create_subscription(Path, '/plan', self._yield_path_callback, 1)
         self.create_subscription(
             PointCloud2, str(self.get_parameter('mover_cloud_topic').value),
             self._mover_cloud_callback, qos_profile_sensor_data
@@ -3429,6 +3465,7 @@ class FixedJointPickPlace(Node):
         if getattr(self, '_cancel_requested', False):
             self._stop_base()
             return None
+        self._yield_path_sample = None
         goal_handle = self._send_goal_tolerant(
             label, client if client is not None else self._navigate_client,
             goal, response_timeout, 5.0, deadline=deadline,
@@ -3603,6 +3640,139 @@ class FixedJointPickPlace(Node):
             and now - since > timeout_sec
         )
 
+    def _turn_to_heading(self, label: str, want: float, frame: str) -> bool:
+        """Rotate in place onto ``want`` (frame rad) before driving a segment.
+
+        Deliberately not gated on the lidar: the scan saturates at range_min
+        0.50 m, so every frame carries a handful of exactly-0.500 rays and a
+        "< 0.4 m, refuse" test can never pass. The safety argument is the
+        segment itself - `_escape_segment` only returns a hit with 0.35 m of
+        half-width room along the chosen heading, so the pocket is wide enough
+        for a slow in-place turn. Speed is capped low and the window short.
+        """
+        command = Twist()
+        command.linear.x = 0.0
+        # 3 s at 0.5 rad/s cannot cover a 90 deg turn, and the failing case
+        # (2026-11-26 19:55 rule 2, warehouse B) needed exactly that: the escape
+        # heading was -90 deg, the base turned from -172 to -129 in the 3 s
+        # window and stopped 43 deg short, the caller fell back to the hull axis,
+        # and the leg died with "no verified recovery".
+        end = time.monotonic() + 8.0
+        err = None
+        try:
+            while time.monotonic() < end and rclpy.ok() and not getattr(
+                    self, '_cancel_requested', False):
+                pose = self._recovery_pose(frame)
+                if pose is None:
+                    return False
+                err = math.atan2(math.sin(want - pose[2]), math.cos(want - pose[2]))
+                if abs(err) < math.radians(8.0):
+                    return True
+                if self._yield_config.enabled and self._entry_yield_pending():
+                    self.get_logger().warning(
+                        f'{label}: mover holds the lane; not rotating the hull '
+                        'for the escape segment.')
+                    return False
+                command.angular.z = max(-0.9, min(0.9, 2.0 * err))
+                self._fine_cmd_pub.publish(command)
+                rclpy.spin_once(self, timeout_sec=0.05)
+        finally:
+            self._stop_base()
+        if err is None:
+            return False
+        if abs(err) >= math.radians(8.0):
+            self.get_logger().warning(
+                f'{label}: escape turn stopped {math.degrees(err):+.0f} deg short '
+                'of the segment heading.')
+        # A few degrees of heading error are harmless on a 0.35 m half-width
+        # corridor: 0.20 m of travel at 30 deg off drifts 0.10 m sideways, well
+        # inside the verified corridor. Refusing the drive over the remaining
+        # error costs the whole leg.
+        return abs(err) < math.radians(30.0)
+
+    def _escape_along_segment(self, label: str) -> bool:
+        """Drive the searched escape segment instead of shoving along the axis.
+
+        The ±axis shove only helps when the free direction happens to be fore or
+        aft. Measured 2026-11-26 18:59 rule 3: the search found a 0.10 m exit at
+        -100 deg while the shove went along -152 deg and gained 0.02 m of
+        clearance per 0.05 m travelled, so the leg died one cell outside the
+        ring. Turn onto the searched heading first, then drive it.
+        """
+        target = self._band_escape_target()
+        clear = self._band_escape_clearance()
+        if not math.isfinite(target) or clear is None or clear >= target:
+            return True
+        grid = self._fresh_recovery_grid('global')
+        if grid is None:
+            return False
+        result = self._escape_segment()
+        if result is None:
+            return False
+        points, _end_cost, _room = result
+        if len(points) < 2:
+            return False
+        frame = grid.header.frame_id
+        pose = self._recovery_pose(frame)
+        if pose is None:
+            return False
+        want = math.atan2(points[-1][1] - points[0][1], points[-1][0] - points[0][0])
+        err = math.atan2(math.sin(want - pose[2]), math.cos(want - pose[2]))
+        if abs(err) <= math.radians(25.0):
+            direction = 1.0
+        elif abs(abs(err) - math.pi) <= math.radians(25.0):
+            direction = -1.0
+        elif self._turn_to_heading(label, want, frame):
+            direction = 1.0
+        else:
+            return False
+        distance = math.hypot(points[-1][0] - points[0][0],
+                              points[-1][1] - points[0][1])
+        self.get_logger().warning(
+            f'{label}: escaping along the segment: {distance:.2f} m at '
+            f'{math.degrees(want):+.0f} deg {"forward" if direction > 0 else "backward"}.')
+        self._back_off(
+            label, distance_m=min(0.35, distance + 0.06), speed=0.08,
+            # Never override a mover hold here: the patrol boxes are kinematic
+            # and do not yield (executor_fast.yaml: enable_obstacle_yield true,
+            # "a kinematic box that never yields"). Standing in the band is a
+            # failed leg; driving through the box is a failed robot.
+            direction=direction, leave_band=True,
+            until=time.monotonic() + 5.0, hold_escape=False,
+            clearance_floor=0.50)
+        clear = self._band_escape_clearance()
+        return clear is not None and clear >= target
+
+    def _recheck_band_before_goal(self, label: str) -> bool:
+        """Last look at the start cell at the moment the goal is built.
+
+        The leg checks the start pose before Nav2 is asked, but the base keeps
+        moving while the goal is assembled, and NavFn reads the cell it is on
+        when the path is requested. Measured 2026-11-26 18:59 rule 3: 0.18 m of
+        turn between the escape and the request put the base back on a 99 cell.
+        """
+        target = self._band_escape_target()
+        clear = self._band_escape_clearance()
+        if not math.isfinite(target) or clear is None or clear >= target:
+            return True
+        self.get_logger().warning(
+            f'{label}: start pose drifted back onto the band before the goal '
+            f'was sent ({clear:.2f} m clear, need {target:.2f} m); retreating again.')
+        if not self._escape_along_segment(label):
+            self._back_off(
+                label, distance_m=0.25, speed=0.08, direction=-1.0,
+                leave_band=True, until=time.monotonic() + 4.0,
+                hold_escape=False, clearance_floor=0.50)
+        clear = self._band_escape_clearance()
+        if clear is not None and clear >= target:
+            self.get_logger().info(
+                f'{label}: start pose {clear:.2f} m clear after the re-check.')
+            return True
+        self.get_logger().warning(
+            f'{label}: start pose still on the band after the re-check '
+            f'({clear if clear is None else round(clear, 2)} m); planning anyway.')
+        return False
+
     def _navigate_once__timed(
         self,
         label: str,
@@ -3632,6 +3802,7 @@ class FixedJointPickPlace(Node):
         if deadline_expired() or getattr(self, '_cancel_requested', False):
             self._stop_base()
             return False
+        self._recheck_band_before_goal(label)
         x, y, yaw = [float(value) for value in values]
         goal, client = self._nav_goal(
             values, self._remaining_chain(chain), behavior_tree=behavior_tree,
@@ -3655,6 +3826,8 @@ class FixedJointPickPlace(Node):
             self._stop_base()
             raise RuntimeError(
                 'YIELD_GATE_NOT_READY: guarded smoother input unavailable')
+        self._yield_path_sample = None
+        self._yield_path_goal = (x, y)
         goal_handle = self._send_goal_tolerant(
             label, client, goal, response_timeout, 5.0, deadline=deadline,
         )
@@ -3711,6 +3884,9 @@ class FixedJointPickPlace(Node):
         stall_progress = float(
             self.get_parameter('navigation_stall_progress_m').value
         )
+        band_grace = float(
+            self.get_parameter('navigation_band_stall_grace_sec').value
+        )
         best_distance = None
         stall_since = None
         stall_waypoint = None
@@ -3766,6 +3942,7 @@ class FixedJointPickPlace(Node):
                 # would otherwise see the cancelled future and fall straight
                 # through to the jam escape, which moved the base 0.70 m
                 # backwards on every single hold of that round.
+                self._capture_yield_release_path(x, y)
                 if getattr(self, '_retain_nav_goal_on_yield', False):
                     if not self._hold_until_clear_retained(
                         label, x, y, deadline, goal_handle, result_future,
@@ -3968,6 +4145,27 @@ class FixedJointPickPlace(Node):
                         stall_since = now
                     elif stall_since is None:
                         stall_since = now
+                    elif (band_grace > 0.0
+                          and now - stall_since > band_grace
+                          and self._start_cell_inside_global_band()):
+                        # Standing in an inscribed cell: NavFn will not plan
+                        # from here and Nav2 will not back out (the body is
+                        # genuinely close to the wall), so the full stall
+                        # timeout can only be spent watching. Give the attempt
+                        # up now and let the wedged retry clear the start pose.
+                        self._last_attempt_failure = 'planner_band'
+                        self.get_logger().warning(
+                            f'{label}: the base has stood {now - stall_since:.1f} s '
+                            'in a cell the planner treats as inscribed (global '
+                            'cost >= 99); NavFn cannot plan from here and Nav2 '
+                            'will refuse to back out, so abandoning this attempt '
+                            'early - the wedged retry clears the start pose.'
+                        )
+                        self._release_nav_control(
+                            label, goal_handle, result_future,
+                            min(5.0, response_timeout), deadline=deadline,
+                        )
+                        return False
                     elif now - stall_since > stall_timeout:
                         # 2026-10-07: consult the acceptance gate before giving up.
                         # This path used to cancel the goal unconditionally, so a
@@ -4337,7 +4535,12 @@ class FixedJointPickPlace(Node):
                 or getattr(self, '_geometry_fault', False)
                 or getattr(self, '_navigation_control_fault', False)):
             return False
-        distance_m, speed = min(distance_m, 0.25), min(abs(speed), 0.08)
+        # A band escape is the one retreat that has to actually leave the ring:
+        # the failing case (2026-11-26 19:02, rule 3) needed 0.30 m and the
+        # 0.25 m clamp turned a solvable wedge into a dead leg. Callers that are
+        # not leaving the band keep the short bound.
+        distance_m = min(distance_m, 0.35 if leave_band else 0.25)
+        speed = min(abs(speed), 0.08)
         if (not math.isfinite(distance_m) or distance_m <= 0.0
                 or not math.isfinite(speed) or speed <= 0.0):
             return False
@@ -4349,7 +4552,7 @@ class FixedJointPickPlace(Node):
         # trap appears (measured 2026-11-23, ..._holdfix2/3: three escapes
         # stopped at 0.00 m with "time budget" while 0.16 m from a wall). Give
         # the guarded escape its own short window instead.
-        retreat_budget = (4.0 if (hold_escape or leave_band)
+        retreat_budget = (5.0 if leave_band else 4.0 if hold_escape
                           else self._nav_budget_remaining(7.0))
         # A caller that hands over an already-expired deadline (the leg budget
         # is usually spent by the time a band trap appears) must not turn the
@@ -4383,16 +4586,32 @@ class FixedJointPickPlace(Node):
                 dx, dy = pose[0] - start[0], pose[1] - start[1]
                 travelled = axis * (dx * math.cos(start[2]) + dy * math.sin(start[2]))
                 yaw_change = math.atan2(math.sin(pose[2] - start[2]), math.cos(pose[2] - start[2]))
-                if (travelled < -0.02 or abs(yaw_change) > 0.12
-                        or abs(dy * math.cos(start[2]) - dx * math.sin(start[2])) > 0.04):
+                # 0.02 m / 0.12 rad / 0.04 m used to abort a 0.25 m shove at the
+                # first wheel slip: 2026-11-26 14:39 rule 2 lost the round with
+                # 'guarded retreat measured 0.04 m; stop: unexpected motion'
+                # while reversing out of a corner 0.25 m from two walls. A base
+                # under a carried cube always yaws a few degrees when it starts
+                # moving, so only a shove-sized excursion counts as being pushed.
+                # 0.22 rad was still too tight: 2026-11-26 15:39 rule 1 stopped a
+                # retreat at 0.10 m in the same corner ("unexpected motion") while
+                # the chassis was skidding its way out. A yaw excursion of 0.40 rad
+                # (23 deg) is a pivot, not a shove.
+                if (travelled < -0.06 or abs(yaw_change) > 0.40
+                        or abs(dy * math.cos(start[2]) - dx * math.sin(start[2])) > 0.18):
                     reason = 'unexpected motion'
                     break
                 if travelled >= distance_m:
                     reason = 'measured distance'
                     break
                 if leave_band and travelled >= 0.05:
-                    cost = self._global_recovery_cost()
-                    if cost is not None and 0 <= cost < 99:
+                    # "Cost below 99" is only one cell outside the ring, and
+                    # one cell is not out: the goal is sent a second later and
+                    # the turn toward it moves base_link up to 0.18 m. Measured
+                    # 2026-11-26 18:59 rule 3 - the retreat stopped on cost 91,
+                    # the turn carried the base back onto 99, and GridBased
+                    # failed three times with nothing left to recover with.
+                    clear = self._band_escape_clearance()
+                    if clear is not None and clear >= self._band_escape_target():
                         reason = 'left planner band'
                         break
                 if travelled >= best + 0.015:
@@ -4443,8 +4662,9 @@ class FixedJointPickPlace(Node):
                               'swept costmap clearance not verified')):
             return False
         if leave_band:
-            cost = self._global_recovery_cost()
-            return travelled >= 0.05 and cost is not None and 0 <= cost < 99
+            clear = self._band_escape_clearance()
+            return (travelled >= 0.05 and clear is not None
+                    and clear >= self._band_escape_target())
         return travelled >= 0.05
 
     # ------------------------------------------------------ narrow-entrance P0
@@ -5127,16 +5347,143 @@ class FixedJointPickPlace(Node):
             return self._visual_align_active__timed(*a, **k)
 
     def _band_escape_axis(self) -> tuple[float, float | None]:
-        """Widest of the two straight retreat directions, with the room the scan sees."""
-        best_axis, best_room = -1.0, None
-        for candidate in (-1.0, 1.0):
-            try:
-                room = self._entry_scan_clearance(candidate)
-            except Exception:  # noqa: BLE001 - diagnostics must never break a leg
-                room = None
-            if room is not None and (best_room is None or room > best_room):
-                best_axis, best_room = candidate, room
-        return best_axis, best_room
+        """Which way to retreat, preferring the ground the base just drove.
+
+        Reversing re-traces a strip the base has already covered, so that strip
+        is the one piece of space whose clearance has been demonstrated rather
+        than measured once by a scan; driving forward may be the shorter way
+        out of the band but it commits the body to ground nothing has verified.
+        The scan keeps the veto: the rear is used unless it reports less room
+        than a shove needs (0.35 m, the same floor the caller checks).
+
+        Measured 2026-11-25 (runs/2026-11-25_1918_servo_m3): the base stood
+        0.32 m from the wall with 0.51 m on its free side, and the old fixed
+        reverse - plus a 0.60 m scan gate - refused the one shove that could
+        have freed the leg; both legs then died with "no verified recovery".
+        """
+        try:
+            rear = self._entry_scan_clearance(-1.0)
+            front = self._entry_scan_clearance(1.0)
+        except Exception:  # noqa: BLE001 - diagnostics must never break a leg
+            return -1.0, None
+        if rear is not None and rear >= 0.35:
+            return -1.0, rear
+        if front is None:
+            return -1.0, rear
+        return 1.0, front
+
+    def _escape_segment(self):
+        """(points, end_cost, scan_room) for the shortest shove out of a band.
+
+        `_band_escape_axis()` can only choose front or rear along the hull, and
+        measures both with a scan that saturates at `range_min`.  Measured
+        2026-11-26 (runs/2026-11-26_1702_lookA_m2): the base stood 0.38 m from
+        the free end of a thin diagonal partition; 0.10 m at 190 deg reaches a
+        cost-0 cell, while the shove actually attempted ran along the hull and
+        left the base at 0.18 m, i.e. further inside.  The one escape this file
+        records as working (2026-11-21) was "0.71 m south-west, heading 218
+        deg", which is the same direction the search finds.
+
+        The start cell is deliberately not checked here: standing on it is the
+        precondition, not a disqualifier.  Only the far cell has to be legal
+        (cost < 99), because a legal start cell is all NavFn needs to resume.
+        """
+        grid = self._fresh_recovery_grid('global')
+        pose = self._recovery_pose(grid.header.frame_id) if grid is not None else None
+        scan = self._scan
+        if grid is None or pose is None or scan is None:
+            return None
+        if (self._scan_received_at is None
+                or not self._recovery_stamp_fresh(scan, 0.5)):
+            return None
+        max_len = max(0.10, float(self.get_parameter('escape_segment_max_m').value))
+        half = max(0.20, float(
+            self.get_parameter('escape_segment_half_width_m').value))
+        x, y = pose[0], pose[1]
+        hits = []
+        floor = scan.range_min + 0.02
+        for index, value in enumerate(scan.ranges):
+            if not math.isfinite(value) or not floor < value < 1.6:
+                continue
+            angle = scan.angle_min + index * scan.angle_increment
+            hits.append((value * math.cos(angle), value * math.sin(angle)))
+        best = None
+        for step in range(36):
+            heading = math.radians(step * 10.0)
+            ux, uy = math.cos(heading), math.sin(heading)
+            for length in (0.10, 0.15, 0.20, 0.25, 0.30, 0.35, 0.40, 0.45, 0.50, 0.55, 0.60):
+                if length > max_len + 1e-9:
+                    break
+                cost = self._recovery_cell(grid, x + length * ux, y + length * uy)
+                if cost is None or cost >= 99:
+                    continue
+                blocked = False
+                in_band = 0.0
+                for distance in range(1, int(length / 0.02) + 1):
+                    cell = self._recovery_cell(
+                        grid, x + distance * 0.02 * ux, y + distance * 0.02 * uy)
+                    if cell is None:
+                        continue
+                    if cell >= 100:
+                        blocked = True
+                        break
+                    if cell >= 99:
+                        in_band += 0.02
+                if blocked:
+                    continue
+                room = math.inf
+                for hx, hy in hits:
+                    along = min(max(hx * ux + hy * uy, 0.0), length)
+                    room = min(room, math.hypot(hx - along * ux, hy - along * uy))
+                if room < half:
+                    continue
+                # Distance traded against the cost of where it ends up: 0.15 m
+                # onto a cost-96 cell satisfies NavFn but leaves the base one
+                # nudge from being banded again, so a longer shove onto clean
+                # ground is worth 0.004 m per cost unit.
+                # Exit early rather than skim the boundary: a shove that ends
+                # one tracking error outside the band is a shove that gets
+                # repeated, so ground covered inside the band counts against
+                # the option even though walking it is harmless.
+                score = length + 0.004 * cost + 0.8 * in_band
+                if best is None or score < best[0]:
+                    best = (score, heading, x + length * ux, y + length * uy,
+                            cost, room, length)
+        if best is None:
+            return None
+        _, heading, end_x, end_y, cost, room, length = best
+        points = [(x + distance * math.cos(heading), y + distance * math.sin(heading))
+                  for distance in (0.05 * index for index in range(
+                      int(round(length / 0.05)) + 1))]
+        points.append((end_x, end_y))
+        return points, cost, room
+
+    def _log_escape_segment(self, label: str, where: str) -> None:
+        """Dry run: log the shove geometry should have chosen, move nothing.
+
+        Gated on `escape_segment_log_only` so a round can record this next to
+        what the axis-limited retreat actually did.
+        """
+        if not bool(self.get_parameter('escape_segment_log_only').value):
+            return
+        try:
+            found = self._escape_segment()
+        except Exception:  # noqa: BLE001 - diagnostics must never break a leg
+            return
+        if found is None:
+            self.get_logger().warning(
+                f'{label}: no escape segment out of the band ({where}): no heading '
+                'within the search reaches a legal start cell.')
+            return
+        points, cost, room = found
+        start_x, start_y = points[0]
+        end_x, end_y = points[-1]
+        heading = math.degrees(math.atan2(end_y - start_y, end_x - start_x))
+        self.get_logger().warning(
+            f'{label}: escape segment out of the band ({where}) would be '
+            f'{math.hypot(end_x - start_x, end_y - start_y):.2f} m at '
+            f'{heading:+.0f} deg, ending on cost {cost} with {room:.2f} m of '
+            'lidar room.')
 
     def _ensure_start_pose_outside_band(self, label: str) -> None:
         """Retreat before driving when the base itself stands in an inscribed band.
@@ -5174,6 +5521,12 @@ class FixedJointPickPlace(Node):
             return
         where = ('local clear, global cost '
                  f'{global_cost}' if local_clear else 'local grid dirty')
+        if global_cost is not None:
+            # Only when the published grid actually calls this start banded:
+            # a dirty local grid at t=0 shoves nothing and has no band to
+            # escape, and logging a segment for it is noise (measured
+            # 2026-11-26 18:37 rule 2, first leg at pose (0,0)).
+            self._log_escape_segment(label, where)
         attempts = max(0, int(self.get_parameter('start_band_escape_attempts').value))
         used = int(getattr(self, '_start_band_escapes', 0))
         if used >= attempts:
@@ -5183,18 +5536,30 @@ class FixedJointPickPlace(Node):
             return
         self._start_band_escapes = used + 1
         best_axis, best_room = self._band_escape_axis()
-        if best_room is None or best_room < 0.35:
+        distance, floor = self._band_escape_shove(best_room if best_room else 0.5)
+        limit = max(0.08, float(
+            self.get_parameter('start_band_escape_retreat_m').value))
+        planner = getattr(self, '_plan_band_escape', None)
+        plan = (planner([distance, min(limit, distance * 1.6), limit])
+                if planner is not None else None)
+        if plan is not None:
+            best_axis, distance, best_room, verified = plan
+        else:
+            verified = False
+        if best_room is not None and best_room < 0.35 and not verified:
             self.get_logger().warning(
                 f'{label}: the start pose is inside an inscribed band ({where}), '
                 'but the scan allows no 0.35 m retreat '
-                f'(best {best_room if best_room is not None else float("nan"):.2f} m); '
-                'asking for a plan anyway.')
+                f'(best {best_room:.2f} m); asking for a plan anyway.')
             return
-        distance, floor = self._band_escape_shove(best_room)
+        if distance <= 0.0:
+            return
+        floor = max(0.30, distance + 0.22)
         self.get_logger().warning(
             f'{label}: the start pose is inside an inscribed band ({where}); '
-            f'retreating {distance:.2f} m on lidar clearance ({best_room:.2f} m) '
-            'before asking for a plan.')
+            f'retreating {distance:.2f} m on axis {best_axis:+.0f} '
+            f'(lidar {best_room if best_room is not None else float("nan"):.2f} m, '
+            f'{"grid-verified" if verified else "grid silent"}) before asking for a plan.')
         self._back_off(
             f'{label}: leaving the band at the start pose', distance, 0.08,
             best_axis, leave_band=True, clearance_floor=floor)
@@ -5219,6 +5584,18 @@ class FixedJointPickPlace(Node):
             return False
         if getattr(self, '_wedged_retreat_used', False):
             return False
+        self._log_escape_segment(label, 'wedged start pose')
+        self._wedged_retreat_used = True
+        # Turn onto the searched heading before falling back to the hull axis.
+        # Measured 2026-11-26 19:36 rule 3 (runs/2026-11-26_1933_sweepb5_m3,
+        # warehouse B): the axis shove and the only legal exit pointed opposite
+        # ways - the search found a 0.10 m exit at +180 deg while the shove ran
+        # 0.18 m forward, ended on cost 0, still inside the inscribed ring, and
+        # the leg died on "no verified recovery for planner_band".
+        if self._escape_along_segment(label):
+            self.get_logger().info(
+                f'{label}: recovered onto a legal start cell after the escape segment.')
+            return True
         best_axis, best_room = self._band_escape_axis()
         if best_room is None or best_room < 0.35:
             # A retreat the scan already refuses must not be attempted: that
@@ -5229,15 +5606,67 @@ class FixedJointPickPlace(Node):
                 f'(best {best_room if best_room is not None else float("nan"):.2f} m); '
                 'not shoving the base.')
             return False
-        self._wedged_retreat_used = True
+        limit = max(0.08, float(
+            self.get_parameter('start_band_escape_retreat_m').value))
         distance, floor = self._band_escape_shove(best_room)
+        planner = getattr(self, '_plan_band_escape', None)
+        plan = (planner([0.18, 0.25, min(limit, 0.35), max(limit, 0.35)])
+                if planner is not None else None)
+        if plan is not None:
+            best_axis, distance, best_room, verified = plan
+        else:
+            verified = False
+        if distance <= 0.0:
+            return False
+        floor = max(0.30, distance + 0.22)
         self.get_logger().warning(
             f'{label}: the leg gave up with no verified recovery; retreating '
-            f'{distance:.2f} m on lidar clearance ({best_room:.2f} m) before one '
-            'last attempt.')
+            f'{distance:.2f} m on axis {best_axis:+.0f} '
+            f'(lidar {best_room if best_room is not None else float("nan"):.2f} m, '
+            f'{"grid-verified" if verified else "grid silent"}) before one last attempt.')
         return self._back_off(
             f'{label}: wedged start pose', distance, 0.08, best_axis,
             leave_band=True, clearance_floor=floor)
+
+    def _plan_band_escape(self, steps):
+        """Pick (axis, distance) whose far cell the global grid calls legal.
+
+        The scan alone is not enough: measured 2026-11-26 (runs/
+        2026-11-26_1633_band_m3) a lidar-clear 0.25 m reverse off a band left
+        the base on global cost 99 again, and the leg died two more times with
+        "no verified recovery for planner_band". The global layer is static, so
+        the cost of the cell a shove would end on is already known - ask it
+        first, and fall back to the scan when no grid is published.
+
+        `steps` is the candidate distance list, longest last. Returns
+        `(axis, distance, room, verified)`; `verified` False means no candidate
+        landed on a legal cell and the caller is moving on the scan alone.
+        """
+        pose = self._recovery_pose('odom')
+        if pose is None:
+            return None
+        rear = self._entry_scan_clearance(-1.0)
+        front = self._entry_scan_clearance(1.0)
+        room = {-1.0: rear, 1.0: front}
+        axes = [-1.0, 1.0] if (rear or 0.0) >= (front or 0.0) else [1.0, -1.0]
+        for axis in axes:
+            available = room[axis]
+            for step in steps:
+                if step <= 0.0:
+                    continue
+                if available is not None and step > available + 0.05:
+                    continue
+                target_x = pose[0] + axis * step * math.cos(pose[2])
+                target_y = pose[1] + axis * step * math.sin(pose[2])
+                value = self._global_cell_cost(target_x, target_y)
+                if value is not None and value < 99:
+                    return axis, step, available, True
+        axis = axes[0]
+        available = room[axis]
+        distance = max(steps)
+        if available is not None:
+            distance = max(0.0, min(distance, available))
+        return axis, distance, available, False
 
     def _band_escape_shove(self, room: float) -> tuple[float, float]:
         """Distance and scan floor for one band-clearing shove.
@@ -5463,45 +5892,111 @@ class FixedJointPickPlace(Node):
     def _odom_callback(self, msg: Odometry) -> None:
         self._odom = msg
 
-    def _mover_cloud_callback(self, msg) -> None:
-        """Keep the patrol footprints in base_link for a long-range yield look.
+    def _yield_path_callback(self, msg: Path) -> None:
+        frame = str(self.get_parameter('navigation_frame').value)
+        if msg.header.frame_id != frame:
+            return
+        points = tuple((p.pose.position.x, p.pose.position.y) for p in msg.poses)
+        if points and all(math.isfinite(x) and math.isfinite(y) for x, y in points):
+            self._yield_path_sample = (time.monotonic(), frame, points)
 
-        Only points inside the tracking window are kept, so the per-tick scan in
-        `_mover_cloud_box` stays cheap; the cloud arrives at 10 Hz at most.
-        """
+    def _recent_yield_path(self, now, goal):
+        sample = self._yield_path_sample
+        if goal is None or sample is None:
+            return None
+        received, frame, points = sample
+        if now - received <= 2.5 and math.dist(points[-1], goal) <= 0.65:
+            return frame, points
+        return None
+
+    def _capture_yield_release_path(self, goal_x, goal_y) -> None:
+        # The planner stops updating after cancellation; use the latest route
+        # from this goal for hold release, always with new obstacle samples.
+        self._yield_release_path = self._recent_yield_path(time.monotonic(), (goal_x, goal_y))
+
+    def _fresh_yield_path_cloud(self, now):
+        cloud = getattr(self, '_mover_release_cloud', None)
+        if cloud is None or now - cloud[0] > float(self.get_parameter(
+                'yield_mover_cloud_timeout_sec').value):
+            return None
+        stamp = cloud[1]
+        age = self._clock_seconds() - stamp.sec - 1e-9 * stamp.nanosec
+        return cloud if -0.5 <= age <= 0.5 else None
+
+    def _yield_path_release_clearance(self, now: float) -> float | None:
+        return self._yield_path_clearance_at_cloud(
+            self._yield_release_path, self._fresh_yield_path_cloud(now))
+
+    def _yield_path_clearance_at_cloud(self, path, cloud) -> float | None:
+        if path is None or cloud is None:
+            return None
+        _, stamp, footprint = cloud
+        frame, route = path
         try:
-            if msg.point_step not in (12, 16, 20, 24, 32):
+            tf = self._recovery_tf.lookup_transform(
+                'base_link', frame, Time.from_msg(stamp))
+        except TransformException:
+            return None
+        tr, q = tf.transform.translation, tf.transform.rotation
+        yaw = math.atan2(2.0 * (q.w*q.z + q.x*q.y),
+                         1.0 - 2.0 * (q.y*q.y + q.z*q.z))
+        c, s = math.cos(yaw), math.sin(yaw)
+        base_route = [(tr.x + c*x - s*y, tr.y + s*x + c*y) for x, y in route]
+        return obstacle_yield.near_path_clearance(base_route, footprint)
+
+    def _yield_close_path_clearance(self, now, cloud, paused, navigating):
+        if cloud is None:
+            return None
+        _, stamp, _ = cloud
+        if paused:
+            # A matching plan can still arrive while cancel is being acked.
+            if self._yield_release_path is None:
+                self._yield_release_path = self._recent_yield_path(now, self._yield_path_goal)
+            path = self._yield_release_path
+        elif navigating:
+            path = self._recent_yield_path(now, self._yield_path_goal)
+        else:
+            path = None
+        clearance = self._yield_path_clearance_at_cloud(path, cloud)
+        if clearance is None:
+            return None
+        # Bound the next half-second of motion in ANY direction, not just along
+        # the box's current heading. This covers diagonal entry and patrol
+        # reversals without guessing a velocity for unmatched cloud points.
+        age = self._clock_seconds() - stamp.sec - 1e-9 * stamp.nanosec
+        if not -0.5 <= age <= 0.5:
+            return None
+        speed_bound = max(0.20, self._yield_config.max_mover_speed_mps)
+        return clearance - speed_bound * (0.5 + max(0.0, age))
+
+    @staticmethod
+    def _yield_cloud_near(cloud, radius):
+        return cloud is not None and any(math.hypot(x, y) <= radius for x, y in cloud[2])
+
+    def _mover_cloud_callback(self, msg) -> None:
+        """Keep the full, stamped patrol footprint for yield decisions."""
+        try:
+            if (msg.header.frame_id != 'base_link'
+                    or not self._recovery_stamp_fresh(msg, 0.5)
+                    or msg.point_step not in (12, 16, 20, 24, 32)):
+                self._mover_release_cloud = None
                 return
             import struct as _struct
-            points = []
-            limit = float(self.get_parameter(
-                'yield_mover_cloud_range_m').value) + 0.5
-            for offset in range(0, len(msg.data), msg.point_step):
-                x, y = _struct.unpack_from('<ff', msg.data, offset)
-                if 0.0 < x <= limit and abs(y) <= 1.5:
-                    points.append((x, y))
+            footprint = tuple(_struct.unpack_from('<ff', msg.data, offset)
+                              for offset in range(0, len(msg.data), msg.point_step))
+            if all(math.isfinite(x) and math.isfinite(y) for x, y in footprint):
+                self._mover_release_cloud = (time.monotonic(), msg.header.stamp, footprint)
+            else:
+                self._mover_release_cloud = None
         except Exception:                                  # noqa: BLE001
-            return
-        self._mover_cloud = points
-        self._mover_cloud_stamp = time.monotonic()
+            self._mover_release_cloud = None
 
-    def _mover_cloud_box(self):
-        """(x, y) of the nearest box in the swept band, or None.
-
-        Only used when the laser tracker has no confirmed mover: a box already
-        tracked is better evidence than a kinematic footprint.
-        """
-        if not bool(self.get_parameter('yield_mover_cloud_stage').value):
-            return None
-        points = self._mover_cloud
-        if not points:
-            return None
-        timeout = float(self.get_parameter(
-            'yield_mover_cloud_timeout_sec').value)
-        if time.monotonic() - self._mover_cloud_stamp > timeout:
+    def _mover_cloud_box(self, cloud):
+        """Nearest footprint in the swept band from an already fresh cloud."""
+        if cloud is None or not bool(self.get_parameter('yield_mover_cloud_stage').value):
             return None
         return obstacle_yield.cloud_box_ahead(
-            points,
+            cloud[2],
             band_m=float(self.get_parameter(
                 'yield_mover_cloud_band_m').value),
             max_range_m=float(self.get_parameter(
@@ -5707,6 +6202,49 @@ class FixedJointPickPlace(Node):
         pose = self._recovery_pose(grid.header.frame_id) if grid is not None else None
         return self._recovery_cell(grid, *pose[:2]) if pose is not None else None
 
+    def _global_recovery_clearance(self, radius_m: float = 0.90) -> float | None:
+        """Distance from the base to the nearest lethal cell of the global map.
+
+        The cost of the single cell the base sits on is flat at 99 across the
+        whole inscribed ring, so it cannot say how far outside the ring the
+        base is. This can, and that is what an escape has to be judged on.
+        Returns ``radius_m`` (saturated) when nothing lethal is that close.
+        """
+        grid = self._fresh_recovery_grid('global')
+        pose = self._recovery_pose(grid.header.frame_id) if grid is not None else None
+        if pose is None:
+            return None
+        info = grid.info
+        res = info.resolution
+        i = math.floor((pose[0] - info.origin.position.x) / res)
+        j = math.floor((pose[1] - info.origin.position.y) / res)
+        span = int(math.ceil(radius_m / res))
+        best = math.inf
+        for jj in range(max(0, j - span), min(info.height, j + span + 1)):
+            row = jj * info.width
+            dy = (jj - j) * res
+            for ii in range(max(0, i - span), min(info.width, i + span + 1)):
+                if grid.data[row + ii] >= 100:
+                    d = math.hypot((ii - i) * res, dy)
+                    if d < best:
+                        best = d
+        return best if best < math.inf else radius_m
+
+    def _band_escape_target(self) -> float:
+        """Clearance a band escape has to reach before it may stop."""
+        nominal = getattr(self, '_nominal_geometry', None)
+        if nominal is None:
+            return math.inf
+        return (float(nominal[0])
+                + float(self.get_parameter('global_radius_margin_m').value)
+                + float(self.get_parameter('band_escape_margin_m').value))
+
+    def _band_escape_clearance(self) -> float | None:
+        target = self._band_escape_target()
+        if not math.isfinite(target):
+            return None
+        return self._global_recovery_clearance(target + 0.25)
+
     def _recovery_envelope_radius(self) -> float:
         # Recovery floor only: measured Xacro projection of the folded arm,
         # camera and attached cube is up to ~0.422 m; reserve an extra 8 mm.
@@ -5876,6 +6414,12 @@ class FixedJointPickPlace(Node):
         pose = self._base_pose()
         yaw = pose[2] if pose is not None else math.nan
         age, points = self._yield_scan_points(yaw)
+        now = time.monotonic()
+        paused = getattr(self, '_yield_pause_active', False)
+        close_m = min(self._yield_config.simple_radius_m,
+                      self._yield_config.simple_radius_commit_m)
+        cloud = self._fresh_yield_path_cloud(now) if self._yield_config.enabled else None
+        cloud_near = not watch and close_m > 0.0 and self._yield_cloud_near(cloud, close_m)
         if getattr(self, '_yield_trace_writer', None) is not None:
             try:
                 self._yield_trace_capture(age, points, None, None, None, None,
@@ -5895,26 +6439,24 @@ class FixedJointPickPlace(Node):
             # evidence. Once the budget is spent, an active hold fails closed.
             elapsed = (time.monotonic() - self._yield_wait_since
                        if self._yield_wait_since is not None else 0.0)
-            self._yield_diag(age if age is not None else -1.0,
-                             [] if points is None else points, [], [], None,
-                             obstacle_yield.YieldDecision(
-                                 obstacle_yield.ACTION_GO,
-                                 obstacle_yield.REASON_CLEAR,
-                                 detail='no fresh pose/scan'),
-                             time.monotonic())
-            if (self._yield_config.enabled and self._yield_latched
-                    and (elapsed < self._yield_config.wait_budget_sec
-                         or getattr(self, '_yield_pause_active', False))):
+            if cloud_near:
+                self._yield_close_path_hold = True
+            close_hold = getattr(self, '_yield_close_path_hold', False)
+            if self._yield_config.enabled and (close_hold or (
+                    self._yield_latched and (elapsed < self._yield_config.wait_budget_sec or paused))):
                 reason = (obstacle_yield.REASON_WAIT_EXPIRED
                           if elapsed >= self._yield_config.wait_budget_sec
                           else obstacle_yield.REASON_WAIT)
-                return (obstacle_yield.YieldDecision(
+                decision = obstacle_yield.YieldDecision(
                     obstacle_yield.ACTION_STOP, reason,
-                    wait_elapsed_sec=elapsed, detail='awaiting fresh pose/scan'
-                ), True, None)
-            return (obstacle_yield.YieldDecision(
-                obstacle_yield.ACTION_GO, obstacle_yield.REASON_CLEAR,
-                detail='no fresh pose/scan'), False, None)
+                    wait_elapsed_sec=elapsed, detail='awaiting fresh pose/scan')
+            else:
+                decision = obstacle_yield.YieldDecision(
+                    obstacle_yield.ACTION_GO, obstacle_yield.REASON_CLEAR,
+                    detail='no fresh pose/scan')
+            self._yield_diag(age if age is not None else -1.0,
+                             [] if points is None else points, [], [], None, decision, now)
+            return decision, decision.holds, None
 
         # Tracking every laser return makes a wall fragment the nearest 'box'
         # and can associate opposite ends of one obstacle across frames. Track
@@ -5933,7 +6475,6 @@ class FixedJointPickPlace(Node):
             sum(r * math.cos(a) for a, r in c) / len(c),
             sum(r * math.sin(a) for a, r in c) / len(c),
         ) for c in boxes]
-        now = time.monotonic()
         carrying = self._carrying_now()
         self._yield_tracker.update(
             centroids, now, (base_x, base_y, yaw, motion_vx, motion_vy, wz),
@@ -5942,6 +6483,13 @@ class FixedJointPickPlace(Node):
             now, (base_x, base_y, yaw, motion_vx, motion_vy, wz),
             min_world_speed=self._yield_config.min_mover_speed_mps,
             carrying=carrying)
+        if track is not None and (cloud is None or not any(
+                math.dist((track['base_x'], track['base_y']), point) <= 0.35
+                for point in cloud[2])):
+            # Apparent lidar velocity is not identity: ego motion and changing
+            # views of static corners can create fast centroid tracks. Only a
+            # track associated with a published patrol footprint can yield.
+            track = None
         excluded = [] if track is None else [
             (track['base_x'], track['base_y'])]
         left_room, right_room = self._yield_room(points, excluded)
@@ -5955,10 +6503,10 @@ class FixedJointPickPlace(Node):
         # escape never fired because no single hold lasted 20 s.
         wait_elapsed = self._yield_episode_elapsed(now)
         held_since = getattr(self, '_yield_continuous_hold_since', None)
-        cloud_box = self._mover_cloud_box() if track is None else None
+        cloud_box = self._mover_cloud_box(cloud) if track is None else None
         if track is None and cloud_box is not None:
-            # Seen by the footprints, not by the laser: same policy, weaker
-            # evidence. Velocity is unknown, so the observation carries the
+            # A confirmed footprint without a corresponding lidar velocity
+            # still participates. The observation carries the
             # patrol boxes' nominal 0.20 m/s instead of pretending it is static
             # (a static reading makes the policy treat the box as leaving).
             obs = obstacle_yield.YieldObservation(
@@ -5997,6 +6545,27 @@ class FixedJointPickPlace(Node):
             )
         if watch:
             return self._yield_arc_watch(obs, base_x, base_y, yaw)
+        close_observation = close_m > 0.0 and obs is not None and obs.range_m() <= close_m
+        # Don't equate loss of the obstacle observation with clearance.
+        close_check = self._yield_config.enabled and close_m > 0.0 and (
+            close_observation or cloud_near or getattr(self, '_yield_close_path_hold', False))
+        close_clear = False
+        close_detail = ''
+        if close_check:
+            clearance = self._yield_close_path_clearance(
+                now, cloud, paused, distance_to_goal_m is not None)
+            radius_param = 'loaded_robot_radius_m' if carrying else 'empty_robot_radius_m'
+            required = (float(self.get_parameter(radius_param).value)
+                        + self._yield_config.hold_release_margin_m)
+            close_clear = clearance is not None and clearance > required
+            if not close_clear:
+                close_detail = (
+                    'awaiting verifiable near path and mover footprint' if clearance is None
+                    else f'predicted near-path clearance {clearance:.2f} m (need >{required:.2f} m)')
+                self.get_logger().info(f'Yield close path blocked: {close_detail}.',
+                                       throttle_duration_sec=1.0)
+        self._yield_close_path_hold = close_check and (paused or cloud_near
+                                                       or close_observation or not close_clear)
         if (self._yield_config.enabled
                 and getattr(self._yield_config, 'approach_trial_enabled', False)
                 and self._yield_latched and obs is None
@@ -6015,7 +6584,29 @@ class FixedJointPickPlace(Node):
                 wait_elapsed_sec=wait_elapsed,
                 arc_attempts=self._yield_arc_attempts,
                 continuous_hold_sec=0.0 if held_since is None else now - held_since,
+                close_path_clear=close_clear,
             )
+        if close_check and not close_clear and (close_observation or not decision.holds):
+            decision = obstacle_yield.YieldDecision(
+                obstacle_yield.ACTION_STOP, obstacle_yield.REASON_WAIT,
+                wait_elapsed_sec=wait_elapsed, detail=close_detail)
+        if (decision.action == obstacle_yield.ACTION_GO
+                and self._yield_config.simple_radius_m > 0.0
+                and paused and not close_check
+                and bool(self.get_parameter('yield_path_release_enabled').value)):
+            clearance = self._yield_path_release_clearance(now)
+            radius_param = 'loaded_robot_radius_m' if carrying else 'empty_robot_radius_m'
+            required = (float(self.get_parameter(radius_param).value)
+                        + self._yield_config.hold_release_margin_m)
+            if clearance is None or clearance <= required:
+                detail = ('awaiting verifiable near path and mover footprint' if clearance is None
+                          else f'mover footprint {clearance:.2f} m from near path '
+                               f'(need >{required:.2f} m)')
+                self.get_logger().info(f'Yield path release blocked: {detail}.',
+                                       throttle_duration_sec=1.0)
+                decision = obstacle_yield.YieldDecision(
+                    obstacle_yield.ACTION_STOP, obstacle_yield.REASON_WAIT,
+                    wait_elapsed_sec=wait_elapsed, detail=detail)
         if getattr(self, '_yield_trace_writer', None) is not None:
             try:
                 self._yield_trace_capture(age, points, clusters, boxes, track, obs,
@@ -6462,6 +7053,9 @@ class FixedJointPickPlace(Node):
         self._yield_arc_abort = None
         self._yield_arc_watch_speed = None
         self._yield_pause_active = False
+        self._yield_close_path_hold = False
+        self._yield_path_goal = None
+        self._yield_release_path = None
         self._yield_episode_since = None
         self._yield_episode_anchor = None
         self._yield_free_since = None
@@ -6763,6 +7357,20 @@ class FixedJointPickPlace(Node):
                     break
                 if (unchanged_retry_used or not self._local_recovery_pose_clear()
                         or (cost := self._global_recovery_cost()) is None or cost >= 99):
+                    # The route is not the problem, the start cell is: NavFn will
+                    # not leave a cell it treats as inscribed and Nav2 will not
+                    # reverse out of one. Backing the base up is the only thing
+                    # that changes the start pose, so try it *before* writing the
+                    # leg off - it used to run only once every attempt was spent,
+                    # which burned the whole budget on a goal that could never be
+                    # planned from where the base stood (2026-11-26 14:39 rule2:
+                    # 14 GridBased aborts, then this branch, then a 0.04 m retreat
+                    # that the motion gate cut short).
+                    wedged_retry = getattr(self, '_wedged_retry', None)
+                    if (wedged_retry is not None
+                            and wedged_retry(label, values, visual_handoff_cube,
+                                             completion_radius_m, chain)):
+                        return True
                     self.get_logger().warning(
                         f'{label}: no verified recovery for {failure or "unclassified failure"}.')
                     break
@@ -7016,6 +7624,57 @@ class FixedJointPickPlace(Node):
                 and not getattr(self, '_cancel_requested', False)
                 and not FixedJointPickPlace._navigation_motion_fault(self))
 
+    def _guard_alignment_band(self) -> bool:
+        """Step back when the aligning base ends up on the planner's band.
+
+        The centring turn rotates about the base origin, so the cell under the
+        wheel should not change; on 2026-11-26 it did - the skid-steer chassis
+        slid 0.18 m while turning at 1.4 rad/s and the cost went 80 to 99. Both
+        odom and the Gazebo pose agree on the slide, so there is nothing to
+        predict from geometry: measure the cell the base actually stands on,
+        once per vision frame, and move off it as soon as it is in the band.
+
+        Both the direction and the distance are chosen by asking, not guessing.
+        The global layer is static, so the cost of a cell 0.3 m away is already
+        known before the base moves; and the scan says how far it may go
+        without touching something. On the failing run the reverse direction
+        stayed on 99 for 0.6 m while 0.44 m the other way reached 0, so trying
+        one axis only would have burned the attempt and changed nothing.
+
+        Returns True when a move was taken, so the caller can let the vision
+        loop re-settle before commanding another frame.
+        """
+        if not bool(self.get_parameter('align_band_guard').value):
+            return False
+        attempts = int(self.get_parameter('align_band_guard_attempts').value)
+        if getattr(self, '_align_band_retreats', 0) >= max(0, attempts):
+            return False
+        cost = self._global_recovery_cost()
+        if cost is None or cost < 99:
+            return False
+        base = float(self.get_parameter('align_band_retreat_m').value)
+        limit = max(base, float(
+            self.get_parameter('align_band_retreat_max_m').value))
+        steps = (base, 0.5 * (base + limit), limit)
+        planner = getattr(self, '_plan_band_escape', None)
+        plan = planner(list(steps)) if planner is not None else None
+        if plan is None:
+            return False
+        axis, distance, room, verified = plan
+        if distance <= 0.0:
+            return False
+        speed = max(0.03, float(
+            self.get_parameter('align_band_retreat_speed_mps').value))
+        self._align_band_retreats = getattr(self, '_align_band_retreats', 0) + 1
+        self.get_logger().warning(
+            f'aligning put the base on a cell the planner rejects (global cost '
+            f'{cost} >= 99); stepping {distance:.2f} m on axis {axis:+.0f} '
+            f'(lidar {room if room is not None else float("nan"):.2f} m, '
+            f'{"grid-verified" if verified else "no legal cell found"}) so the '
+            'next leg has a legal start pose.'
+        )
+        return bool(self._back_off('alignment band', distance, speed, axis))
+
     def _visual_align(self) -> bool:
         """Servo the base using the colour contour, then hand control back.
 
@@ -7029,6 +7688,7 @@ class FixedJointPickPlace(Node):
             self.get_logger().warning('Visual fine alignment is disabled.')
             return True
         self._visual_range_gate_active = True
+        self._align_band_retreats = 0
         # Turn the HSV pipeline on only for the servo window.
         self._vision_enabled = True
         try:
@@ -7220,6 +7880,10 @@ class FixedJointPickPlace(Node):
                 last_row = float(bottom_row)
                 centre_error = (centre_x - image_width / 2.0) / (image_width / 2.0)
                 last_centred = abs(centre_error) <= centre_tolerance
+                # getattr: the alignment tests drive this loop on a bare stub.
+                band_guard = getattr(self, '_guard_alignment_band', None)
+                if band_guard is not None and band_guard():
+                    continue
                 # Bottom row grows as the robot approaches: it is the range error.
                 row_error = (approach_row - bottom_row) / approach_row
                 centred = abs(centre_error) <= centre_tolerance

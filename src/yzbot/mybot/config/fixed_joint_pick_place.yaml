@@ -141,6 +141,11 @@ fixed_joint_pick_place:
     # escape's swept check refused too, and the round died 3/5.  The shell is
     # now 0.30 control / 0.35 planning, still 8% above the real half diagonal.
     global_radius_margin_m: 0.10
+    # 退带判据只认"一格出环"时的实测后果：2026-11-26 18:59 rule 3 退出到
+    # cost 91 就报 left planner band，发目标后转向 1.2 s 平移 0.18 m，起点格
+    # 又变回 99，GridBased 连失败 3 次、无 recovery 可退。这里要求真正离开
+    # 内切环多少米，`_back_off` 与发目标前的复核都用它。
+    band_escape_margin_m: 0.10
     loaded_robot_radius_m: 0.28
     loaded_inflation_radius_m: 0.45
     robot_attach_link: link6
@@ -216,6 +221,10 @@ fixed_joint_pick_place:
     # 正常进门不会失败，没有这个开关就只能等偶然出现的切角失败才能验证
     # 等待点、只查路探测和免恢复行为树；比赛配置不含此键（保持 false）。
     entry_recovery_force_first: false
+    # 2026-11-26 14:39 rule 2：车以 1.31 m/s 切过 27 度折角，横向偏 0.35 m，停在
+    # 全局代价 99（内切带）的格子里；NavFn 立刻拒绝出图、Nav2 又拒绝倒车，载货腿
+    # 就这样死了。这种状态下再等满 45 s 毫无意义，3 s 没进展就收手、交给自救退让。
+    navigation_band_stall_grace_sec: 3.0
     navigation_retry_count: 2
     action_retry_count: 2
     service_timeout_sec: 20.0
@@ -260,6 +269,17 @@ fixed_joint_pick_place:
     visual_search_rate: 0.35
     visual_search_timeout_sec: 18.0
     visual_research_after_sec: 3.0
+    # 2026-11-26 (run 2026-11-26_1539_A9_r1_2, blue_cube_5): the base aligned at
+    # cost 80, the centring turn rotated it 79 deg, and the skid-steer chassis
+    # slid 0.18 m into the shelf while doing so - cost 80 -> 99, so the
+    # warehouse leg had no legal start pose and the round was lost. The slide is
+    # not geometric, so watch the cell the base stands on during alignment and
+    # step back when it enters the band.
+    align_band_guard: true
+    align_band_retreat_m: 0.28
+    align_band_retreat_max_m: 0.60
+    align_band_retreat_speed_mps: 0.08
+    align_band_guard_attempts: 2
     require_proximity_check: true
     proximity_timeout_sec: 5.0
     proximity_retry_attempts: 3

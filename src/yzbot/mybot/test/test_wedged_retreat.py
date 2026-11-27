@@ -52,15 +52,26 @@ class WedgedRetreatSourceTest(unittest.TestCase):
 
     def test_navigate_to_asks_for_the_retreat_only_after_the_ladder(self):
         body = self.method_source('_navigate_to')
-        # The retreat must sit outside the while loop: a call inside it would
-        # displace the configured recoveries (every failed attempt would shove
-        # the base before the ladder ever got a turn).
         loop_end = body.rindex('unchanged_retry_used = True')
         tail = body[loop_end:]
+        # The post-loop call stays as the fallback for every other break path
+        # (jam recovery, entry recovery, pickup fallback).
         self.assertIn("getattr(self, '_wedged_retry', None)", tail)
         while_head = body.index('while attempt < attempts:')
         while_body = body[while_head:loop_end]
-        self.assertNotIn("'_wedged_retry'", while_body)
+        # Inside the loop it may appear exactly once, and only as the last
+        # resort of the spent-attempt branch: after the configured ladder
+        # (relax / pickup fallback / back-off) had its turn, and before the leg
+        # is written off as having no verified recovery. Measured 2026-11-26
+        # 14:39 rule2: spending the remaining attempts on a goal that could
+        # never be planned from an inscribed start cell, and retreating only
+        # afterwards, cost the round.
+        ladder = while_body.index('self._relax_global_footprint(label)')
+        retreat = while_body.index("getattr(self, '_wedged_retry', None)")
+        verdict = while_body.index('no verified recovery')
+        self.assertLess(ladder, retreat)
+        self.assertLess(retreat, verdict)
+        self.assertEqual(while_body.count("'_wedged_retry'"), 1)
         self.assertNotIn('_wedged_retreat(', while_body)
 
     def test_cancel_and_already_used_both_suppress_the_retreat(self):
@@ -120,15 +131,23 @@ class WedgedRetreatRuntimeTests(unittest.TestCase):
         node._band_escape_shove = self.executor._band_escape_shove.__get__(node)
         return node
 
-    def test_retreats_towards_the_wider_side_of_the_scan(self):
-        node = self.node(front=0.90, rear=0.40)
+    def test_retreats_along_the_route_it_drove(self):
+        # The rear wins even when the front looks roomier: reversing re-traces
+        # ground this leg has already covered.
+        node = self.node(front=0.90, rear=0.60)
         self.assertTrue(self.executor._wedged_retreat(node, LABEL))
         node._back_off.assert_called_once()
         args, kwargs = node._back_off.call_args
         self.assertIn('wedged start pose', args[0])
-        self.assertEqual(args[1:], (0.25, 0.08, 1.0))
+        self.assertEqual(args[1:], (0.25, 0.08, -1.0))
         self.assertIs(kwargs['leave_band'], True)
         self.assertIs(node._wedged_retreat_used, True)
+
+    def test_a_blocked_rear_swerves_to_the_open_side(self):
+        node = self.node(front=0.90, rear=0.20)
+        self.assertTrue(self.executor._wedged_retreat(node, LABEL))
+        args, _ = node._back_off.call_args
+        self.assertEqual(args[1:], (0.25, 0.08, 1.0))
 
     def test_a_blocked_scan_is_refused_without_touching_the_base(self):
         node = self.node(front=0.31, rear=0.20)
@@ -280,6 +299,20 @@ class BandEscapeShoveTests(unittest.TestCase):
         self.assertIs(kwargs['leave_band'], True)
         self.assertAlmostEqual(kwargs['clearance_floor'], 0.47)
 
+    def test_a_retreat_reverses_along_the_route_it_drove(self):
+        # Reversing re-traces ground the base just covered; going forward
+        # commits the body to space only one scan has looked at.
+        node = self.node(front=2.00, rear=0.55)
+        self.executor._ensure_start_pose_outside_band(node, LABEL)
+        args, _ = node._back_off.call_args
+        self.assertEqual(args[1:], (0.25, 0.08, -1.0))
+
+    def test_a_blocked_rear_still_uses_the_open_side(self):
+        node = self.node(front=0.55, rear=0.20)
+        self.executor._ensure_start_pose_outside_band(node, LABEL)
+        args, _ = node._back_off.call_args
+        self.assertEqual(args[1:], (0.25, 0.08, 1.0))
+
     def test_the_scan_floor_now_admits_a_051_m_side(self):
         # The regression this guards: a 0.51 m side used to be refused by the
         # 0.60 m gate the generic retreat uses.
@@ -311,6 +344,42 @@ class BandEscapeShoveTests(unittest.TestCase):
         node = self.node(band=False, global_cost=None)
         self.executor._ensure_start_pose_outside_band(node, LABEL)
         node._back_off.assert_not_called()
+
+
+class BandStallGuardTests(unittest.TestCase):
+    """A leg that parks itself inside the planner's band must not wait it out.
+
+    Measured 2026-11-26 14:39 (runs/2026-11-26_1439_ann3_m2, rule 2): the base
+    carried 1.31 m/s through a 27 deg kink, drifted 0.35 m inside and stopped in
+    a cell whose global cost is 99. NavFn refused to plan from it for 12.6 s and
+    the loaded leg had no retry left, so the round died 0/5. The stall monitor
+    now fails such an attempt after `navigation_band_stall_grace_sec` instead of
+    watching the full stall timeout.
+    """
+
+    def setUp(self):
+        self.source = SCRIPT.read_text(encoding='utf-8')
+
+    def test_the_band_guard_runs_before_the_long_stall_timeout(self):
+        band = self.source.find("self._last_attempt_failure = 'planner_band'")
+        self.assertGreater(band, 0, 'the band guard is not wired in')
+        self.assertLess(
+            band,
+            self.source.find('no progress for {stall_timeout:.0f} s'),
+            'the band guard must fire before the generic stall timeout',
+        )
+
+    def test_the_band_guard_asks_the_global_grid(self):
+        start = self.source.find("self._last_attempt_failure = 'planner_band'")
+        window = self.source[max(0, start - 700):start + 200]
+        self.assertIn('_start_cell_inside_global_band()', window)
+        self.assertIn('band_grace', window)
+
+    def test_both_configs_carry_the_grace(self):
+        for name in ('config/fixed_joint_pick_place.yaml',
+                     'config/profiles/executor_fast.yaml'):
+            text = (BOT / name).read_text(encoding='utf-8')
+            self.assertIn('navigation_band_stall_grace_sec: 3.0', text, name)
 
 
 if __name__ == '__main__':

@@ -3098,8 +3098,9 @@ class YieldWiringTests(unittest.TestCase):
             _yield_base_motion=lambda: (0.0, 0.0, 0.0, 0.0, 0.0),
             _base_pose=lambda: (0.0, 0.0, 0.0),
             _yield_scan_points=lambda yaw: (math.inf, []),
-            _yield_config=SimpleNamespace(enabled=True, track_timeout_sec=1.5,
-                                          wait_budget_sec=20.0),
+            _fresh_yield_path_cloud=lambda now: None,
+            _yield_config=module.obstacle_yield.YieldConfig(
+                enabled=True, track_timeout_sec=1.5, wait_budget_sec=20.0),
             _yield_wait_since=module.time.monotonic() - 1.0,
             _yield_latched=True,
             # The diagnostic is logging-only; this test pins the decision.
@@ -3139,7 +3140,8 @@ class YieldWiringTests(unittest.TestCase):
                     _yield_config=oy.YieldConfig(),
                     _carrying_now=lambda: False,
                     _yield_tracker=SimpleNamespace(update=Mock(), nearest=Mock(return_value=None)),
-            _mover_cloud_box=lambda: None,
+                    _mover_cloud_box=lambda cloud: None,
+                    _fresh_yield_path_cloud=lambda now: None,
                     _yield_room=lambda *args: (1.0, 1.0),
                     _yield_episode_elapsed=lambda now: 2.0,
                     _yield_arc_attempts=0,
@@ -3171,7 +3173,8 @@ class YieldWiringTests(unittest.TestCase):
             _yield_config=oy.YieldConfig(enabled=True),
             _carrying_now=lambda: False,
             _yield_tracker=SimpleNamespace(update=Mock(), nearest=Mock(return_value=None)),
-            _mover_cloud_box=lambda: None,
+            _mover_cloud_box=lambda cloud: None,
+            _fresh_yield_path_cloud=lambda now: None,
             _yield_room=lambda *args: (1.0, 1.0),
             _yield_episode_elapsed=lambda now: 2.0,
             _yield_arc_attempts=0, _yield_arc_goal=None, _yield_arc_used=False,
@@ -3210,6 +3213,7 @@ class YieldWiringTests(unittest.TestCase):
             _yield_scan_points=Mock(return_value=(0.0, [])),
             _yield_config=cfg, _carrying_now=lambda: False,
             _yield_tracker=SimpleNamespace(update=Mock(), nearest=Mock(return_value=track)),
+            _fresh_yield_path_cloud=lambda now: (now, None, [(0.5, 0.0)]),
             _yield_room=lambda *args: (2.0, 2.0), _patrol_segments=[],
             _yield_episode_elapsed=lambda now: now - 70.0,
             _yield_arc_attempts=cfg.max_arc_attempts - 1,
@@ -3242,39 +3246,25 @@ class YieldWiringTests(unittest.TestCase):
         self.assertIn('v=(n/a,n/a)', logged[0])
 
     def test_mover_cloud_box_is_used_only_while_fresh_and_enabled(self):
-        """The cloud look is a fallback for an empty tracker, never a cache.
-
-        A stale footprint would stage the base for a box that has already
-        driven off, so age is checked on every call.
-        """
-        import time as _time
-
-        node = SimpleNamespace(
-            _mover_cloud=[(3.0, 0.05), (3.01, 0.06), (3.02, 0.04)],
-            _mover_cloud_stamp=_time.monotonic(),
-            _yield_config=SimpleNamespace(half_width_m=0.47),
-            get_parameter=lambda name: SimpleNamespace(value={
-                'yield_mover_cloud_stage': True,
-                'yield_mover_cloud_timeout_sec': 0.35,
-                'yield_mover_cloud_range_m': 6.0,
-                'yield_mover_cloud_band_m': 1.2,
-            }[name]),
-        )
-        box = module.FixedJointPickPlace._mover_cloud_box(node)
-        self.assertIsNotNone(box)
-        self.assertAlmostEqual(box[0], 3.0, places=2)
-
-        node._mover_cloud_stamp = _time.monotonic() - 2.0
-        self.assertIsNone(module.FixedJointPickPlace._mover_cloud_box(node))
-
-        node._mover_cloud_stamp = _time.monotonic()
-        node.get_parameter = lambda name: SimpleNamespace(value={
-            'yield_mover_cloud_stage': False,
+        params = {
+            'yield_mover_cloud_stage': True,
             'yield_mover_cloud_timeout_sec': 0.35,
             'yield_mover_cloud_range_m': 6.0,
             'yield_mover_cloud_band_m': 1.2,
-        }[name])
-        self.assertIsNone(module.FixedJointPickPlace._mover_cloud_box(node))
+        }
+        footprint = [(3.0, 0.05), (3.01, 0.06), (3.02, 0.04)]
+        stamp = SimpleNamespace(sec=10, nanosec=0)
+        node = SimpleNamespace(
+            _mover_release_cloud=(100.0, stamp, footprint),
+            _clock_seconds=lambda: 10.0,
+            get_parameter=lambda name: SimpleNamespace(value=params[name]),
+        )
+        cls = module.FixedJointPickPlace
+        self.assertAlmostEqual(cls._mover_cloud_box(node, cls._fresh_yield_path_cloud(node, 100.0))[0],
+                               3.0, places=2)
+        self.assertIsNone(cls._mover_cloud_box(node, cls._fresh_yield_path_cloud(node, 102.0)))
+        params['yield_mover_cloud_stage'] = False
+        self.assertIsNone(cls._mover_cloud_box(node, cls._fresh_yield_path_cloud(node, 100.0)))
 
     def test_rejected_arc_at_attempt_ceiling_hands_conflict_to_nav2(self):
         oy = module.obstacle_yield

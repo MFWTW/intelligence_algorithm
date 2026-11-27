@@ -252,6 +252,11 @@ fixed_joint_pick_place:
     # 全局规划额外余量：0.0 时 NavFn 会贴着车体半径（内切带 253）走，RPP 的
     # 前向投影弧随即拒绝，表现为墙角静止 18 s + 后退重试。受控试验量化后取 0.10。
     global_radius_margin_m: 0.10
+    # 退带判据只认"一格出环"时的实测后果：2026-11-26 18:59 rule 3 退出到
+    # cost 91 就报 left planner band，发目标后转向 1.2 s 平移 0.18 m，起点格
+    # 又变回 99，GridBased 连失败 3 次、无 recovery 可退。这里要求真正离开
+    # 内切环多少米，`_back_off` 与发目标前的复核都用它。
+    band_escape_margin_m: 0.10
     loaded_robot_radius_m: 0.28
     loaded_inflation_radius_m: 0.45
     robot_attach_link: link6
@@ -307,6 +312,10 @@ fixed_joint_pick_place:
     # 全部 FAILED（abaz1 2/5、abaz2 0/5）——它砍掉的是“控制器零指令 45 s 后靠逃逸
     # 重试救回来”的那条路，而不是纯粹浪费的尾巴。故保持 45 s 与 retry=2 不变。
     # 若要快速放弃，应判“规划器连续 N 次失败（目标不可达）”，不要用原始静止计时。
+    # 2026-11-26 14:39 rule 2：车以 1.31 m/s 切过 27 度折角，横向偏 0.35 m，停在
+    # 全局代价 99（内切带）的格子里；NavFn 立刻拒绝出图、Nav2 又拒绝倒车，载货腿
+    # 就这样死了。这种状态下再等满 45 s 毫无意义，3 s 没进展就收手、交给自救退让。
+    navigation_band_stall_grace_sec: 3.0
     navigation_retry_count: 2
     action_retry_count: 2
     service_timeout_sec: 20.0
